@@ -23,6 +23,7 @@ loop doesn't have to be stood up.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -281,3 +282,85 @@ class TestCaptureAtCallStartInvariant:
         # No ``agent`` or ``self`` parameter — capture must happen in caller.
         assert "agent" not in params
         assert "self" not in params
+
+
+class TestEmitDdToolCall:
+    def test_posts_bounded_redacted_log_tool_payload(self):
+        from run_agent import _emit_dd_tool_call
+        dd_obs = MagicMock()
+        args = {
+            "command": "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz' https://example.test",
+            "api_key": "sk-this-should-not-leak-1234567890",
+        }
+        result = "ok " + ("x" * 6000)
+
+        _emit_dd_tool_call(
+            dd_obs_module=dd_obs,
+            run_id="hermes-run-1",
+            session_key="agent:hermes:gateway:sess",
+            session_id_fallback="fallback-session",
+            tool_name="terminal",
+            tool_args=args,
+            tool_result=result,
+            tool_call_id="call-123",
+            started_at_epoch=1_700_000_000.0,
+            completed_at_epoch=1_700_000_002.0,
+            is_error=False,
+        )
+
+        dd_obs.log_tool.assert_called_once()
+        kwargs = dd_obs.log_tool.call_args.kwargs
+        assert kwargs["run_id"] == "hermes-run-1"
+        assert kwargs["tool_name"] == "terminal"
+        assert kwargs["tool_call_id"] == "call-123"
+        assert kwargs["session_id"] == "agent:hermes:gateway:sess"
+        assert kwargs["started_at"].startswith("2023-")
+        assert kwargs["completed_at"].startswith("2023-")
+        assert len(kwargs["tool_input"]) <= 4100
+        assert len(kwargs["tool_output"]) <= 4100
+        assert json.loads(kwargs["tool_input"])["preview"]
+        assert json.loads(kwargs["tool_output"])["preview"]
+        assert len(kwargs["input_summary"]) <= 500
+        assert len(kwargs["output_summary"]) <= 500
+        assert "sk-this-should-not-leak" not in kwargs["tool_input"]
+        assert "abcdefghijklmnopqrstuvwxyz" not in kwargs["tool_input"]
+        assert "[REDACTED]" in kwargs["tool_input"]
+
+    def test_tool_observability_is_best_effort(self):
+        from run_agent import _emit_dd_tool_call
+        dd_obs = MagicMock()
+        dd_obs.log_tool.side_effect = RuntimeError("ingest down")
+
+        _emit_dd_tool_call(
+            dd_obs_module=dd_obs,
+            run_id="hermes-run-1",
+            session_key=None,
+            session_id_fallback="fallback-session",
+            tool_name="read_file",
+            tool_args={"path": "x"},
+            tool_result="ok",
+            tool_call_id=None,
+            started_at_epoch=None,
+            completed_at_epoch=None,
+        )
+
+        dd_obs.log_tool.assert_called_once()
+
+    def test_no_run_id_skips_log_tool(self):
+        from run_agent import _emit_dd_tool_call
+        dd_obs = MagicMock()
+
+        _emit_dd_tool_call(
+            dd_obs_module=dd_obs,
+            run_id=None,
+            session_key="session",
+            session_id_fallback="fallback-session",
+            tool_name="read_file",
+            tool_args={"path": "x"},
+            tool_result="ok",
+            tool_call_id=None,
+            started_at_epoch=None,
+            completed_at_epoch=None,
+        )
+
+        dd_obs.log_tool.assert_not_called()

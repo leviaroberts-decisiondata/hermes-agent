@@ -61,12 +61,21 @@ def _resolve_obs_ingest_base() -> Optional[str]:
                     return _OBS_INGEST_BASE
         except Exception:
             pass
-        # Fallback to env var or localhost:8511
-        env_base = os.getenv("DD_OBS_INGEST_URL")
+        # Fallback to the same env vars gateway/run.py honors, then the
+        # legacy dd_obs-specific var, then localhost:8511.  Keeping the
+        # per-call sync writer and gateway synthetic fallback pointed at the
+        # same obs-ingest is safety-critical: if they drift, a successful
+        # per-call POST to one ingest could suppress the synthetic fallback
+        # that gateway/run.py would have sent to another.
+        env_base = (
+            os.getenv("HERMES_DECISIONDATA_OBSERVABILITY_URL")
+            or os.getenv("DECISIONDATA_OBSERVABILITY_URL")
+            or os.getenv("DD_OBS_INGEST_URL")
+        )
         if env_base:
             _OBS_INGEST_BASE = env_base.rstrip("/")
             return _OBS_INGEST_BASE
-        _OBS_INGEST_BASE = "http://localhost:8511"
+        _OBS_INGEST_BASE = "http://127.0.0.1:8511"
         return _OBS_INGEST_BASE
 
 
@@ -171,6 +180,53 @@ def log_complete(
         "completed_at": _iso_now(),
     }
     _post_async("/log_complete", payload)
+
+
+def log_tool(
+    *,
+    run_id: str,
+    tool_name: str,
+    tool_call_id: Optional[str] = None,
+    started_at: Optional[str] = None,
+    completed_at: Optional[str] = None,
+    input_summary: Optional[str] = None,
+    output_summary: Optional[str] = None,
+    error: Optional[str] = None,
+    session_id: Optional[str] = None,
+    generation_id: Optional[str] = None,
+    tool_input: Optional[str] = None,
+    tool_output: Optional[str] = None,
+) -> None:
+    """Asynchronously log a Hermes tool call to DecisionData MC.
+
+    The obs-ingest /log_tool endpoint writes the legacy tool_calls row and,
+    when session_id is supplied, a full-fidelity span sidecar. This helper is
+    intentionally fire-and-forget: observability must never block Hermes tool
+    execution or user responses. Callers are responsible for bounding/redacting
+    previews before passing them here.
+    """
+    if not run_id or not tool_name:
+        return
+    payload: Dict[str, Any] = {
+        "run_id": run_id,
+        "tool_name": tool_name,
+    }
+    optional = {
+        "tool_call_id": tool_call_id,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "input_summary": input_summary,
+        "output_summary": output_summary,
+        "error": error,
+        "session_id": session_id,
+        "generation_id": generation_id,
+        "tool_input": tool_input,
+        "tool_output": tool_output,
+    }
+    for key, value in optional.items():
+        if value is not None:
+            payload[key] = value
+    _post_async("/log_tool", payload)
 
 
 def log_generation(

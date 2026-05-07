@@ -953,6 +953,104 @@ def _emit_dd_per_call_generation(
         pass
 
 
+_DD_TOOL_PREVIEW_LIMIT = 4000
+_DD_TOOL_SUMMARY_LIMIT = 500
+_DD_SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization|cookie|credential)")
+_DD_SECRET_VALUE_RE = re.compile(
+    r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}|"
+    r"(sk-[A-Za-z0-9._-]{12,})|"
+    r"(xox[baprs]-[A-Za-z0-9-]{12,})|"
+    r"([A-Za-z0-9_]*api[_-]?key[A-Za-z0-9_]*\s*[:=]\s*)['\"]?[^'\"\s,}]{8,}"
+)
+
+
+def _dd_safe_tool_value(value: Any, *, limit: int = _DD_TOOL_PREVIEW_LIMIT) -> str:
+    """Bound and redact tool telemetry previews before sending to MC.
+
+    Tool calls can include command output, environment-ish strings, or file
+    snippets. MC needs enough to operate, not raw unbounded payloads. This keeps
+    sensitive-looking keys/values out of observability and caps payload size.
+    """
+    try:
+        def _scrub(obj):
+            if isinstance(obj, dict):
+                return {
+                    str(k): ("[REDACTED]" if _DD_SECRET_KEY_RE.search(str(k)) else _scrub(v))
+                    for k, v in obj.items()
+                }
+            if isinstance(obj, list):
+                return [_scrub(v) for v in obj[:50]]
+            if isinstance(obj, tuple):
+                return tuple(_scrub(v) for v in obj[:50])
+            return obj
+
+        if isinstance(value, (dict, list, tuple)):
+            text = json.dumps(_scrub(value), ensure_ascii=False, default=str)
+        else:
+            text = str(value or "")
+    except Exception:
+        text = str(value or "")
+    text = _DD_SECRET_VALUE_RE.sub(lambda m: (m.group(1) or m.group(4) or "") + "[REDACTED]", text)
+    if len(text) > limit:
+        text = text[:limit] + "…[truncated]"
+    return text
+
+
+def _dd_iso_from_epoch(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    try:
+        from datetime import timezone as _tz
+        return datetime.fromtimestamp(float(ts), tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _emit_dd_tool_call(
+    *,
+    dd_obs_module,
+    run_id: Optional[str],
+    session_key: Optional[str],
+    session_id_fallback: Optional[str],
+    tool_name: str,
+    tool_args: Any,
+    tool_result: Any,
+    tool_call_id: Optional[str],
+    started_at_epoch: Optional[float],
+    completed_at_epoch: Optional[float],
+    is_error: bool = False,
+) -> None:
+    """Emit a bounded DecisionData /log_tool row for a Hermes tool call.
+
+    This intentionally does not return a success signal: tool observability is
+    useful for MC parity but must never alter Hermes execution flow.
+    """
+    try:
+        if not run_id or not tool_name or not hasattr(dd_obs_module, "log_tool"):
+            return
+        input_preview = _dd_safe_tool_value(tool_args, limit=_DD_TOOL_PREVIEW_LIMIT)
+        output_preview = _dd_safe_tool_value(tool_result, limit=_DD_TOOL_PREVIEW_LIMIT)
+        error_text = output_preview[:_DD_TOOL_SUMMARY_LIMIT] if is_error else None
+        dd_obs_module.log_tool(
+            run_id=run_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            started_at=_dd_iso_from_epoch(started_at_epoch),
+            completed_at=_dd_iso_from_epoch(completed_at_epoch),
+            input_summary=input_preview[:_DD_TOOL_SUMMARY_LIMIT],
+            output_summary=output_preview[:_DD_TOOL_SUMMARY_LIMIT],
+            error=error_text,
+            session_id=session_key or session_id_fallback or "",
+            # obs-ingest spans store tool_input/tool_output in JSON columns.
+            # Keep summaries human-readable, but make full-fidelity fields valid
+            # JSON so /log_tool sidecar reliably writes spans.
+            tool_input=json.dumps({"preview": input_preview}, ensure_ascii=False),
+            tool_output=json.dumps({"preview": output_preview}, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+
+
 def _qwen_portal_headers() -> dict:
     """Return default HTTP headers required by Qwen Portal API."""
     import platform as _plat
@@ -9435,8 +9533,26 @@ class AIAgent:
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
-            duration = time.time() - start
+            completed = time.time()
+            duration = completed - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            try:
+                import dd_obs as _dd_obs
+                _emit_dd_tool_call(
+                    dd_obs_module=_dd_obs,
+                    run_id=getattr(self, "_dd_run_id", None),
+                    session_key=getattr(self, "_dd_session_key", None),
+                    session_id_fallback=self.session_id or "",
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    tool_result=result,
+                    tool_call_id=getattr(tool_call, "id", None),
+                    started_at_epoch=start,
+                    completed_at_epoch=completed,
+                    is_error=is_error,
+                )
+            except Exception:
+                pass
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -9914,6 +10030,24 @@ class AIAgent:
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+            try:
+                import dd_obs as _dd_obs
+                _emit_dd_tool_call(
+                    dd_obs_module=_dd_obs,
+                    run_id=getattr(self, "_dd_run_id", None),
+                    session_key=getattr(self, "_dd_session_key", None),
+                    session_id_fallback=self.session_id or "",
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    tool_result=function_result,
+                    tool_call_id=getattr(tool_call, "id", None),
+                    started_at_epoch=tool_start_time,
+                    completed_at_epoch=tool_start_time + float(tool_duration or 0),
+                    is_error=_is_error_result,
+                )
+            except Exception:
+                pass
+
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
