@@ -1016,9 +1016,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "wts_task_id": _dd_wts_task_id,
         }
         _dd_keepalive = None
-        # Only own lifecycle for non-streaming; streaming path completion is
-        # handled by the dispatcher when it supplies a run_id.
-        if _dd_owns_lifecycle and not stream:
+        # Own lifecycle for direct callers in both non-streaming and streaming
+        # modes.  If a caller supplied X-DD-Run-Id (for example
+        # hermes-dispatcher), that caller owns spawn/complete and we only
+        # attach generation metadata to its existing run.
+        if _dd_owns_lifecycle:
             try:
                 import dd_obs
                 _user_text_for_log = ""
@@ -1044,8 +1046,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _dd_keepalive.start()
             except Exception:
                 pass  # observability never blocks
-        else:
-            _dd_owns_lifecycle = False  # disable complete-on-return for streaming
+        # If X-DD-Run-Id was caller-supplied, lifecycle remains disabled here.
 
         if stream:
             import queue as _q
@@ -1119,13 +1120,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
-            # Streaming path: api_server does NOT own /log_spawn or /log_complete
-            # for streaming completions. Only forward dd_obs_meta when the
-            # caller (e.g. hermes-dispatcher) supplied X-DD-Run-Id and is
-            # running its own spawn/complete handshake — otherwise per-call
-            # /log_generation rows would attach to a run that never existed
-            # in agent_runs (orphan rows).
-            _dd_meta_for_stream = _dd_meta if _dd_caller_supplied_run_id else None
+            # Forward dd_obs_meta for streaming whenever a real run exists.
+            # Dispatcher-supplied runs already exist upstream; direct streaming
+            # callers now self-spawn above so per-call generation/tool rows no
+            # longer become orphans.
+            _dd_meta_for_stream = _dd_meta if (_dd_caller_supplied_run_id or _dd_owns_lifecycle) else None
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -1138,9 +1137,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 dd_obs_meta=_dd_meta_for_stream,
             ))
 
+            _dd_lifecycle = None
+            if _dd_owns_lifecycle:
+                _dd_lifecycle = {
+                    "run_id": _dd_run_id,
+                    "keepalive": _dd_keepalive,
+                }
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
+                dd_lifecycle=_dd_lifecycle,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1237,6 +1243,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
+        dd_lifecycle: Optional[Dict[str, Any]] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1261,6 +1268,11 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Id"] = session_id
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+
+        _dd_complete_status = "error"
+        _dd_complete_summary = ""
+        _dd_input_tokens = 0
+        _dd_output_tokens = 0
 
         try:
             last_activity = time.monotonic()
@@ -1331,8 +1343,16 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
-            except Exception:
-                pass
+                if isinstance(result, dict):
+                    _dd_complete_status = "error" if result.get("failed") else "done"
+                    _dd_complete_summary = str(result.get("final_response") or result.get("error") or "")[:200]
+                else:
+                    _dd_complete_status = "done"
+                _dd_input_tokens = int(usage.get("input_tokens", 0) or 0)
+                _dd_output_tokens = int(usage.get("output_tokens", 0) or 0)
+            except Exception as _agent_err:
+                _dd_complete_status = "error"
+                _dd_complete_summary = str(_agent_err)[:200]
 
             # Finish chunk
             finish_chunk = {
@@ -1363,7 +1383,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     await agent_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            _dd_complete_status = "interrupted"
+            _dd_complete_summary = "SSE client disconnected"
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+        finally:
+            if dd_lifecycle:
+                try:
+                    _ka = dd_lifecycle.get("keepalive")
+                    if _ka is not None:
+                        _ka.stop()
+                    import dd_obs
+                    dd_obs.log_complete(
+                        run_id=str(dd_lifecycle.get("run_id") or ""),
+                        status=_dd_complete_status,
+                        result_summary=_dd_complete_summary,
+                        input_tokens=_dd_input_tokens,
+                        output_tokens=_dd_output_tokens,
+                    )
+                except Exception:
+                    pass  # observability never blocks
 
         return response
 

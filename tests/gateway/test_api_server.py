@@ -601,6 +601,58 @@ class TestChatCompletionsEndpoint:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_stream_direct_caller_owns_decisiondata_lifecycle(self, adapter):
+        """Direct stream=true calls must appear as live MC Hermes runs.
+
+        Without caller-supplied X-DD-Run-Id, api_server owns /log_spawn,
+        keepalive, per-call generation metadata, and /log_complete even for
+        streaming completions. Otherwise MC Live has zero running Hermes rows
+        while the agent is actively working.
+        """
+        keepalive = MagicMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                assert kwargs.get("dd_obs_meta") is not None
+                assert kwargs["dd_obs_meta"]["run_id"]
+                assert kwargs["dd_obs_meta"]["session_key"].startswith("agent:hermes:api_server:")
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Hello")
+                return (
+                    {"final_response": "Hello", "messages": [], "api_calls": 1},
+                    {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch("dd_obs.log_spawn") as log_spawn,
+                patch("dd_obs.KeepaliveLoop", return_value=keepalive) as keepalive_cls,
+                patch("dd_obs.log_complete") as log_complete,
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+
+                log_spawn.assert_called_once()
+                keepalive_cls.assert_called_once()
+                keepalive.start.assert_called_once()
+                keepalive.stop.assert_called_once()
+                log_complete.assert_called_once()
+                complete_kwargs = log_complete.call_args.kwargs
+                assert complete_kwargs["status"] == "done"
+                assert complete_kwargs["input_tokens"] == 7
+                assert complete_kwargs["output_tokens"] == 3
+
+    @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
         """Idle SSE streams should send keepalive comments while tools run silently."""
         import asyncio
