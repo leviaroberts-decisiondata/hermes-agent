@@ -93,6 +93,43 @@ class TestEmitDdPerCallGeneration:
         assert kwargs["generation_id"]
         assert kwargs["generation_id"] != "hermes-sess-g1:generation:1"
 
+    def test_includes_full_request_and_response_content_when_available(self):
+        emit = _import_helper()
+        dd_obs = _make_dd_obs(sync_returns=True)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="full assistant response sentinel",
+                reasoning_content="reasoning sentinel",
+                tool_calls=[],
+            ))]
+        )
+
+        emit(
+            dd_obs_module=dd_obs,
+            run_id="hermes-sess-g1",
+            session_key="agent:hermes:gateway:sess",
+            session_id_fallback="sess",
+            model="gpt-5.5",
+            provider="openai-codex",
+            requested_at="2026-04-30T07:48:07Z",
+            completed_at="2026-04-30T07:48:09Z",
+            latency_ms=2000,
+            canonical_usage=_make_canonical_usage(),
+            cost_amount_usd=0.0123,
+            dd_context=None,
+            request_messages=[{"role": "user", "content": "full prompt sentinel"}],
+            response_obj=response,
+            system_prompt="system prompt sentinel",
+        )
+
+        kwargs = dd_obs.log_generation_sync.call_args.kwargs
+        request_messages = json.loads(kwargs["request_messages"])
+        content_blocks = json.loads(kwargs["content_blocks"])
+        assert request_messages[0]["content"] == "full prompt sentinel"
+        assert {b["type"] for b in content_blocks} == {"text", "thinking"}
+        assert content_blocks[0]["text"] == "full assistant response sentinel"
+        assert kwargs["system_prompt"] == "system prompt sentinel"
+
     def test_falls_back_to_session_id_when_session_key_blank(self):
         emit = _import_helper()
         dd_obs = _make_dd_obs(sync_returns=True)

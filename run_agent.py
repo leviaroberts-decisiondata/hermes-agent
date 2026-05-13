@@ -892,10 +892,106 @@ def _build_hermes_context_usage_payload(
     }
 
 
+def _dd_obs_json(value: Any) -> Optional[str]:
+    """JSON-encode observability content without failing the agent loop."""
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        try:
+            return json.dumps(str(value), ensure_ascii=False)
+        except Exception:
+            return None
+
+
+def _dd_obj_to_plain(value: Any) -> Any:
+    """Best-effort object → JSON-ish conversion for provider SDK objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _dd_obj_to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_dd_obj_to_plain(v) for v in value]
+    for attr in ("model_dump", "dict", "to_dict"):
+        fn = getattr(value, attr, None)
+        if callable(fn):
+            try:
+                return _dd_obj_to_plain(fn())
+            except Exception:
+                pass
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                str(k): _dd_obj_to_plain(v)
+                for k, v in vars(value).items()
+                if not str(k).startswith("_")
+            }
+        except Exception:
+            pass
+    return str(value)
+
+
+def _dd_response_content_blocks(response_obj: Any) -> list:
+    """Normalize provider response content into MC generation_content blocks."""
+    if response_obj is None:
+        return []
+    try:
+        # Anthropic Messages: response.content is already a list of content blocks.
+        content = getattr(response_obj, "content", None)
+        if isinstance(content, list):
+            return _dd_obj_to_plain(content)
+        if isinstance(content, str) and content:
+            return [{"type": "text", "text": content}]
+
+        # OpenAI Chat Completions-compatible responses.
+        choices = getattr(response_obj, "choices", None)
+        if choices:
+            choice0 = choices[0]
+            message = getattr(choice0, "message", None)
+            if message is not None:
+                blocks = []
+                msg_content = getattr(message, "content", None)
+                if msg_content:
+                    blocks.append({"type": "text", "text": msg_content})
+                reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+                if reasoning:
+                    blocks.append({"type": "thinking", "thinking": reasoning})
+                tool_calls = getattr(message, "tool_calls", None) or []
+                for tc in tool_calls:
+                    fn = getattr(tc, "function", None)
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": getattr(tc, "id", None),
+                        "name": getattr(fn, "name", None) if fn else None,
+                        "input": getattr(fn, "arguments", None) if fn else _dd_obj_to_plain(tc),
+                    })
+                return blocks
+
+        # OpenAI Responses/Codex style.
+        output = getattr(response_obj, "output", None)
+        if output:
+            blocks = []
+            for item in output:
+                plain = _dd_obj_to_plain(item)
+                if isinstance(plain, dict) and plain.get("content"):
+                    for c in plain.get("content") or []:
+                        blocks.append(c if isinstance(c, dict) else {"type": "text", "text": str(c)})
+                else:
+                    blocks.append(plain if isinstance(plain, dict) else {"type": "text", "text": str(plain)})
+            return blocks
+        output_text = getattr(response_obj, "output_text", None)
+        if output_text:
+            return [{"type": "text", "text": output_text}]
+    except Exception:
+        pass
+    return [{"type": "raw_response", "text": str(_dd_obj_to_plain(response_obj))}]
+
+
 def _emit_dd_per_call_generation(
     *,
     dd_obs_module,
-    run_id: str,
+    run_id: Optional[str],
     session_key: Optional[str],
     session_id_fallback: Optional[str],
     model: str,
@@ -906,6 +1002,9 @@ def _emit_dd_per_call_generation(
     canonical_usage: Any,
     cost_amount_usd: Optional[float],
     dd_context: Optional[dict],
+    request_messages: Any = None,
+    response_obj: Any = None,
+    system_prompt: Optional[str] = None,
 ) -> None:
     """Emit a per-API-call /log_generation row for a Hermes gateway turn.
 
@@ -930,6 +1029,8 @@ def _emit_dd_per_call_generation(
         _cache_write = int(getattr(canonical_usage, "cache_write_tokens", 0) or 0)
         _cost = float(cost_amount_usd) if cost_amount_usd is not None else 0.0
         _latency = int(latency_ms) if latency_ms is not None else None
+        _request_messages_json = _dd_obs_json(request_messages)
+        _content_blocks_json = _dd_obs_json(_dd_response_content_blocks(response_obj))
         ok = dd_obs_module.log_generation_sync(
             generation_id=_uuid.uuid4().hex,
             session_id=session_key or session_id_fallback or "",
@@ -944,6 +1045,9 @@ def _emit_dd_per_call_generation(
             cost_total_usd=_cost,
             completed_at=completed_at,
             latency_ms=_latency,
+            request_messages=_request_messages_json,
+            content_blocks=_content_blocks_json,
+            system_prompt=system_prompt,
         )
         if ok and isinstance(dd_context, dict):
             dd_context["per_call_generation_emitted"] = True
@@ -11713,6 +11817,9 @@ class AIAgent:
                                     canonical_usage=canonical_usage,
                                     cost_amount_usd=cost_result.amount_usd,
                                     dd_context=_dd_call_context,
+                                    request_messages=api_messages,
+                                    response_obj=response,
+                                    system_prompt=active_system_prompt,
                                 )
                             except Exception:
                                 pass  # never block the agent loop
