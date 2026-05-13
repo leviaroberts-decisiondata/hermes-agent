@@ -144,7 +144,10 @@ def log_spawn(
         "run_id": run_id,
         "parent_run_id": parent_run_id,
         "session_key": session_key,
-        "task_prompt": (task_prompt or "")[:500],
+        # Do not pre-truncate here. MC run detail already has explicit preview
+        # surfaces; full captured payload debugging depends on ingest receiving
+        # the complete prompt when callers have it.
+        "task_prompt": task_prompt or "",
         "label": label,
         "model": model,
         "provider": provider,
@@ -172,7 +175,10 @@ def log_complete(
     payload = {
         "run_id": run_id,
         "status": status,
-        "result_summary": (result_summary or "")[:200],
+        # Preserve the full captured result for MC's collapsed Full Captured
+        # Result section. UI/API layers can derive previews; this client should
+        # not destroy forensic context before ingest.
+        "result_summary": result_summary or "",
         "input_tokens": int(input_tokens or 0),
         "output_tokens": int(output_tokens or 0),
         "cache_read_tokens": int(cache_read_tokens or 0),
@@ -246,6 +252,10 @@ def log_generation(
     latency_ms: Optional[int] = None,
     stop_reason: Optional[str] = None,
     cwd: Optional[str] = None,
+    content_blocks: Optional[str] = None,
+    request_messages: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    thinking_text: Optional[str] = None,
 ) -> None:
     payload: Dict[str, Any] = {
         "generation_id": generation_id,
@@ -275,6 +285,14 @@ def log_generation(
         payload["stop_reason"] = stop_reason
     if cwd:
         payload["cwd"] = cwd
+    if content_blocks is not None:
+        payload["content_blocks"] = content_blocks
+    if request_messages is not None:
+        payload["request_messages"] = request_messages
+    if system_prompt is not None:
+        payload["system_prompt"] = system_prompt
+    if thinking_text is not None:
+        payload["thinking_text"] = thinking_text
     _post_async("/log_generation", payload)
 
 
@@ -295,6 +313,10 @@ def log_generation_sync(
     latency_ms: Optional[int] = None,
     stop_reason: Optional[str] = None,
     cwd: Optional[str] = None,
+    content_blocks: Optional[str] = None,
+    request_messages: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    thinking_text: Optional[str] = None,
 ) -> bool:
     """Synchronous /log_generation. Returns True iff obs-ingest accepted (2xx).
 
@@ -326,6 +348,14 @@ def log_generation_sync(
         payload["stop_reason"] = stop_reason
     if cwd:
         payload["cwd"] = cwd
+    if content_blocks is not None:
+        payload["content_blocks"] = content_blocks
+    if request_messages is not None:
+        payload["request_messages"] = request_messages
+    if system_prompt is not None:
+        payload["system_prompt"] = system_prompt
+    if thinking_text is not None:
+        payload["thinking_text"] = thinking_text
     return _post_sync("/log_generation", payload)
 
 
