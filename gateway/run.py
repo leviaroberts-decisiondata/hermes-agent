@@ -791,10 +791,37 @@ def _dd_observability_run_id(session_id: str | None, generation: Optional[int] =
     return f"hermes-{base}-{suffix}"
 
 
+def _dd_observability_active_profile() -> str:
+    """Return the active Hermes profile name, or "" for the default gateway.
+
+    Best-effort: never raises into the emit path. "default"/"custom"/unknown
+    all map to "" so the default gateway keeps the legacy un-segmented key.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        prof = get_active_profile_name()
+    except Exception:
+        return ""
+    if not prof or prof == "default" or prof == "custom":
+        return ""
+    return prof
+
+
 def _dd_observability_session_key(session_id: str | None) -> str:
-    """Build the MC Live grouping key expected by the Hermes tree mapper."""
+    """Build the MC Live grouping key expected by the Hermes tree mapper.
+
+    Specialist profile gateways encode their profile as a dedicated segment —
+    ``agent:hermes:gateway:<profile>:<session>`` — so MC /live can split them
+    into per-profile cards. The default gateway keeps the legacy
+    ``agent:hermes:gateway:<session>`` form (non-breaking). Profile names are
+    colon-free, so positional parsing on the MC side stays unambiguous.
+    """
     base = re.sub(r"[^A-Za-z0-9_.:-]+", "-", session_id or "session").strip("-")[:96]
-    return f"agent:hermes:gateway:{base or uuid.uuid4().hex[:8]}"
+    base = base or uuid.uuid4().hex[:8]
+    profile = _dd_observability_active_profile()
+    if profile:
+        return f"agent:hermes:gateway:{profile}:{base}"
+    return f"agent:hermes:gateway:{base}"
 
 
 def _attach_dd_context_for_turn(
@@ -10753,11 +10780,14 @@ class GatewayRunner:
 
             _dd_provider = (turn_route.get("runtime") or {}).get("provider") or runtime_kwargs.get("provider")
             _dd_model = turn_route.get("model") or model
+            _dd_profile = _dd_observability_active_profile()
             _dd_observability_post("/log_spawn", {
                 "run_id": _dd_run_id,
                 "session_key": _dd_session_key,
                 "task_prompt": str(message)[:1000],
-                "label": f"Hermes {platform_key} turn",
+                "label": (f"Hermes {_dd_profile} turn" if _dd_profile
+                          else f"Hermes {platform_key} turn"),
+                "profile": _dd_profile or "default",
                 "model": _dd_model,
                 "provider": _dd_provider,
                 "spawned_at": _utc_iso(),
