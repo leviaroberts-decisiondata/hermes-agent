@@ -5064,6 +5064,25 @@ class AIAgent:
 
 
 
+    def _context_tree_injection_enabled(self) -> bool:
+        """Whether to inject the DecisionData /context tree awareness block.
+
+        Reads `context.tree_injection` from the active profile's config.yaml
+        (HERMES_HOME-scoped, mtime-cached → hot-reloads per turn). Default False,
+        so behavior is unchanged for any profile that does not opt in. Fail-soft:
+        any error → False (no injection).
+        """
+        try:
+            from hermes_cli.config import load_config as _load_ct_cfg
+            cfg = _load_ct_cfg() or {}
+            ctx = cfg.get("context") or {}
+            val = ctx.get("tree_injection")
+            if isinstance(val, bool):
+                return val
+            return str(val).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        except Exception:
+            return False
+
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
@@ -5200,6 +5219,19 @@ class AIAgent:
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
+
+        # DecisionData /context tree awareness injection (gateway mirror of the
+        # Slack canary). Gated by config `context.tree_injection` (default off so
+        # only profiles that opt in get it). Read-only, fail-soft: a missing tree
+        # or disabled flag yields no block and leaves the prompt unchanged.
+        if self._context_tree_injection_enabled():
+            try:
+                from agent.prompt_builder import build_context_tree_prompt
+                _ctx_tree = build_context_tree_prompt()
+                if _ctx_tree:
+                    prompt_parts.append(_ctx_tree)
+            except Exception:
+                logger.debug("context-tree injection skipped (error)", exc_info=True)
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()

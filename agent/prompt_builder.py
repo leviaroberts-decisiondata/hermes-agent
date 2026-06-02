@@ -1080,6 +1080,95 @@ def _load_cursorrules(cwd_path: Path) -> str:
     return _truncate_content(cursorrules_content, ".cursorrules")
 
 
+# --- DecisionData /context tree injection (gateway mirror of the Slack canary) ----
+# Mirrors dd-slack-service/src/context-tree.js: load the AWARENESS-level _node.md
+# summaries from the shared ~/.hermes/context tree and render a lower-precedence
+# background block. Read-only, fail-soft (any error → empty block → today's
+# behavior). The tree is SHARED across profiles (home-anchored), not per-profile,
+# so it is NOT resolved via HERMES_HOME (which points at a profile dir for
+# specialists). Override with DD_CONTEXT_TREE_ROOT (tests / relocation).
+_CONTEXT_TREE_AWARENESS_NODES = ["global", "operating-model", "platform"]
+_CONTEXT_TREE_PER_NODE_CHAR_CAP = 6000
+_CONTEXT_TREE_TOTAL_CHAR_CAP = 20000
+
+
+def _context_tree_root() -> Path:
+    override = os.getenv("DD_CONTEXT_TREE_ROOT")
+    if override:
+        return Path(override)
+    return Path.home() / ".hermes" / "context"
+
+
+def _strip_frontmatter(raw: str) -> str:
+    """Strip a leading YAML frontmatter block (--- ... ---); return the body."""
+    text = (raw or "").strip("﻿")
+    if not text.startswith("---"):
+        return text.strip()
+    closing = text.find("\n---", 3)
+    if closing == -1:
+        return text.strip()
+    after = text.find("\n", closing + 1)
+    if after == -1:
+        return ""
+    return text[after + 1:].strip()
+
+
+def _load_context_tree_node(slug: str, root: Path) -> Optional[str]:
+    """Load one awareness node's summary body by fixed slug. None on any failure."""
+    if slug not in _CONTEXT_TREE_AWARENESS_NODES:
+        return None
+    node_file = (root / slug / "_node.md").resolve()
+    # Defence in depth: resolved path must stay inside the tree root.
+    if not str(node_file).startswith(str(root.resolve()) + os.sep):
+        return None
+    try:
+        raw = node_file.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    body = _strip_frontmatter(raw)
+    if not body:
+        return None
+    if len(body) > _CONTEXT_TREE_PER_NODE_CHAR_CAP:
+        return body[:_CONTEXT_TREE_PER_NODE_CHAR_CAP] + (
+            f"\n[...node truncated to {_CONTEXT_TREE_PER_NODE_CHAR_CAP} chars...]"
+        )
+    return body
+
+
+def build_context_tree_prompt(root: Optional[Path] = None) -> str:
+    """Render the DecisionData /context tree awareness block for a turn.
+
+    Mirrors the Slack canary loader (awareness _node.md summaries only, no
+    detail/ walk), capped and fail-soft. Returns "" when nothing loads, so the
+    system prompt is unchanged on a missing/broken tree. The block is explicitly
+    LOWER precedence than the live turn and never overrides the requested output.
+    """
+    tree_root = root or _context_tree_root()
+    sections = []
+    loaded = []
+    total = 0
+    for slug in _CONTEXT_TREE_AWARENESS_NODES:
+        body = _load_context_tree_node(slug, tree_root)
+        if not body:
+            continue
+        if total + len(body) > _CONTEXT_TREE_TOTAL_CHAR_CAP:
+            break
+        sections.append(f"### context: {slug}\n{body}")
+        loaded.append(slug)
+        total += len(body)
+    if not sections:
+        return ""
+    header = "\n".join([
+        "--- DecisionData /context tree (awareness; background system + operating context) ---",
+        "These are durable, git-versioned awareness summaries from the shared /context tree.",
+        "They are LOWER precedence than the current request — they set operating defaults and",
+        "system awareness, and must never override the requested output for this turn. If a",
+        "summary disagrees with its named source of truth, the source wins.",
+    ])
+    logger.debug("context-tree injected nodes: %s (%d chars)", loaded, total)
+    return f"{header}\n\n" + "\n\n".join(sections)
+
+
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:
     """Discover and load context files for the system prompt.
 
