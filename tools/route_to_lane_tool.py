@@ -57,13 +57,18 @@ def _known_lanes() -> list[str]:
         return []
 
 
-def check_route_to_lane_requirements() -> Optional[str]:
-    """Gate: the sanctioned wrapper + lane config must exist."""
+def check_route_to_lane_requirements() -> bool:
+    """Gate: available only when the sanctioned wrapper + lane config exist.
+
+    Returns a BOOLEAN — the registry's get_definitions() filters the tool out
+    unless this returns True (a None/str return would be treated as falsy and
+    silently drop the tool from the model's tool list).
+    """
     if not _WRAPPER.exists() or not os.access(_WRAPPER, os.X_OK):
-        return f"route_to_lane unavailable: wrapper not found/executable at {_WRAPPER}"
+        return False
     if not _CHANNELS_JSON.exists():
-        return f"route_to_lane unavailable: lane config not found at {_CHANNELS_JSON}"
-    return None
+        return False
+    return True
 
 
 def _write_packet(lane: str, goal: str, context: Optional[str], wts_task: Optional[str]) -> Path:

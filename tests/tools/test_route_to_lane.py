@@ -58,6 +58,25 @@ def _argv(fake_tree):
     return fake_tree["argv_log"].read_text(encoding="utf-8").splitlines()
 
 
+class TestRegistryGate:
+    """The check_fn must return a BOOLEAN — registry.get_definitions() filters
+    the tool out of the model's tool list on any falsy (None/str) return."""
+
+    def test_check_fn_returns_true_when_available(self):
+        # The real wrapper + channels.json exist in the live tree.
+        assert r2l.check_route_to_lane_requirements() is True
+
+    def test_tool_surfaces_in_registry_definitions(self):
+        import tools.route_to_lane_tool  # ensure registered
+        from tools.registry import registry
+        defs = registry.get_definitions({"route_to_lane"}, quiet=True)
+        names = {d["function"]["name"] for d in defs}
+        assert "route_to_lane" in names, (
+            "route_to_lane was filtered out of registry definitions — check_fn "
+            "must return True, not None/str."
+        )
+
+
 # ── I1: correct invocation ────────────────────────────────────────────────
 class TestI1CorrectInvocation:
     def test_emits_lane_and_packet_flags(self, fake_tree, monkeypatch):
