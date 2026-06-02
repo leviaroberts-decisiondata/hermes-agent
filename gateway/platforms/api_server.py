@@ -973,7 +973,13 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    # Follow compression forks: if this session was compressed,
+                    # its transcript lives in a descendant child session. Redirect
+                    # only the HISTORY LOAD to that child; new-turn writes still
+                    # use the caller-supplied session_id. Safe for non-forked ids
+                    # (returns the same id when the session already has messages).
+                    resume_id = db.resolve_resume_session_id(session_id)
+                    history = db.get_messages_as_conversation(resume_id)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []

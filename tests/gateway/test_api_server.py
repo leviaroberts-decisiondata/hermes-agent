@@ -2543,3 +2543,43 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+    @pytest.mark.asyncio
+    async def test_resume_follows_compression_fork(self, auth_adapter):
+        """A resume of a compressed/forked session loads the child's transcript.
+
+        The history-load id is routed through resolve_resume_session_id (which
+        follows compression forks), while the new turn's writes still use the
+        caller-supplied session_id unchanged.
+        """
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        child_history = [
+            {"role": "user", "content": "msg in forked child"},
+            {"role": "assistant", "content": "reply in forked child"},
+        ]
+        mock_db = MagicMock()
+        # Parent was compressed: its messages live in the descendant child.
+        mock_db.resolve_resume_session_id.return_value = "child-session-456"
+        mock_db.get_messages_as_conversation.return_value = child_history
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "parent-session-123", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Continue"}]},
+                )
+
+            assert resp.status == 200
+            # Fork-follow was consulted with the caller-supplied id...
+            mock_db.resolve_resume_session_id.assert_called_once_with("parent-session-123")
+            # ...and the history load used the redirected child id.
+            mock_db.get_messages_as_conversation.assert_called_once_with("child-session-456")
+            call_kwargs = mock_run.call_args.kwargs
+            # History comes from the child; new-turn writes stay on the caller's id.
+            assert call_kwargs["conversation_history"] == child_history
+            assert call_kwargs["session_id"] == "parent-session-123"
+            assert resp.headers.get("X-Hermes-Session-Id") == "parent-session-123"
