@@ -1113,19 +1113,64 @@ def _strip_frontmatter(raw: str) -> str:
     return text[after + 1:].strip()
 
 
-def _load_context_tree_node(slug: str, root: Path) -> Optional[str]:
-    """Load one awareness node's summary body by fixed slug. None on any failure."""
-    if slug not in _CONTEXT_TREE_AWARENESS_NODES:
-        return None
-    node_file = (root / slug / "_node.md").resolve()
-    # Defence in depth: resolved path must stay inside the tree root.
-    if not str(node_file).startswith(str(root.resolve()) + os.sep):
+# Per-audience role views the operating-model node composes with the shared
+# core. Keys are the audience labels passed by each loader; values are the
+# role-view filename under operating-model/agent-roles/. Only WIRED audiences
+# appear here (dispatch/claude-code/openclaw are tree-side stubs, not composed).
+_OPERATING_MODEL_VIEW_BY_AUDIENCE = {
+    "p1-specialists": "p1-specialists",
+    "slack-project-agent": "slack-project-agent",
+}
+
+
+def _read_node_body(node_file: Path, root: Path) -> Optional[str]:
+    """Read + frontmatter-strip a node file, guarded to stay inside the root."""
+    resolved = node_file.resolve()
+    if not str(resolved).startswith(str(root.resolve()) + os.sep):
         return None
     try:
-        raw = node_file.read_text(encoding="utf-8")
+        raw = resolved.read_text(encoding="utf-8")
     except Exception:
         return None
     body = _strip_frontmatter(raw)
+    return body or None
+
+
+def compose_operating_model(root: Path, audience: str) -> Optional[str]:
+    """Compose the operating-model payload = shared _core.md + the audience role view.
+
+    The shared core is the single source of truth for the inter-layer boundary;
+    the role view describes only the reader's own role. Returns the composed
+    body, or the core alone if the audience has no wired view, or None if the
+    core is unreadable (caller falls back to the legacy _node.md).
+    """
+    core = _read_node_body(root / "operating-model" / "_core.md", root)
+    if not core:
+        return None
+    view_slug = _OPERATING_MODEL_VIEW_BY_AUDIENCE.get(audience)
+    view = None
+    if view_slug:
+        view = _read_node_body(
+            root / "operating-model" / "agent-roles" / f"{view_slug}.md", root
+        )
+    return f"{core}\n\n{view}" if view else core
+
+
+def _load_context_tree_node(slug: str, root: Path, audience: str = "p1-specialists") -> Optional[str]:
+    """Load one awareness node's summary body by fixed slug. None on any failure.
+
+    For the ``operating-model`` slug, compose the shared core + the audience's
+    role view (alignment-by-construction split). Other slugs load their _node.md.
+    """
+    if slug not in _CONTEXT_TREE_AWARENESS_NODES:
+        return None
+    if slug == "operating-model":
+        body = compose_operating_model(root, audience)
+        if body is None:
+            # Fall back to the legacy single _node.md if core is missing.
+            body = _read_node_body(root / slug / "_node.md", root)
+    else:
+        body = _read_node_body(root / slug / "_node.md", root)
     if not body:
         return None
     if len(body) > _CONTEXT_TREE_PER_NODE_CHAR_CAP:
@@ -1135,7 +1180,7 @@ def _load_context_tree_node(slug: str, root: Path) -> Optional[str]:
     return body
 
 
-def build_context_tree_prompt(root: Optional[Path] = None) -> str:
+def build_context_tree_prompt(root: Optional[Path] = None, audience: str = "p1-specialists") -> str:
     """Render the DecisionData /context tree awareness block for a turn.
 
     Mirrors the Slack canary loader (awareness _node.md summaries only, no
@@ -1148,7 +1193,7 @@ def build_context_tree_prompt(root: Optional[Path] = None) -> str:
     loaded = []
     total = 0
     for slug in _CONTEXT_TREE_AWARENESS_NODES:
-        body = _load_context_tree_node(slug, tree_root)
+        body = _load_context_tree_node(slug, tree_root, audience=audience)
         if not body:
             continue
         if total + len(body) > _CONTEXT_TREE_TOTAL_CHAR_CAP:
