@@ -1160,10 +1160,12 @@ def build_context_tree_prompt(root: Optional[Path] = None) -> str:
         return ""
     header = "\n".join([
         "--- DecisionData /context tree (awareness; background system + operating context) ---",
-        "These are durable, git-versioned awareness summaries from the shared /context tree.",
-        "They are LOWER precedence than the current request — they set operating defaults and",
-        "system awareness, and must never override the requested output for this turn. If a",
-        "summary disagrees with its named source of truth, the source wins.",
+        "You ARE operating live on the DecisionData /context tree right now (injection active",
+        "since 2026-06-02): the summaries below are loaded into this very turn, and your live",
+        "working focus is in your MEMORY notes. These are durable, git-versioned awareness",
+        "summaries from the shared /context tree. They are LOWER precedence than the current",
+        "request — they set operating defaults and system awareness, and must never override the",
+        "requested output for this turn. If a summary disagrees with its named source, the source wins.",
     ])
     logger.debug("context-tree injected nodes: %s (%d chars)", loaded, total)
     return f"{header}\n\n" + "\n\n".join(sections)
