@@ -2583,3 +2583,136 @@ class TestSessionIdHeader:
             assert call_kwargs["conversation_history"] == child_history
             assert call_kwargs["session_id"] == "parent-session-123"
             assert resp.headers.get("X-Hermes-Session-Id") == "parent-session-123"
+
+
+# ---------------------------------------------------------------------------
+# Per-request + config reasoning_effort resolution (_create_agent precedence)
+# ---------------------------------------------------------------------------
+class TestReasoningEffortResolution:
+    """_create_agent resolves reasoning_config with precedence:
+    per-request value > config agent.reasoning_effort > None (codex default).
+    """
+
+    def _make_adapter(self):
+        config = PlatformConfig(enabled=True)
+        return APIServerAdapter(config)
+
+    def _capture_reasoning_config(self, *, request_effort, config_effort):
+        """Invoke _create_agent and return the reasoning_config passed to AIAgent.
+
+        AIAgent and all heavy gateway helpers are patched so the call is a pure
+        unit test of the precedence/resolution logic.
+        """
+        from hermes_constants import parse_reasoning_effort
+
+        adapter = self._make_adapter()
+        captured = {}
+
+        def _fake_aiagent(*args, **kwargs):
+            captured["reasoning_config"] = kwargs.get("reasoning_config")
+            return MagicMock()
+
+        cfg_value = parse_reasoning_effort(config_effort) if config_effort else None
+
+        with patch("run_agent.AIAgent", side_effect=_fake_aiagent), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}), \
+             patch("gateway.run._resolve_gateway_model", return_value="gpt-5.5"), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value=set()), \
+             patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None), \
+             patch("gateway.run.GatewayRunner._load_reasoning_config", return_value=cfg_value), \
+             patch.object(adapter, "_ensure_session_db", return_value=None):
+            adapter._create_agent(reasoning_effort=request_effort)
+        return captured["reasoning_config"]
+
+    def test_request_value_wins_over_config(self):
+        # request=low, config=medium → low
+        rc = self._capture_reasoning_config(request_effort="low", config_effort="medium")
+        assert rc == {"enabled": True, "effort": "low"}
+
+    def test_config_used_when_no_request_value(self):
+        # request=None, config=medium → medium
+        rc = self._capture_reasoning_config(request_effort=None, config_effort="medium")
+        assert rc == {"enabled": True, "effort": "medium"}
+
+    def test_none_when_neither_set(self):
+        # request=None, config=None → None (codex transport applies its default)
+        rc = self._capture_reasoning_config(request_effort=None, config_effort=None)
+        assert rc is None
+
+    def test_invalid_request_value_falls_through_to_config(self):
+        # request="bogus" (invalid) → ignored → config medium
+        rc = self._capture_reasoning_config(request_effort="bogus", config_effort="medium")
+        assert rc == {"enabled": True, "effort": "medium"}
+
+    def test_none_effort_disables_reasoning(self):
+        # request="none" → {"enabled": False}
+        rc = self._capture_reasoning_config(request_effort="none", config_effort="medium")
+        assert rc == {"enabled": False}
+
+
+class TestReasoningEffortRequestParsing:
+    """_handle_chat_completions extracts reasoning_effort from body or the
+    X-Hermes-Reasoning header, validates it, and threads it to _run_agent.
+    """
+
+    def _make_request(self, body, headers=None):
+        req = MagicMock()
+        req.json = AsyncMock(return_value=body)
+        req.headers = headers or {}
+        return req
+
+    async def _invoke_capture(self, body, headers=None):
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        captured = {}
+
+        async def _fake_run_agent(*args, **kwargs):
+            captured["reasoning_effort"] = kwargs.get("reasoning_effort")
+            return ({"role": "assistant", "content": "ok"},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+
+        req = self._make_request(body, headers)
+        with patch.object(adapter, "_check_auth", return_value=None), \
+             patch.object(adapter, "_run_agent", side_effect=_fake_run_agent), \
+             patch.object(adapter, "_resolve_session_id", return_value=(None, None)) \
+                 if hasattr(adapter, "_resolve_session_id") else patch("builtins.id", side_effect=id):
+            try:
+                await adapter._handle_chat_completions(req)
+            except Exception:
+                # Response assembly past _run_agent isn't under test; the
+                # captured reasoning_effort is what matters.
+                pass
+        return captured.get("reasoning_effort")
+
+    @pytest.mark.asyncio
+    async def test_body_field_low(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"})
+        assert eff == "low"
+
+    @pytest.mark.asyncio
+    async def test_header_alt_when_no_body_field(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Hermes-Reasoning": "high"})
+        assert eff == "high"
+
+    @pytest.mark.asyncio
+    async def test_body_field_beats_header(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"},
+            headers={"X-Hermes-Reasoning": "high"})
+        assert eff == "low"
+
+    @pytest.mark.asyncio
+    async def test_invalid_value_ignored(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "bogus"})
+        assert eff is None
+
+    @pytest.mark.asyncio
+    async def test_absent_is_none(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}]})
+        assert eff is None

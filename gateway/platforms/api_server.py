@@ -736,6 +736,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         dd_obs_meta: Optional[Dict[str, str]] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -762,6 +763,25 @@ class APIServerAdapter(BasePlatformAdapter):
         from gateway.run import GatewayRunner
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # Reasoning effort precedence: per-request override > config
+        # (agent.reasoning_effort, same helper the chat path uses) > None
+        # (None lets the codex transport apply its medium default).
+        # parse_reasoning_effort returns a reasoning_config dict or None;
+        # an invalid request value is silently ignored (falls through to
+        # config), validated upstream in _handle_chat_completions.
+        reasoning_config = None
+        if reasoning_effort:
+            try:
+                from hermes_constants import parse_reasoning_effort
+                reasoning_config = parse_reasoning_effort(reasoning_effort)
+            except Exception:
+                reasoning_config = None
+        if reasoning_config is None:
+            try:
+                reasoning_config = GatewayRunner._load_reasoning_config()
+            except Exception:
+                reasoning_config = None
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -778,7 +798,13 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            reasoning_config=reasoning_config,
         )
+        if reasoning_config is not None:
+            logger.debug(
+                "[api_server] reasoning_config resolved: %s (request_effort=%s)",
+                reasoning_config, reasoning_effort or "<none>",
+            )
         # DecisionData observability — propagate run lineage from caller.
         if dd_obs_meta:
             try:
@@ -905,6 +931,23 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = body.get("stream", False)
+
+        # Per-request reasoning override: JSON body field `reasoning_effort`
+        # (preferred) or header `X-Hermes-Reasoning` (alt). Validated here;
+        # an invalid/unknown value is ignored (None) so resolution falls
+        # through to config (agent.reasoning_effort) at _create_agent time.
+        # Precedence: request > config > codex transport default (medium).
+        _req_reasoning = body.get("reasoning_effort")
+        if not isinstance(_req_reasoning, str) or not _req_reasoning.strip():
+            _req_reasoning = request.headers.get("X-Hermes-Reasoning")
+        reasoning_effort: Optional[str] = None
+        if isinstance(_req_reasoning, str) and _req_reasoning.strip():
+            try:
+                from hermes_constants import parse_reasoning_effort
+                if parse_reasoning_effort(_req_reasoning) is not None:
+                    reasoning_effort = _req_reasoning.strip().lower()
+            except Exception:
+                reasoning_effort = None
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -1141,6 +1184,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 dd_obs_meta=_dd_meta_for_stream,
+                reasoning_effort=reasoning_effort,
             ))
 
             _dd_lifecycle = None
@@ -1163,6 +1207,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 dd_obs_meta=_dd_meta,
+                reasoning_effort=reasoning_effort,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2493,6 +2538,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         dd_obs_meta: Optional[Dict[str, str]] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2516,6 +2562,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 dd_obs_meta=dd_obs_meta,
+                reasoning_effort=reasoning_effort,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
