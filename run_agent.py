@@ -5083,6 +5083,38 @@ class AIAgent:
         except Exception:
             return False
 
+    def _resolve_context_audience(self) -> str:
+        """WS4 S1 — resolve the context-tree audience from the live identity.
+
+        Replaces the blind default ("p1-specialists") that gave every profile the
+        coordinator role view. Resolution order (WS4 §4.1):
+          1. delivery turn (skip_context_files + not load_soul_identity, set by the
+             §4 replace_identity path) → slack-project-agent (the delivery role);
+          2. platform == slack/api_server delivery → slack-project-agent;
+          3. profile == default → p1-default (the coordinator view);
+          4. profile is one of the 10 lane profiles → that lane's own view;
+          5. fallback → p1-default (safe coordinator default; NEVER silently the
+             generic p1-specialists).
+        Fail-soft: any error → p1-default.
+        """
+        try:
+            # A delivery turn (replace_identity) wants the delivery role, not P1.
+            if getattr(self, "skip_context_files", False) and not getattr(self, "load_soul_identity", True):
+                return "slack-project-agent"
+            platform = (self.platform or "").lower().strip()
+            if platform == "slack":
+                return "slack-project-agent"
+            from hermes_cli.profiles import get_active_profile_name
+            profile = (get_active_profile_name() or "").strip()
+            if profile == "default" or not profile:
+                return "p1-default"
+            from agent.prompt_builder import _LANE_PROFILE_AUDIENCES
+            if profile in _LANE_PROFILE_AUDIENCES:
+                return profile
+            return "p1-default"
+        except Exception:
+            return "p1-default"
+
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
@@ -5227,7 +5259,12 @@ class AIAgent:
         if self._context_tree_injection_enabled():
             try:
                 from agent.prompt_builder import build_context_tree_prompt
-                _ctx_tree = build_context_tree_prompt()
+                # WS4 S1-S3 — resolve the audience per caller instead of letting
+                # the default ("p1-specialists") stand in for every profile. This
+                # removes the second P1-family injection (the coordinator role
+                # view) from specialist + delivery turns. Fail-soft: errors fall
+                # back to the safe coordinator default inside the resolver.
+                _ctx_tree = build_context_tree_prompt(audience=self._resolve_context_audience())
                 if _ctx_tree:
                     prompt_parts.append(_ctx_tree)
             except Exception:

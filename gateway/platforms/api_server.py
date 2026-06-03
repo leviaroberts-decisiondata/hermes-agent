@@ -737,6 +737,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         dd_obs_meta: Optional[Dict[str, str]] = None,
         reasoning_effort: Optional[str] = None,
+        replace_identity: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -782,6 +783,20 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 reasoning_config = None
 
+        # WS1 §4 — delivery-distinct identity. When replace_identity is set, build
+        # the agent so the P1 coordinator SOUL is NOT identity slot #1:
+        #   skip_context_files=True  → skips the SOUL/AGENTS/.cursorrules block
+        #   load_soul_identity=False → does not force SOUL back in as identity
+        # Slot #1 then falls to DEFAULT_AGENT_IDENTITY and the delivery persona
+        # arrives via the appended ephemeral system message (acc-a). The second
+        # P1-family injection (the p1-specialists tree role view at
+        # run_agent.py:5230) is removed by the WS4 audience resolver in this same
+        # increment — both are required for acc-b. Default False → unchanged.
+        _identity_kwargs = (
+            {"skip_context_files": True, "load_soul_identity": False}
+            if replace_identity
+            else {}
+        )
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -789,6 +804,7 @@ class APIServerAdapter(BasePlatformAdapter):
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
+            **_identity_kwargs,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
@@ -1052,6 +1068,11 @@ class APIServerAdapter(BasePlatformAdapter):
         _dd_run_id = (request.headers.get("X-DD-Run-Id") or "").strip()
         _dd_parent_run_id = (request.headers.get("X-DD-Parent-Run-Id") or "").strip() or None
         _dd_wts_task_id = (request.headers.get("X-DD-WTS-Task-Id") or "").strip() or None
+        # WS1 §4 — delivery-distinct identity. When the dispatcher marks this a
+        # delivery turn, build the agent with skip_context_files=True +
+        # load_soul_identity=False so the P1 coordinator SOUL is NOT slot #1.
+        # Absent header → False → identical to today.
+        _dd_replace_identity = (request.headers.get("X-DD-Replace-Identity") or "").strip() in ("1", "true", "yes", "on")
         _dd_caller_supplied_run_id = bool(_dd_run_id)
         _dd_owns_lifecycle = False
         if not _dd_run_id:
@@ -1204,6 +1225,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 dd_obs_meta=_dd_meta_for_stream,
                 reasoning_effort=reasoning_effort,
+                replace_identity=_dd_replace_identity,
             ))
 
             _dd_lifecycle = None
@@ -1227,6 +1249,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 dd_obs_meta=_dd_meta,
                 reasoning_effort=reasoning_effort,
+                replace_identity=_dd_replace_identity,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2558,6 +2581,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         dd_obs_meta: Optional[Dict[str, str]] = None,
         reasoning_effort: Optional[str] = None,
+        replace_identity: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2582,6 +2606,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=tool_complete_callback,
                 dd_obs_meta=dd_obs_meta,
                 reasoning_effort=reasoning_effort,
+                replace_identity=replace_identity,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent

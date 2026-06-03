@@ -1120,7 +1120,16 @@ def _strip_frontmatter(raw: str) -> str:
 _OPERATING_MODEL_VIEW_BY_AUDIENCE = {
     "p1-specialists": "p1-specialists",
     "slack-project-agent": "slack-project-agent",
+    "p1-default": "p1-default",
 }
+
+# WS4 §4.1 — the 10 lane profiles whose own role view lives under
+# agent-roles/specialists/<profile>.md. When the audience is one of these, the
+# loader composes that specialist view (not the generic coordinator view).
+_LANE_PROFILE_AUDIENCES = frozenset({
+    "dd-design", "dd-engineer-1", "dd-engineer-2", "dd-engineer-3", "qa-review",
+    "dd-pmo", "architect-standards", "product-os", "knowledge-context", "devops-release",
+})
 
 
 def _read_node_body(node_file: Path, root: Path) -> Optional[str]:
@@ -1147,12 +1156,20 @@ def compose_operating_model(root: Path, audience: str) -> Optional[str]:
     core = _read_node_body(root / "operating-model" / "_core.md", root)
     if not core:
         return None
-    view_slug = _OPERATING_MODEL_VIEW_BY_AUDIENCE.get(audience)
     view = None
-    if view_slug:
+    # WS4 §4.1 — a known lane profile composes its OWN specialist view, not the
+    # generic coordinator view. This is the fix for the audience mis-assembly:
+    # every specialist resolves to agent-roles/specialists/<profile>.md.
+    if audience in _LANE_PROFILE_AUDIENCES:
         view = _read_node_body(
-            root / "operating-model" / "agent-roles" / f"{view_slug}.md", root
+            root / "operating-model" / "agent-roles" / "specialists" / f"{audience}.md", root
         )
+    if view is None:
+        view_slug = _OPERATING_MODEL_VIEW_BY_AUDIENCE.get(audience)
+        if view_slug:
+            view = _read_node_body(
+                root / "operating-model" / "agent-roles" / f"{view_slug}.md", root
+            )
     return f"{core}\n\n{view}" if view else core
 
 
