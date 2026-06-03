@@ -18,6 +18,7 @@ gate. The tool reports the resource's verdict honestly (including a 403 deny).
 """
 from __future__ import annotations
 
+import json
 import os
 
 from tools.registry import registry, tool_error
@@ -56,7 +57,10 @@ DEPLOY_APPROVE_SCHEMA = {
 }
 
 
-def deploy_approve(entry_id: str, decided_by: str = "system-a", force: bool = False) -> dict:
+def deploy_approve(entry_id: str, decided_by: str = "system-a", force: bool = False) -> str:
+    # Tool handlers MUST return a STRING (the agent's tool-result pipeline slices
+    # result[:500] for failure detection — a dict raises "unhashable type: slice").
+    # So every return path here is JSON-serialized.
     if not entry_id:
         return tool_error("entry_id is required")
     from gateway import capability_egress
@@ -76,7 +80,7 @@ def deploy_approve(entry_id: str, decided_by: str = "system-a", force: bool = Fa
 
     if resp.status_code == 403:
         # The gate denied — surface it honestly; do not pretend success.
-        return {
+        return json.dumps({
             "ok": False,
             "denied": True,
             "status_code": 403,
@@ -86,12 +90,12 @@ def deploy_approve(entry_id: str, decided_by: str = "system-a", force: bool = Fa
                 "DENIED by the capability gate — this turn lacks the System-A "
                 "(C4) capability to approve a deploy."
             ),
-        }
-    return {
+        })
+    return json.dumps({
         "ok": resp.status_code < 400,
         "status_code": resp.status_code,
         "result": payload,
-    }
+    })
 
 
 registry.register(
