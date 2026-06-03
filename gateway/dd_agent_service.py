@@ -45,6 +45,43 @@ def _safe_float(env_val: str | None, default: float) -> float:
 _TIMEOUT = _safe_float(os.getenv("AGENT_SERVICE_TIMEOUT"), 3.0)
 
 
+def _service_capability_headers() -> dict:
+    """Mint a short-lived SERVICE-tier capability credential for the gateway's
+    own control-plane writes to the gated :8510 registry/job-graph endpoints.
+
+    The agent-orchestration (:8510) capability gate (commit 4eeb2eac7) requires a
+    signed C6 (R-REG) credential on the P1-ledger writes (/jobs/{id}/p1-claim,
+    PATCH /jobs/{id}/p1-status). These writes are GATEWAY INFRASTRUCTURE — the
+    gateway recording that a job was claimed/completed — NOT a model effect. They
+    must therefore succeed for EVERY turn, delivery turns included, so this
+    credential is minted independently of the turn's System classification (it is
+    the gateway acting, not the model). It carries only the caps these writes
+    need (C6 registry + C7 job-graph), with a short TTL, signed by the same key
+    the gate verifies. If the signer key is unavailable, returns no header and
+    the call falls back to its existing non-fatal 403/skip path.
+
+    Mirrors the in-process post_with_capability pattern (capability_egress); the
+    credential is never placed in any subprocess env.
+    """
+    try:
+        from gateway import capability_gate as _cg
+        from gateway import capability_context as _cc
+
+        secret = _cc.get_signer_secret()
+        if not secret:
+            return {}
+        credential = _cg.mint(
+            system="A",
+            capabilities=(_cg.CAP_C6_REG, _cg.CAP_C7_JOB),
+            session_id="gateway-service",
+            secret=secret,
+            ttl_seconds=120,
+        )
+        return {_cc.CAPABILITY_HEADER: credential}
+    except Exception:  # noqa: BLE001 — never block a turn on credential minting
+        return {}
+
+
 def is_enabled() -> bool:
     """True only when the default-off flag is explicitly turned on."""
     return ENABLED
@@ -159,7 +196,11 @@ def p1_claim_job(
         import httpx
 
         with httpx.Client(timeout=_TIMEOUT) as client:
-            resp = client.post(f"{AGENT_SERVICE_URL}/jobs/{job_id}/p1-claim", json=body)
+            resp = client.post(
+                f"{AGENT_SERVICE_URL}/jobs/{job_id}/p1-claim",
+                json=body,
+                headers=_service_capability_headers(),
+            )
         if resp.status_code in (200, 201):
             logger.debug("p1-claim persisted to :8510 (job=%s)", job_id)
             return True
@@ -195,7 +236,11 @@ def p1_set_status(
         import httpx
 
         with httpx.Client(timeout=_TIMEOUT) as client:
-            resp = client.patch(f"{AGENT_SERVICE_URL}/jobs/{job_id}/p1-status", json=body)
+            resp = client.patch(
+                f"{AGENT_SERVICE_URL}/jobs/{job_id}/p1-status",
+                json=body,
+                headers=_service_capability_headers(),
+            )
         if resp.status_code in (200, 201):
             logger.debug("p1-status persisted to :8510 (job=%s status=%s)", job_id, status)
             return True
