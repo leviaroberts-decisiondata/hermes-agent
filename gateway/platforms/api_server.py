@@ -1124,16 +1124,31 @@ class APIServerAdapter(BasePlatformAdapter):
         # or routing. Non-fatal: a down/slow :8510 never blocks the turn. We fire
         # for every api_server turn (idempotent on the :8510 side, keyed on
         # session_id) so direct-caller AND dispatcher-forwarded sessions register.
+        # P5: the linked :8510 job_id for this turn, captured at registration so
+        # the turn-completion finally can write the P1-ledger status transition.
+        # None unless service registration is enabled AND :8510 returned a job_id.
+        _dd_p1_job_id: Optional[str] = None
         try:
             from gateway import dd_agent_service
 
             if dd_agent_service.is_enabled():
-                dd_agent_service.register_session_created(
+                # register_session_get_job_id is the same idempotent session-created
+                # POST as before, but returns the linked job_id so we can drive the
+                # P1 ledger. P5: a REAL P1 turn begins working a job here → claim it
+                # (the A-side ledger write that was previously unwired). Fail-soft:
+                # any :8510 error leaves _dd_p1_job_id None and the turn unchanged.
+                _dd_p1_job_id = dd_agent_service.register_session_get_job_id(
                     session_id,
                     model=model_name or "",
                     label="Hermes gateway session",
                     session_key=_dd_session_key,
                 )
+                if _dd_p1_job_id:
+                    dd_agent_service.p1_claim_job(
+                        _dd_p1_job_id,
+                        owner=_dd_session_key or "p1",
+                        priority="normal",
+                    )
         except Exception:
             pass  # registration must never block a turn
 
@@ -1238,6 +1253,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 dd_lifecycle=_dd_lifecycle,
+                p1_job_id=_dd_p1_job_id,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1332,11 +1348,25 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass  # observability never blocks
+            # P5: P1-ledger status transition on turn completion. Symmetric with
+            # the begin-of-turn p1-claim; fires only when a job was claimed
+            # (_dd_p1_job_id set). NOT gated on _dd_owns_lifecycle (that governs
+            # dd_obs, not the ledger). _dd_complete_status is "done" on success,
+            # "error" otherwise — the ledger has no "error" status, so a failed
+            # turn lands as "blocked" (honest: the work stopped, not finished).
+            if _dd_p1_job_id:
+                try:
+                    from gateway import dd_agent_service
+                    _p1_status = "done" if _dd_complete_status == "done" else "blocked"
+                    dd_agent_service.p1_set_status(_dd_p1_job_id, status=_p1_status)
+                except Exception:
+                    pass  # ledger write must never block a turn
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         dd_lifecycle: Optional[Dict[str, Any]] = None,
+        p1_job_id: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1495,6 +1525,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass  # observability never blocks
+            # P5: P1-ledger status transition for STREAMING turns — symmetric with
+            # the non-stream finally. Fires only when a job was claimed at begin.
+            # An interrupted stream (client disconnect) lands as "blocked" too, not
+            # "done": the work did not complete.
+            if p1_job_id:
+                try:
+                    from gateway import dd_agent_service
+                    _p1_status = "done" if _dd_complete_status == "done" else "blocked"
+                    dd_agent_service.p1_set_status(p1_job_id, status=_p1_status)
+                except Exception:
+                    pass  # ledger write must never block a turn
 
         return response
 

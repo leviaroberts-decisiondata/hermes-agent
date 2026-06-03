@@ -92,3 +92,93 @@ def test_empty_name_or_session_rejected(monkeypatch):
     mod = _reload_with_env(monkeypatch, ENABLE_AGENT_SERVICE_REGISTRATION="1")
     assert mod.register_agent("") is False
     assert mod.register_session_created("") is False
+
+
+# ── P5: P1-ledger write client (the previously-unwired persistence path) ──────
+
+
+def test_p1_ledger_writers_default_off_inert(monkeypatch):
+    """Flag unset → the ledger writers are inert (no HTTP), mirroring §2."""
+    mod = _reload_with_env(monkeypatch)
+    assert mod.is_enabled() is False
+    assert mod.register_session_get_job_id("sess-x") is None
+    assert mod.p1_claim_job("job-x") is False
+    assert mod.p1_set_status("job-x", status="done") is False
+
+
+def test_p1_ledger_writers_service_down_non_fatal(monkeypatch):
+    """Enabled but :8510 down → swallow the error, never raise."""
+    mod = _reload_with_env(
+        monkeypatch,
+        ENABLE_AGENT_SERVICE_REGISTRATION="1",
+        AGENT_SERVICE_URL="http://127.0.0.1:1",
+        AGENT_SERVICE_TIMEOUT="0.5",
+    )
+    assert mod.register_session_get_job_id("sess-x") is None
+    assert mod.p1_claim_job("job-x", owner="p1") is False
+    assert mod.p1_set_status("job-x", status="done") is False
+
+
+def test_p1_ledger_writers_empty_id_rejected(monkeypatch):
+    mod = _reload_with_env(monkeypatch, ENABLE_AGENT_SERVICE_REGISTRATION="1")
+    assert mod.register_session_get_job_id("") is None
+    assert mod.p1_claim_job("") is False
+    assert mod.p1_set_status("", status="done") is False
+    # An empty status body is a no-op (nothing to PATCH) → False, no HTTP.
+    assert mod.p1_set_status("job-x") is False
+
+
+def test_p1_ledger_writers_happy_path(monkeypatch):
+    """Begin-of-turn: session→job_id, then p1-claim. End-of-turn: p1-status.
+    Asserts the exact URLs/payloads the live :8510 endpoints expect."""
+    mod = _reload_with_env(
+        monkeypatch, ENABLE_AGENT_SERVICE_REGISTRATION="1", AGENT_SERVICE_URL="http://svc:8510"
+    )
+
+    calls = []
+
+    class _Resp:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {"job_id": "job-42", "agent_id": "a1", "message": "ok"}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None):
+            calls.append(("POST", url, json))
+            return _Resp()
+
+        def patch(self, url, json=None):
+            calls.append(("PATCH", url, json))
+            return _Resp()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "Client", _Client)
+
+    # Begin of turn: resolve the linked job_id from the idempotent session-created.
+    job_id = mod.register_session_get_job_id("sess-1", model="gpt", session_key="sk")
+    assert job_id == "job-42"
+    assert calls[-1] == ("POST", "http://svc:8510/gateway/session-created", calls[-1][2])
+
+    # Claim it (the A-side ledger write).
+    assert mod.p1_claim_job(job_id, owner="sk", priority="normal") is True
+    assert calls[-1] == (
+        "POST",
+        "http://svc:8510/jobs/job-42/p1-claim",
+        {"owner": "sk", "priority": "normal"},
+    )
+
+    # End of turn: status transition.
+    assert mod.p1_set_status(job_id, status="done") is True
+    assert calls[-1] == ("PATCH", "http://svc:8510/jobs/job-42/p1-status", {"status": "done"})

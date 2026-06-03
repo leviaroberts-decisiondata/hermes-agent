@@ -89,6 +89,123 @@ def register_session_created(
         return False
 
 
+def register_session_get_job_id(
+    session_id: str,
+    *,
+    model: str | None = None,
+    label: str | None = None,
+    session_key: str | None = None,
+    initiated_by: str = "hermes-gateway",
+) -> str | None:
+    """Best-effort POST /gateway/session-created, returning the linked :8510 job_id.
+
+    Same wire call as register_session_created (idempotent on the :8510 side, keyed
+    on session_id — returns the EXISTING job on a duplicate), but parses the
+    response so the caller can use the job_id to drive the P1 ledger (p1-claim /
+    p1-status). Returns None on flag-off, missing session_id, non-2xx, a down/slow
+    :8510, or any error. NEVER raises — registration must never block a turn.
+    """
+    if not ENABLED:
+        return None
+    if not session_id:
+        return None
+    payload = {
+        "session_id": session_id,
+        "model": model,
+        "label": label,
+        "session_key": session_key,
+        "initiated_by": initiated_by,
+    }
+    try:
+        import httpx
+
+        with httpx.Client(timeout=_TIMEOUT) as client:
+            resp = client.post(f"{AGENT_SERVICE_URL}/gateway/session-created", json=payload)
+        if resp.status_code in (200, 201):
+            job_id = (resp.json() or {}).get("job_id") or None
+            logger.debug("session-created → :8510 job_id=%s (%s)", job_id, session_id)
+            return job_id
+        logger.debug("session-created → :8510 returned %d (non-fatal)", resp.status_code)
+        return None
+    except Exception as exc:  # noqa: BLE001 — registration must never block a turn
+        logger.debug("session-created (job_id) skipped (%s) — :8510 unavailable", exc)
+        return None
+
+
+def p1_claim_job(
+    job_id: str,
+    *,
+    owner: str | None = None,
+    priority: str | None = None,
+    eta: str | None = None,
+) -> bool:
+    """Best-effort POST /jobs/{job_id}/p1-claim — the A-side ledger write that
+    records P1 has begun working this job. Idempotent on the :8510 side (upserts
+    the ledger row per job_id). Non-fatal; NEVER raises — a ledger write must
+    never block or alter a turn.
+    """
+    if not ENABLED:
+        return False
+    if not job_id:
+        return False
+    body: dict = {}
+    if owner is not None:
+        body["owner"] = owner
+    if priority is not None:
+        body["priority"] = priority
+    if eta is not None:
+        body["eta"] = eta
+    try:
+        import httpx
+
+        with httpx.Client(timeout=_TIMEOUT) as client:
+            resp = client.post(f"{AGENT_SERVICE_URL}/jobs/{job_id}/p1-claim", json=body)
+        if resp.status_code in (200, 201):
+            logger.debug("p1-claim persisted to :8510 (job=%s)", job_id)
+            return True
+        logger.debug("p1-claim → :8510 returned %d (non-fatal)", resp.status_code)
+        return False
+    except Exception as exc:  # noqa: BLE001 — ledger write must never block a turn
+        logger.debug("p1-claim skipped (%s) — :8510 unavailable", exc)
+        return False
+
+
+def p1_set_status(
+    job_id: str,
+    *,
+    status: str | None = None,
+    notes: str | None = None,
+) -> bool:
+    """Best-effort PATCH /jobs/{job_id}/p1-status — records the P1 ledger status
+    transition on turn completion (done) or error. Idempotent on the :8510 side.
+    Non-fatal; NEVER raises — a ledger write must never block or alter a turn.
+    """
+    if not ENABLED:
+        return False
+    if not job_id:
+        return False
+    body: dict = {}
+    if status is not None:
+        body["status"] = status
+    if notes is not None:
+        body["notes"] = notes
+    if not body:
+        return False
+    try:
+        import httpx
+
+        with httpx.Client(timeout=_TIMEOUT) as client:
+            resp = client.patch(f"{AGENT_SERVICE_URL}/jobs/{job_id}/p1-status", json=body)
+        if resp.status_code in (200, 201):
+            logger.debug("p1-status persisted to :8510 (job=%s status=%s)", job_id, status)
+            return True
+        logger.debug("p1-status → :8510 returned %d (non-fatal)", resp.status_code)
+        return False
+    except Exception as exc:  # noqa: BLE001 — ledger write must never block a turn
+        logger.debug("p1-status skipped (%s) — :8510 unavailable", exc)
+        return False
+
+
 def register_agent(name: str, webhook_url: str = "") -> bool:
     """Best-effort POST /agents/register. Idempotent on the :8510 side (re-activates).
 
