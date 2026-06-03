@@ -173,3 +173,67 @@ class TestI3ActiveTaskAttach:
         out = r2l.route_to_lane(lane="qa", goal="review")
         assert "HANDOFF OK" in out
         assert "WARN[I3]" in out and "last resort" in out.lower() or "lane log" in out.lower()
+
+
+# ── WS8 §4: the active-task FEED — default --wts-task from the turn's bound id ──
+class _FakeAgent:
+    """Stands in for the gateway agent; carries the X-DD-WTS-Task-Id binding."""
+    def __init__(self, bound=None):
+        self._dd_wts_task_id = bound
+
+
+class TestWS8ActiveTaskFeed:
+    BOUND = "11112222-3333-4444-5555-666677778888"
+    EXPLICIT = "99990000-aaaa-bbbb-cccc-ddddeeeeffff"
+
+    def test_feed_off_by_default_no_bound_used(self, fake_tree, monkeypatch):
+        # Flag OFF (default): the bound id on parent_agent is IGNORED — legacy
+        # caller-supplied-only behaviour is byte-identical.
+        monkeypatch.delenv("ROUTE_TO_LANE_WTS_FEED", raising=False)
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=7.7")
+        r2l.route_to_lane(lane="qa", goal="review", parent_agent=_FakeAgent(self.BOUND))
+        assert "--wts-task" not in _argv(fake_tree)
+
+    def test_feed_on_defaults_wts_from_bound_anchor(self, fake_tree, monkeypatch):
+        # Flag ON + omitted wts_task + bound context → wrapper gets the bound id.
+        monkeypatch.setenv("ROUTE_TO_LANE_WTS_FEED", "1")
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=8.8")
+        r2l.route_to_lane(lane="qa", goal="review", parent_agent=_FakeAgent(self.BOUND))
+        argv = _argv(fake_tree)
+        assert "--wts-task" in argv
+        assert argv[argv.index("--wts-task") + 1] == self.BOUND
+        # the packet's WTS: line also carries the fed id
+        pkt = Path(argv[argv.index("--packet") + 1])
+        assert f"WTS: {self.BOUND}" in pkt.read_text(encoding="utf-8")
+
+    def test_explicit_wts_task_overrides_the_feed(self, fake_tree, monkeypatch):
+        # Flag ON but an EXPLICIT arg is supplied → explicit wins (the model may
+        # override, e.g. a governance handoff to a P1-created task).
+        monkeypatch.setenv("ROUTE_TO_LANE_WTS_FEED", "1")
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=8.9")
+        r2l.route_to_lane(lane="qa", goal="review", wts_task=self.EXPLICIT,
+                          parent_agent=_FakeAgent(self.BOUND))
+        argv = _argv(fake_tree)
+        assert argv[argv.index("--wts-task") + 1] == self.EXPLICIT
+
+    def test_feed_on_but_unbound_context_means_no_flag(self, fake_tree, monkeypatch):
+        # Flag ON, no explicit arg, parent_agent has no bound id → empty → the
+        # wrapper fails honest (no flag, no bucket).
+        monkeypatch.setenv("ROUTE_TO_LANE_WTS_FEED", "1")
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=9.0")
+        r2l.route_to_lane(lane="qa", goal="review", parent_agent=_FakeAgent(None))
+        assert "--wts-task" not in _argv(fake_tree)
+
+    def test_feed_on_but_no_parent_agent_is_safe(self, fake_tree, monkeypatch):
+        # Defensive: no parent_agent at all (e.g. a non-gateway invocation) must
+        # not raise — getattr default handles it.
+        monkeypatch.setenv("ROUTE_TO_LANE_WTS_FEED", "1")
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=9.1")
+        out = r2l.route_to_lane(lane="qa", goal="review", parent_agent=None)
+        assert "HANDOFF OK" in out
+        assert "--wts-task" not in _argv(fake_tree)

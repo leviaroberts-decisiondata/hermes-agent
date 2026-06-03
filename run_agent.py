@@ -9537,6 +9537,21 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name == "route_to_lane":
+            # WS8 §4: route_to_lane needs `parent_agent` (this agent) to read the
+            # turn's bound WTS task (self._dd_wts_task_id) and default --wts-task
+            # to it. The generic registry.dispatch path does not forward
+            # parent_agent, so call the tool directly here (mirrors the
+            # delegate_task special-case) to thread the agent through.
+            from tools.route_to_lane_tool import route_to_lane as _route_to_lane
+            return _route_to_lane(
+                lane=function_args.get("lane"),
+                goal=function_args.get("goal"),
+                context=function_args.get("context"),
+                wts_task=function_args.get("wts_task"),
+                packet=function_args.get("packet"),
+                parent_agent=self,
+            )
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -10098,6 +10113,27 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "route_to_lane":
+                # WS8 §4 (sequential path): thread parent_agent so route_to_lane
+                # can default --wts-task to the turn's bound id (self._dd_wts_task_id).
+                from tools.route_to_lane_tool import route_to_lane as _route_to_lane
+                _rtl_result = None
+                try:
+                    function_result = _route_to_lane(
+                        lane=function_args.get("lane"),
+                        goal=function_args.get("goal"),
+                        context=function_args.get("context"),
+                        wts_task=function_args.get("wts_task"),
+                        packet=function_args.get("packet"),
+                        parent_agent=self,
+                    )
+                    _rtl_result = function_result
+                except Exception as tool_error:
+                    function_result = f"Error executing tool 'route_to_lane': {tool_error}"
+                    logger.error("route_to_lane raised: %s", tool_error, exc_info=True)
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('route_to_lane', function_args, tool_duration, result=_rtl_result)}")
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):

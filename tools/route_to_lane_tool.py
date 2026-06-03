@@ -120,6 +120,21 @@ def route_to_lane(
             f"route_to_lane: unknown lane '{lane}'. Known lanes: {', '.join(known)}."
         )
 
+    # WS8 §4 (the active-task FEED): when the caller did not pass wts_task,
+    # DEFAULT it to the thread's bound id carried into the turn from the Slack
+    # anchor (dd-slack-service stamps X-DD-WTS-Task-Id → the gateway exposes it
+    # as parent_agent._dd_wts_task_id). This closes I3 WITHOUT P1 remembering the
+    # id. An EXPLICIT wts_task arg always wins (the model may override). Neither
+    # present → empty → the wrapper fails honest (no bucket). Default-OFF behind
+    # ROUTE_TO_LANE_WTS_FEED=1 so the legacy (caller-supplied-only) path is
+    # byte-identical until the Phase-B cutover.
+    wts_source = "explicit" if (wts_task and wts_task.strip()) else "none"
+    if (not (wts_task or "").strip()) and os.getenv("ROUTE_TO_LANE_WTS_FEED") == "1":
+        bound = getattr(parent_agent, "_dd_wts_task_id", None)
+        if bound and str(bound).strip():
+            wts_task = str(bound).strip()
+            wts_source = "anchor-feed"
+
     # Resolve / build the packet.
     if packet:
         packet_path = Path(packet).expanduser()
@@ -205,8 +220,11 @@ ROUTE_TO_LANE_SCHEMA = {
         "Use this instead of running the work yourself or shelling the lane wrapper "
         "by hand. It emits the correct wrapper invocation, runs the lane "
         "synchronously, posts the visible handoff+result to the lane's Slack thread, "
-        "attaches the artifact to the ACTIVE bound WTS task when you pass wts_task, "
-        "and returns an HONEST status — it reports FAILED if the lane did not run. "
+        "attaches BOTH the handoff (REQUEST) and the result (RESPONSE) to the ACTIVE "
+        "bound WTS task (precedence: wts_task arg > packet 'WTS:' line > the thread's "
+        "anchor-bound id auto-fed into the turn > none; there is NO per-lane bucket on "
+        "the Slack path), and returns an HONEST status — it reports FAILED if the lane "
+        "did not run. "
         "NEVER tell the user a handoff succeeded unless this tool returns HANDOFF OK."
     ),
     "parameters": {
@@ -226,7 +244,7 @@ ROUTE_TO_LANE_SCHEMA = {
             },
             "wts_task": {
                 "type": "string",
-                "description": "The thread's ACTIVE bound WTS task id. Pass this so the handoff artifact attaches to the active task, NOT the per-lane standing bucket. Omit only if there genuinely is no bound task.",
+                "description": "The thread's ACTIVE bound WTS task id. Usually you can OMIT this on Slack-originated work — the thread's bound id is fed into the turn automatically and used as the default. Pass it explicitly only to override (e.g. a governance/Telegram handoff where you created the WTS task yourself). When neither is present the handoff is NOT attached to a durable record (no bucket).",
             },
             "packet": {
                 "type": "string",
