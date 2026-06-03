@@ -593,6 +593,16 @@ class APIServerAdapter(BasePlatformAdapter):
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         self._port: int = int(extra.get("port", os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))))
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # Delivery (System-B) principal key. The dispatcher presents THIS key —
+        # not the System-A key — when it builds a delivery turn. The gateway
+        # classifies the turn's System purely by which key authenticated the
+        # request (see _classify_system_principal). Distinct key → distinct
+        # principal → single authoritative source. Unset → no delivery principal
+        # is configured (delivery turns then classify as 'unknown' → System B by
+        # default-deny, which is the safe direction).
+        self._delivery_key: str = extra.get(
+            "delivery_key", os.getenv("HERMES_DELIVERY_KEY", ""),
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -697,37 +707,54 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
+            # Accept EITHER configured principal key (System-A or delivery). The
+            # two are distinguished for capability purposes by
+            # _classify_system_principal; for plain endpoint admission both are
+            # valid authenticated principals.
             if hmac.compare_digest(token, self._api_key):
-                return None  # Auth OK
+                return None  # Auth OK (System-A principal)
+            if self._delivery_key and hmac.compare_digest(token, self._delivery_key):
+                return None  # Auth OK (delivery principal)
 
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
 
-    def _is_authenticated_internal_principal(self, request: "web.Request") -> bool:
-        """True ONLY when the request carries the internal-principal Bearer that
-        matches the gateway's configured key.
+    def _classify_system_principal(self, request: "web.Request") -> str:
+        """THE single authoritative source of truth for System A vs System B.
 
-        This is the trusted server-side signal that gates System-A capability
-        minting (security review BLOCKER #1). It is deliberately STRICTER than
-        ``_check_auth``: ``_check_auth`` allows all when no key is configured
-        (local-dev convenience), but System-A power must NOT follow that
-        convenience — if no key is configured, there is no authenticated
-        principal, so this returns False and the turn is minted System B.
+        Identity is derived from exactly ONE thing: *which authenticated
+        principal (which Bearer key) validated this request* — a property of how
+        the turn entered the gateway process, not any model- or caller-supplied
+        data (no request header, no body field, no env var).
 
-        The only holder of the configured key is the internal caller chain
-        (the dispatcher / orchestrator), which already sends
-        ``Authorization: Bearer <API_SERVER_KEY>``. A delivery turn cannot
-        present it because it never receives the key.
+        Two principals, distinguished by two keys:
+          • Bearer == API_SERVER_KEY     → "A"  (P1 / coordinator principal)
+          • Bearer == HERMES_DELIVERY_KEY → "B"  (delivery principal — the key
+                                                  the dispatcher presents when it
+                                                  builds a delivery turn)
+          • anything else (no/unknown key) → "unknown"
+
+        Returns "A" | "B" | "unknown". The capability issuer grants System-A
+        capabilities ONLY for "A"; "B" and "unknown" get producer-only. A
+        delivery turn's shell cannot forge this because it never holds either
+        key — the keys live in the trusted dispatcher/gateway boundary.
+
+        NOTE: this deliberately does NOT consult X-DD-Replace-Identity. That
+        header still drives identity-slot/SOUL construction (its original WS1 §4
+        purpose) but is NO LONGER an input to the capability decision — that was
+        the two-sources bug. Capability identity has exactly one source: the key.
         """
-        if not self._api_key:
-            return False  # no configured principal → nobody is System-A authorized
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
-            return False
+            return "unknown"
         token = auth_header[7:].strip()
-        return hmac.compare_digest(token, self._api_key)
+        if self._api_key and hmac.compare_digest(token, self._api_key):
+            return "A"
+        if self._delivery_key and hmac.compare_digest(token, self._delivery_key):
+            return "B"
+        return "unknown"
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -1099,24 +1126,21 @@ class APIServerAdapter(BasePlatformAdapter):
         _dd_replace_identity = (request.headers.get("X-DD-Replace-Identity") or "").strip() in ("1", "true", "yes", "on")
         # ── Option-3 capability credential (Phase 1) ─────────────────────────
         # Mint the per-turn capability credential at THE moment the turn's
-        # nature is decided. System assignment is FAIL-CLOSED and bound to a
-        # TRUSTED server-side signal — the authenticated internal-principal
-        # Bearer — NOT the bare X-DD-Replace-Identity header (review BLOCKER #1).
-        # System A (full caps) requires the authenticated principal AND a turn
-        # that did not assert delivery; everything else (no auth, no key
-        # configured, or replace_identity asserted) → System B producer-only.
-        # The credential is stored in the capability_context contextvar (NOT
-        # os.environ, NOT a turn-readable file): the delivery turn's shell never
-        # receives it. Gateway-mediated outbound calls to protected resources
-        # read it via capability_context.current_credential() and attach it as
-        # the X-DD-Capability control-plane header. Fail-soft: a missing signer
-        # key mints nothing → resources default-deny (correct).
+        # nature is decided. The System (A/B) is determined by exactly ONE
+        # authoritative source — _classify_system_principal, i.e. WHICH
+        # authenticated Bearer key validated this request — not by any
+        # caller/model-supplied header, body field, or env var (review
+        # BLOCKER #1). The credential is stored in the capability_context
+        # contextvar (NOT os.environ, NOT a turn-readable file): the delivery
+        # turn's shell never receives it. Gateway-mediated outbound calls to
+        # protected resources read it via capability_context.current_credential()
+        # and attach it as the X-DD-Capability control-plane header. Fail-soft:
+        # a missing signer key mints nothing → resources default-deny (correct).
         try:
             from gateway import capability_issuer
-            _dd_system_a_authorized = self._is_authenticated_internal_principal(request)
+            _dd_system = self._classify_system_principal(request)
             capability_issuer.mint_for_turn(
-                system_a_authorized=_dd_system_a_authorized,
-                replace_identity=_dd_replace_identity,
+                system=_dd_system,
                 session_id=session_id,
             )
         except Exception:
