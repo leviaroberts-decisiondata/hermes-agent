@@ -1842,7 +1842,30 @@ class AIAgent:
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
-        
+
+        # P2 — System A/B boundary (capability removal, parsing-free).
+        # A delivery turn is built with skip_context_files=True AND
+        # load_soul_identity=False (the §4 replace_identity path); it is
+        # System B and must not be able to dispatch into System A. route_to_lane
+        # is the *direct* A-dispatch tool — removing it from the delivery toolset
+        # means the model has no tool to express a lane handoff, so there is
+        # nothing to parse and nothing to evade. This is parsing-free by
+        # construction; the caller_origin pre-tool block is defense-in-depth.
+        #
+        # NOTE: terminal / execute_code are *indirect* A-vectors (the gateway
+        # terminal tool can exec ~/.hermes/bin/dd-lane-run). They are deliberately
+        # NOT stripped here: the live delivery persona (slack-project-agent) is a
+        # producer that relies on shell to build deliverables. Closing that vector
+        # is pending a separate decision (strip vs. gate the lane-spawn resource);
+        # see .wip-quarantine/p2-full-strip-terminal-execute_code.md.
+        _is_delivery_build = bool(self.skip_context_files and not self.load_soul_identity)
+        self._delivery_stripped_tools: tuple = ()
+        if _is_delivery_build and self.tools:
+            _strip = {"route_to_lane"}
+            _before = {t["function"]["name"] for t in self.tools}
+            self.tools = [t for t in self.tools if t["function"]["name"] not in _strip]
+            self._delivery_stripped_tools = tuple(sorted(_before & _strip))
+
         # Show tool configuration and store valid tool names for validation
         self.valid_tool_names = set()
         if self.tools:
