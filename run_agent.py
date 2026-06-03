@@ -5286,6 +5286,16 @@ class AIAgent:
             except Exception:
                 logger.debug("context-tree injection skipped (error)", exc_info=True)
 
+        # WS2 §3 — collision-awareness advisory block. PASSIVE, ADVISORY-by-default:
+        # a "## Active Work" block injected at this same WS4 seam so an agent SEES
+        # who/what else is active before it acts, every turn, with no query and no
+        # UI. Default-OFF behind ENABLE_ACTIVE_WORK_AWARENESS=1; read-only, fail-soft
+        # (a down :8510 or disabled view yields no block and leaves the prompt
+        # unchanged — awareness must never break a turn).
+        _aw = self._build_active_work_awareness()
+        if _aw:
+            prompt_parts.append(_aw)
+
         from hermes_time import now as _hermes_now
         now = _hermes_now()
         timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
@@ -5320,6 +5330,37 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+
+    def _build_active_work_awareness(self) -> str:
+        """WS2 §3 — fetch the '## Active Work' collision-awareness advisory block
+        from the Service Layer (:8510) for injection at the WS4 context seam.
+
+        PASSIVE + ADVISORY + DEFAULT-OFF (ENABLE_ACTIVE_WORK_AWARENESS=1). Fully
+        best-effort/fail-soft: a disabled flag, a down/slow :8510, or any error
+        yields '' so the prompt is unchanged. Scoped to the turn's bound WTS task
+        family when known (self._dd_wts_task_id) so the block stays relevant, not
+        noisy. Read-only — it never writes any store.
+        """
+        if os.getenv("ENABLE_ACTIVE_WORK_AWARENESS", "").strip().lower() not in ("1", "true", "yes", "on"):
+            return ""
+        try:
+            base = os.getenv("AGENT_SERVICE_URL", "http://127.0.0.1:8510").rstrip("/")
+            params = {"max_rows": "8"}
+            bound = getattr(self, "_dd_wts_task_id", None)
+            if bound:
+                params["wts_task_family"] = str(bound)
+            try:
+                import httpx
+                with httpx.Client(timeout=2.5) as client:
+                    resp = client.get(f"{base}/work-registry/awareness", params=params)
+                if resp.status_code == 200:
+                    block = (resp.json() or {}).get("block") or ""
+                    return block.strip()
+            except Exception as exc:
+                logger.debug("active-work awareness skipped (:8510 unavailable: %s)", exc)
+        except Exception:
+            logger.debug("active-work awareness skipped (error)", exc_info=True)
+        return ""
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -9537,6 +9578,21 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name == "route_to_lane":
+            # WS8 §4: route_to_lane needs `parent_agent` (this agent) to read the
+            # turn's bound WTS task (self._dd_wts_task_id) and default --wts-task
+            # to it. The generic registry.dispatch path does not forward
+            # parent_agent, so call the tool directly here (mirrors the
+            # delegate_task special-case) to thread the agent through.
+            from tools.route_to_lane_tool import route_to_lane as _route_to_lane
+            return _route_to_lane(
+                lane=function_args.get("lane"),
+                goal=function_args.get("goal"),
+                context=function_args.get("context"),
+                wts_task=function_args.get("wts_task"),
+                packet=function_args.get("packet"),
+                parent_agent=self,
+            )
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -10098,6 +10154,27 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "route_to_lane":
+                # WS8 §4 (sequential path): thread parent_agent so route_to_lane
+                # can default --wts-task to the turn's bound id (self._dd_wts_task_id).
+                from tools.route_to_lane_tool import route_to_lane as _route_to_lane
+                _rtl_result = None
+                try:
+                    function_result = _route_to_lane(
+                        lane=function_args.get("lane"),
+                        goal=function_args.get("goal"),
+                        context=function_args.get("context"),
+                        wts_task=function_args.get("wts_task"),
+                        packet=function_args.get("packet"),
+                        parent_agent=self,
+                    )
+                    _rtl_result = function_result
+                except Exception as tool_error:
+                    function_result = f"Error executing tool 'route_to_lane': {tool_error}"
+                    logger.error("route_to_lane raised: %s", tool_error, exc_info=True)
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('route_to_lane', function_args, tool_duration, result=_rtl_result)}")
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
