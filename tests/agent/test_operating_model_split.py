@@ -26,11 +26,58 @@ from agent.prompt_builder import (
     compose_operating_model,
     build_context_tree_prompt,
 )
+from utils import env_var_enabled
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# The live tree (home-anchored). Tests read it read-only; if absent, skip.
+# The live tree (home-anchored). Tests read it read-only.
 LIVE_TREE = Path.home() / ".hermes" / "context"
 SLACK_CT_JS = Path.home() / "apps" / "dd-slack-service" / "src" / "context-tree.js"
+
+# Explicit opt-in for environments where the operating-model split tree is
+# LEGITIMATELY absent (e.g. a stripped container that ships no /context tree).
+# This is the ONLY way to skip the boundary guard. Default — and any
+# environment that has the tree — runs the guard for real; a missing or
+# regressed tree FAILS (red) so a violated System A / System B boundary can
+# never disappear behind a green skip. See P0a of the realization plan.
+_OPT_IN_ENV = "HERMES_ALLOW_MISSING_OPERATING_MODEL_TREE"
+_CORE_PATH = LIVE_TREE / "operating-model" / "_core.md"
+_TREE_PRESENT = _CORE_PATH.exists()
+_OPT_IN = env_var_enabled(_OPT_IN_ENV)
+
+
+def test_operating_model_split_tree_present_or_opted_out():
+    """Tripwire: the operating-model split tree MUST exist, unless an env
+    explicitly opts out. A missing/regressed tree is a real A/B boundary
+    regression — it must surface as a RED failure here, never a silent skip.
+
+    To run in an environment that legitimately ships no /context tree, set
+    HERMES_ALLOW_MISSING_OPERATING_MODEL_TREE=1 (the guard then skips loudly).
+    """
+    if _OPT_IN:
+        pytest.skip(
+            f"{_OPT_IN_ENV} set: operating-model split guard explicitly opted "
+            "out for this environment (tree legitimately absent)."
+        )
+    assert _TREE_PRESENT, (
+        f"operating-model split tree MISSING at {_CORE_PATH} — the System A / "
+        "System B boundary guard cannot run. This is a boundary regression, not "
+        f"a reason to skip. If this environment legitimately has no /context "
+        f"tree, set {_OPT_IN_ENV}=1 to opt out explicitly."
+    )
+
+
+# The per-audience / byte-identical-core guards below need the live tree to
+# assert against. When the tree is present they run for real (a violated
+# boundary fails them red). When it is absent they are skipped ONLY because the
+# tripwire above has already failed (no opt-in) or been opted out (opt-in) —
+# so a regression is never masked: it is caught by the tripwire instead.
+_skip_body = pytest.mark.skipif(
+    not _TREE_PRESENT,
+    reason=(
+        "operating-model split tree absent — boundary failure is reported by "
+        "test_operating_model_split_tree_present_or_opted_out (tripwire), not here."
+    ),
+)
 
 
 def _core_body(root: Path) -> str:
@@ -47,12 +94,7 @@ def _core_body(root: Path) -> str:
     return text.strip()
 
 
-pytestmark = pytest.mark.skipif(
-    not (LIVE_TREE / "operating-model" / "_core.md").exists(),
-    reason="operating-model split tree not present",
-)
-
-
+@_skip_body
 class TestPerAudienceComposition:
     def test_p1_gets_stewardship_view_not_slack(self):
         body = compose_operating_model(LIVE_TREE, "p1-specialists")
@@ -80,6 +122,7 @@ class TestPerAudienceComposition:
         assert core in sl
 
 
+@_skip_body
 class TestByteIdenticalCoreGuard:
     """The enforcement backbone: the core block must be byte-identical across
     both wired audiences. Composition is `core + "\\n\\n" + view`, so the core
@@ -137,6 +180,7 @@ class TestByteIdenticalCoreGuard:
         )
 
 
+@_skip_body
 class TestComposedInjectionEndToEnd:
     def test_build_context_tree_prompt_composes_for_audience(self):
         p1 = build_context_tree_prompt(root=LIVE_TREE, audience="p1-specialists")
