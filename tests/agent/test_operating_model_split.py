@@ -112,7 +112,8 @@ class TestPerAudienceComposition:
         body = compose_operating_model(LIVE_TREE, "no-such-audience")
         assert body is not None
         assert "Your role —" not in body  # no role view composed
-        assert "never via live agent-to-agent comms" in body  # core present
+        # Core present — pinned to a v1.3 marker (Deploy Queue realization gate).
+        assert "Deploy Queue is the realization gate" in body
 
     def test_both_audiences_carry_shared_core(self):
         core = _core_body(LIVE_TREE)
@@ -190,6 +191,8 @@ class TestComposedInjectionEndToEnd:
         assert "Your role — Product execution (Layer 2)" not in p1
         # Slack prompt carries Slack's view.
         assert "Your role — Product execution (Layer 2)" in sl
-        # Both still carry the tree header + the shared core boundary.
+        # Both still carry the tree header + the shared core boundary (v1.3:
+        # the Deploy Queue realization-gate invariant lives in the shared core).
         assert "DecisionData /context tree" in p1
-        assert "never via live agent-to-agent comms" in p1 and "never via live agent-to-agent comms" in sl
+        _core_marker = "Deploy Queue is the realization gate"
+        assert _core_marker in p1 and _core_marker in sl
