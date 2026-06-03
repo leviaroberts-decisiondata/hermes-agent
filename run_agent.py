@@ -5286,6 +5286,16 @@ class AIAgent:
             except Exception:
                 logger.debug("context-tree injection skipped (error)", exc_info=True)
 
+        # WS2 §3 — collision-awareness advisory block. PASSIVE, ADVISORY-by-default:
+        # a "## Active Work" block injected at this same WS4 seam so an agent SEES
+        # who/what else is active before it acts, every turn, with no query and no
+        # UI. Default-OFF behind ENABLE_ACTIVE_WORK_AWARENESS=1; read-only, fail-soft
+        # (a down :8510 or disabled view yields no block and leaves the prompt
+        # unchanged — awareness must never break a turn).
+        _aw = self._build_active_work_awareness()
+        if _aw:
+            prompt_parts.append(_aw)
+
         from hermes_time import now as _hermes_now
         now = _hermes_now()
         timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
@@ -5320,6 +5330,37 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+
+    def _build_active_work_awareness(self) -> str:
+        """WS2 §3 — fetch the '## Active Work' collision-awareness advisory block
+        from the Service Layer (:8510) for injection at the WS4 context seam.
+
+        PASSIVE + ADVISORY + DEFAULT-OFF (ENABLE_ACTIVE_WORK_AWARENESS=1). Fully
+        best-effort/fail-soft: a disabled flag, a down/slow :8510, or any error
+        yields '' so the prompt is unchanged. Scoped to the turn's bound WTS task
+        family when known (self._dd_wts_task_id) so the block stays relevant, not
+        noisy. Read-only — it never writes any store.
+        """
+        if os.getenv("ENABLE_ACTIVE_WORK_AWARENESS", "").strip().lower() not in ("1", "true", "yes", "on"):
+            return ""
+        try:
+            base = os.getenv("AGENT_SERVICE_URL", "http://127.0.0.1:8510").rstrip("/")
+            params = {"max_rows": "8"}
+            bound = getattr(self, "_dd_wts_task_id", None)
+            if bound:
+                params["wts_task_family"] = str(bound)
+            try:
+                import httpx
+                with httpx.Client(timeout=2.5) as client:
+                    resp = client.get(f"{base}/work-registry/awareness", params=params)
+                if resp.status_code == 200:
+                    block = (resp.json() or {}).get("block") or ""
+                    return block.strip()
+            except Exception as exc:
+                logger.debug("active-work awareness skipped (:8510 unavailable: %s)", exc)
+        except Exception:
+            logger.debug("active-work awareness skipped (error)", exc_info=True)
+        return ""
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
