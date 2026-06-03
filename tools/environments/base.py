@@ -373,6 +373,15 @@ class BaseEnvironment(ABC):
     # Command wrapping
     # ------------------------------------------------------------------
 
+    def _delivery_cd_fallback(self) -> bool:
+        """Whether a failed ``cd`` should fall back to $HOME instead of aborting.
+
+        Only LocalEnvironment with delivery OS-account separation enabled
+        overrides this to True; every other backend keeps the strict
+        ``|| exit 126`` behavior.
+        """
+        return False
+
     @staticmethod
     def _quote_cwd_for_cd(cwd: str) -> str:
         """Quote a ``cd`` target while preserving ``~`` expansion."""
@@ -397,7 +406,13 @@ class BaseEnvironment(ABC):
         # can emit the declarations to stdout, leaking ~60 lines of env
         # vars into every tool response (issue #15459).  Linux bash is
         # silent here, but the redirect is harmless.
-        if self._snapshot_ready:
+        # Under delivery separation the snapshot was captured as the gateway
+        # account (its HOME/identity); sourcing it in the delivery account would
+        # clobber the curated delivery env (HOME, USER) and re-inject the
+        # gateway identity. Skip it — the delivery child already gets a sane
+        # curated env via `env -i` in local._wrap_delivery_account.
+        delivery = self._delivery_cd_fallback()
+        if self._snapshot_ready and not delivery:
             parts.append(
                 f"source {self._snapshot_path} >/dev/null 2>&1 || true"
             )
@@ -405,18 +420,32 @@ class BaseEnvironment(ABC):
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
         quoted_cwd = self._quote_cwd_for_cd(cwd)
-        parts.append(f"builtin cd {quoted_cwd} || exit 126")
+        # Under delivery OS-account separation the requested cwd may be an
+        # openclaw-owned 0700 tree the delivery account cannot enter; a hard
+        # ``|| exit 126`` would abort every such turn. Fall back to $HOME (the
+        # delivery scratch dir) so the turn still runs, instead of failing the
+        # whole shell. Non-delivery behavior is unchanged (hard fail preserved).
+        if self._delivery_cd_fallback():
+            parts.append(f"builtin cd {quoted_cwd} 2>/dev/null || builtin cd \"$HOME\" || exit 126")
+        else:
+            parts.append(f"builtin cd {quoted_cwd} || exit 126")
 
         # Run the actual command
         parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
 
-        # Re-dump env vars to snapshot (last-writer-wins for concurrent calls)
-        if self._snapshot_ready:
+        # Re-dump env vars to snapshot (last-writer-wins for concurrent calls).
+        # Skipped under delivery separation: the snapshot file is owned by the
+        # gateway account and not writable by the delivery account, and we don't
+        # want delivery env mutations leaking back into the gateway snapshot.
+        if self._snapshot_ready and not delivery:
             parts.append(f"export -p > {self._snapshot_path} 2>/dev/null || true")
 
-        # Write CWD to file (local reads this) and stdout marker (remote parses this)
-        parts.append(f"pwd -P > {self._cwd_file} 2>/dev/null || true")
+        # Write CWD to file (local reads this) and stdout marker (remote parses
+        # this). The file write is skipped under delivery (gateway-owned, not
+        # writable); _update_cwd then relies on the stdout marker below.
+        if not delivery:
+            parts.append(f"pwd -P > {self._cwd_file} 2>/dev/null || true")
         # Use a distinct line for the marker. The leading \n ensures
         # the marker starts on its own line even if the command doesn't
         # end with a newline (e.g. printf 'exact'). We'll strip this
