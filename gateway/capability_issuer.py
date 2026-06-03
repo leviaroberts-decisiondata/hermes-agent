@@ -62,8 +62,11 @@ def mint_for_turn(*, system: str, session_id: str) -> Optional[str]:
         secret=secret,
     )
     cc.set_credential(credential)
-    logger.debug(
-        "minted capability credential sys=%s caps=%d sid=%s",
+    # INFO-level so capability minting is observable in production (design §7):
+    # one structured line per turn shows the System classification without
+    # exposing the credential bytes (only the count of caps + the session id).
+    logger.info(
+        "capability.minted sys=%s caps=%d sid=%s",
         system, len(caps), session_id,
     )
     return credential
