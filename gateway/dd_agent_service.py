@@ -27,7 +27,22 @@ logger = logging.getLogger("hermes.dd_agent_service")
 ENABLED = os.getenv("ENABLE_AGENT_SERVICE_REGISTRATION", "").strip().lower() in ("1", "true", "yes", "on")
 
 AGENT_SERVICE_URL = os.getenv("AGENT_SERVICE_URL", "http://127.0.0.1:8510").rstrip("/")
-_TIMEOUT = float(os.getenv("AGENT_SERVICE_TIMEOUT", "3.0"))
+
+
+def _safe_float(env_val: str | None, default: float) -> float:
+    """Parse a float env var, falling back to default on any bad value.
+
+    Import-time float() would crash module load (and thus gateway startup) on a
+    malformed AGENT_SERVICE_TIMEOUT. This wiring must never affect startup.
+    """
+    try:
+        return float(env_val) if env_val not in (None, "") else default
+    except (TypeError, ValueError):
+        logger.debug("Bad AGENT_SERVICE_TIMEOUT=%r; using default %.1fs", env_val, default)
+        return default
+
+
+_TIMEOUT = _safe_float(os.getenv("AGENT_SERVICE_TIMEOUT"), 3.0)
 
 
 def is_enabled() -> bool:
