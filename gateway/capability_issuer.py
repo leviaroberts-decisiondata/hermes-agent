@@ -1,14 +1,17 @@
 """
 capability_issuer — mints the per-turn capability credential.
 
-This is the single place that knows the truth about a turn's nature BEFORE any
-model token is generated and before any shell can run: it is called at turn
-construction, right where ``replace_identity`` is decided (api_server.py).
+Called at turn construction (api_server.py), BEFORE any model token is generated
+and before any shell can run. The turn's System (A/B) is resolved by the SINGLE
+authoritative source — api_server._classify_system_principal, i.e. WHICH
+authenticated Bearer key validated the request — and passed in as ``system``.
+This module does not re-derive identity from any other signal (it no longer
+consults ``replace_identity``):
 
-- A delivery turn (``replace_identity=True``) is System B → minted a
+- System "A" (authenticated System-A principal) → credential carrying the full
+  System-A capability set.
+- System "B" / "unknown" (delivery principal, or any non-System-A caller) →
   producer-only credential carrying NO System-A capabilities.
-- A P1 / System-A turn (``replace_identity=False``) → minted a credential
-  carrying the full System-A capability set.
 
 The minted credential is stored in the per-turn contextvar (capability_context),
 never in os.environ. The signer secret is held only here/at the verifier.
