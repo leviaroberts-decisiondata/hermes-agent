@@ -24,6 +24,7 @@ Requires:
 """
 
 import asyncio
+import contextvars
 import hashlib
 import hmac
 import json
@@ -2735,7 +2736,15 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        # Run the agent loop under a COPY of the current context so per-turn
+        # contextvars propagate into the worker thread. run_in_executor does not
+        # copy contextvars, so without this the Option-3 capability credential
+        # (minted in _handle_chat_completions and held in capability_context) is
+        # None throughout the agent loop and every tool — a gateway-mediated
+        # egress tool could never present it. copy_context() snapshots the
+        # handler's context (credential included); the agent then runs under it.
+        _ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, _ctx.run, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

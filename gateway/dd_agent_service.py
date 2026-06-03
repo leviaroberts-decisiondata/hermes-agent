@@ -55,9 +55,9 @@ def _service_capability_headers() -> dict:
     gateway recording that a job was claimed/completed — NOT a model effect. They
     must therefore succeed for EVERY turn, delivery turns included, so this
     credential is minted independently of the turn's System classification (it is
-    the gateway acting, not the model). It carries only the caps these writes
-    need (C6 registry + C7 job-graph), with a short TTL, signed by the same key
-    the gate verifies. If the signer key is unavailable, returns no header and
+    the gateway acting, not the model). It carries only the cap these writes
+    need (C6 registry), with a short TTL, signed by the same key the gate
+    verifies. If the signer key is unavailable, returns no header and
     the call falls back to its existing non-fatal 403/skip path.
 
     Mirrors the in-process post_with_capability pattern (capability_egress); the
@@ -72,7 +72,9 @@ def _service_capability_headers() -> dict:
             return {}
         credential = _cg.mint(
             system="A",
-            capabilities=(_cg.CAP_C6_REG, _cg.CAP_C7_JOB),
+            # Both gated writes this credential authorizes (/jobs/{id}/p1-claim,
+            # PATCH /jobs/{id}/p1-status) require C6 only — scope to exactly that.
+            capabilities=(_cg.CAP_C6_REG,),
             session_id="gateway-service",
             secret=secret,
             ttl_seconds=120,

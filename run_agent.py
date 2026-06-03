@@ -23,6 +23,7 @@ Usage:
 import asyncio
 import base64
 import concurrent.futures
+import contextvars
 import copy
 import hashlib
 import json
@@ -9855,7 +9856,16 @@ class AIAgent:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                    # Propagate the caller's contextvars into the worker thread.
+                    # ThreadPoolExecutor.submit does NOT copy contextvars, so
+                    # without this, per-turn context (e.g. the Option-3
+                    # capability credential held in capability_context) is None
+                    # inside every tool — a gateway-mediated egress tool could
+                    # never present its credential. copy_context() snapshots the
+                    # current context (including the credential minted at turn
+                    # construction) and runs the worker under it.
+                    _ctx = contextvars.copy_context()
+                    f = executor.submit(_ctx.run, _run_tool, i, tc, name, args)
                     futures.append(f)
 
                 # Wait for all to complete with periodic heartbeats so the
