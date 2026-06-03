@@ -705,6 +705,30 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _is_authenticated_internal_principal(self, request: "web.Request") -> bool:
+        """True ONLY when the request carries the internal-principal Bearer that
+        matches the gateway's configured key.
+
+        This is the trusted server-side signal that gates System-A capability
+        minting (security review BLOCKER #1). It is deliberately STRICTER than
+        ``_check_auth``: ``_check_auth`` allows all when no key is configured
+        (local-dev convenience), but System-A power must NOT follow that
+        convenience — if no key is configured, there is no authenticated
+        principal, so this returns False and the turn is minted System B.
+
+        The only holder of the configured key is the internal caller chain
+        (the dispatcher / orchestrator), which already sends
+        ``Authorization: Bearer <API_SERVER_KEY>``. A delivery turn cannot
+        present it because it never receives the key.
+        """
+        if not self._api_key:
+            return False  # no configured principal → nobody is System-A authorized
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return False
+        token = auth_header[7:].strip()
+        return hmac.compare_digest(token, self._api_key)
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -1073,6 +1097,30 @@ class APIServerAdapter(BasePlatformAdapter):
         # load_soul_identity=False so the P1 coordinator SOUL is NOT slot #1.
         # Absent header → False → identical to today.
         _dd_replace_identity = (request.headers.get("X-DD-Replace-Identity") or "").strip() in ("1", "true", "yes", "on")
+        # ── Option-3 capability credential (Phase 1) ─────────────────────────
+        # Mint the per-turn capability credential at THE moment the turn's
+        # nature is decided. System assignment is FAIL-CLOSED and bound to a
+        # TRUSTED server-side signal — the authenticated internal-principal
+        # Bearer — NOT the bare X-DD-Replace-Identity header (review BLOCKER #1).
+        # System A (full caps) requires the authenticated principal AND a turn
+        # that did not assert delivery; everything else (no auth, no key
+        # configured, or replace_identity asserted) → System B producer-only.
+        # The credential is stored in the capability_context contextvar (NOT
+        # os.environ, NOT a turn-readable file): the delivery turn's shell never
+        # receives it. Gateway-mediated outbound calls to protected resources
+        # read it via capability_context.current_credential() and attach it as
+        # the X-DD-Capability control-plane header. Fail-soft: a missing signer
+        # key mints nothing → resources default-deny (correct).
+        try:
+            from gateway import capability_issuer
+            _dd_system_a_authorized = self._is_authenticated_internal_principal(request)
+            capability_issuer.mint_for_turn(
+                system_a_authorized=_dd_system_a_authorized,
+                replace_identity=_dd_replace_identity,
+                session_id=session_id,
+            )
+        except Exception:
+            pass  # capability minting must never block a turn
         _dd_caller_supplied_run_id = bool(_dd_run_id)
         _dd_owns_lifecycle = False
         if not _dd_run_id:
