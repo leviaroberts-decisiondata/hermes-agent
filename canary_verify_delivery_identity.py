@@ -68,6 +68,22 @@ def main() -> int:
     print(f"HERMES_HOME = {os.environ['HERMES_HOME']}")
     print("=" * 70)
 
+    # Guard: the whole proof is meaningless if tree injection is OFF (then "no
+    # markers" is trivially true because nothing injected). Assert it's enabled +
+    # that the tree actually renders content for the coordinator audience.
+    from run_agent import AIAgent
+    from agent.prompt_builder import build_context_tree_prompt
+    _probe = AIAgent(model="x", api_key="k", base_url="http://127.0.0.1:1",
+                     quiet_mode=True, platform="api_server")
+    tree_on = _probe._context_tree_injection_enabled()
+    tree_renders = bool(build_context_tree_prompt(audience="p1-specialists").strip())
+    print(f"PRECONDITION: tree_injection enabled={tree_on}, tree renders content={tree_renders}")
+    if not (tree_on and tree_renders):
+        print("✗ PRECONDITION FAIL: tree injection off or empty — the 'no markers' result")
+        print("  would be vacuous. Cannot assert acc-b. (Enable context.tree_injection.)")
+        return 2
+    print("=" * 70)
+
     # ORIGINAL PROD — the inversion as it exists on the live gateway TODAY: the
     # tree audience is the hardcoded default 'p1-specialists' (the WS4 defect) and
     # SOUL loads as slot #1. Proves the markers actually fire on the broken state.

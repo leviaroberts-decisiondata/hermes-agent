@@ -80,3 +80,42 @@ def test_resolver_non_delivery_default_is_coordinator():
     aud = agent._resolve_context_audience()
     assert aud in ("p1-default",), f"expected p1-default, got {aud}"
     assert aud != "p1-specialists"
+
+
+def test_resolver_specialist_survives_profile_helper_failure(monkeypatch, tmp_path):
+    """If get_active_profile_name() raises, a specialist must NOT silently demote.
+
+    The resolver derives the profile from HERMES_HOME instead, so a specialist
+    whose profile-helper throws still gets its own lane view — never the
+    coordinator view, and never the generic p1-specialists.
+    """
+    import hermes_cli.profiles as profiles_mod
+    from run_agent import AIAgent
+
+    def _boom():
+        raise RuntimeError("profile helper down")
+
+    monkeypatch.setattr(profiles_mod, "get_active_profile_name", _boom)
+    home = tmp_path / ".hermes" / "profiles" / "dd-design"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    agent = AIAgent(model="x", api_key="k", base_url="http://127.0.0.1:1", quiet_mode=True,
+                    platform="api_server")
+    aud = agent._resolve_context_audience()
+    assert aud == "dd-design", f"specialist demoted on helper failure: got {aud}"
+    assert aud != "p1-specialists"
+
+
+def test_resolver_delivery_never_returns_generic_p1_specialists(tmp_path, monkeypatch):
+    """A delivery turn must NEVER return the generic coordinator-of-specialists view."""
+    from run_agent import AIAgent
+
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    agent = AIAgent(model="x", api_key="k", base_url="http://127.0.0.1:1", quiet_mode=True,
+                    platform="api_server", skip_context_files=True, load_soul_identity=False)
+    aud = agent._resolve_context_audience()
+    assert aud == "slack-project-agent"
+    assert aud != "p1-specialists"

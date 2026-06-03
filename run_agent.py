@@ -5104,15 +5104,31 @@ class AIAgent:
             platform = (self.platform or "").lower().strip()
             if platform == "slack":
                 return "slack-project-agent"
-            from hermes_cli.profiles import get_active_profile_name
-            profile = (get_active_profile_name() or "").strip()
-            if profile == "default" or not profile:
-                return "p1-default"
+            # Resolve the profile defensively. If get_active_profile_name() raises,
+            # fall back to the HERMES_HOME-derived profile dir name rather than
+            # losing a known-specialist signal — a specialist must NOT silently
+            # receive the coordinator view just because the profile helper threw.
             from agent.prompt_builder import _LANE_PROFILE_AUDIENCES
+            profile = ""
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                profile = (get_active_profile_name() or "").strip()
+            except Exception:
+                import os as _os
+                home = _os.environ.get("HERMES_HOME", "")
+                # ~/.hermes/profiles/<profile> → <profile>; ~/.hermes (default) → default
+                profile = _os.path.basename(home.rstrip("/")) if "/profiles/" in home else "default"
+                logger.debug("get_active_profile_name failed; derived profile=%r from HERMES_HOME", profile)
             if profile in _LANE_PROFILE_AUDIENCES:
                 return profile
+            if profile == "default" or not profile:
+                return "p1-default"
+            # Unknown non-lane profile → p1-default (coordinator), NEVER the generic
+            # p1-specialists. This is the WS4 §4.1 step-5 safe default.
+            logger.debug("audience resolver: unknown profile %r → p1-default fallback", profile)
             return "p1-default"
         except Exception:
+            logger.debug("audience resolver hard-failed → p1-default", exc_info=True)
             return "p1-default"
 
     def _build_system_prompt(self, system_message: str = None) -> str:
