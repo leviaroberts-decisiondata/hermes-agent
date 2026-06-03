@@ -1097,6 +1097,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass  # observability never blocks
         # If X-DD-Run-Id was caller-supplied, lifecycle remains disabled here.
 
+        # ── WS1 §2: best-effort Service-Layer (:8510) session registration ───
+        # ADDITIVE + DEFAULT-OFF (ENABLE_AGENT_SERVICE_REGISTRATION). Makes this
+        # gateway session enumerable in the backbone without touching dispatch
+        # or routing. Non-fatal: a down/slow :8510 never blocks the turn. We fire
+        # for every api_server turn (idempotent on the :8510 side, keyed on
+        # session_id) so direct-caller AND dispatcher-forwarded sessions register.
+        try:
+            from gateway import dd_agent_service
+
+            if dd_agent_service.is_enabled():
+                dd_agent_service.register_session_created(
+                    session_id,
+                    model=model_name or "",
+                    label="Hermes gateway session",
+                    session_key=_dd_session_key,
+                )
+        except Exception:
+            pass  # registration must never block a turn
+
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
