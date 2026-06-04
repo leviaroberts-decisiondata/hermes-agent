@@ -850,9 +850,47 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
+def _save_auth_store(
+    auth_store: Dict[str, Any],
+    *,
+    allow_provider_clear: bool = False,
+) -> Path:
     auth_file = _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Anti-clobber guard ──────────────────────────────────────────────────
+    # Refuse to replace a non-empty ``providers`` map with an empty one unless
+    # the caller is an explicit clear/logout path (``allow_provider_clear``).
+    # On 2026-06-04 a test subprocess that did not inherit the monkeypatched
+    # HERMES_HOME resolved the store to the REAL ~/.hermes/auth.json, seeded
+    # the copilot credential pool, and saved a store whose ``providers`` map
+    # was empty — wiping the live openai-codex OAuth tokens and taking every
+    # gateway turn offline (no fallback was configured). The codex tokens
+    # could not be rehydrated without interactive re-auth. A store that holds
+    # credentials must never be silently emptied by a non-clear save; refuse
+    # and log instead so the loss is loud and recoverable.
+    new_providers = auth_store.get("providers")
+    new_is_empty = (not isinstance(new_providers, dict)) or len(new_providers) == 0
+    if new_is_empty and not allow_provider_clear:
+        try:
+            if auth_file.exists():
+                existing = json.loads(auth_file.read_text())
+                existing_providers = existing.get("providers")
+                if isinstance(existing_providers, dict) and len(existing_providers) > 0:
+                    logger.error(
+                        "auth: REFUSING to overwrite %s — on-disk store has %d "
+                        "provider(s) but the store being saved has none and this "
+                        "is not an explicit clear/logout (allow_provider_clear). "
+                        "This guards against the 2026-06-04 test-subprocess wipe. "
+                        "Pass allow_provider_clear=True from logout/clear paths.",
+                        auth_file, len(existing_providers),
+                    )
+                    return auth_file
+        except Exception as guard_exc:
+            # Never let the guard's own read failure block a legitimate save —
+            # fall through to the normal write path.
+            logger.debug("auth: anti-clobber guard read failed (%s) — proceeding", guard_exc)
+
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
@@ -1097,7 +1135,8 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
 
         if not cleared:
             return False
-        _save_auth_store(auth_store)
+        # Explicit logout/clear — permitted to empty the providers map.
+        _save_auth_store(auth_store, allow_provider_clear=True)
     return True
 
 
