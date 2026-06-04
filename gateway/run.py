@@ -862,6 +862,53 @@ def _attach_dd_context_for_turn(
     return ctx
 
 
+def _is_system_a_messaging_turn(
+    *,
+    user_config: dict,
+    platform: Any,
+    enabled_toolsets: "list | set | tuple",
+) -> bool:
+    """Decide whether a messaging-platform turn is the System-A coordinator turn.
+
+    This is the messaging-path analogue of api_server._classify_system_principal:
+    that function authenticates the System-A principal by the HTTP Bearer key;
+    this one authenticates it by *trusted in-process provenance* — which gateway
+    process is running and on which surface — because a messaging turn carries no
+    request and no Bearer token.
+
+    It is the SINGLE place that answers "is this messaging turn System A". It is
+    fail-closed by AND-composition; the decision is a property of the process and
+    the inbound surface, never of model- or caller-supplied data:
+
+      1. ``dd_system_a_principal`` is true in THIS gateway's loaded config — only
+         the default P1 coordinator gateway sets it; specialist profile gateways
+         do not (absent → false). Cross-process boundary.
+      2. The surface is Telegram (P1's coordinator surface). Other platforms on
+         the same process do not get System-A. Cross-surface boundary.
+      3. The ``deploy`` toolset is actually enabled for this surface — couples the
+         capability mint to the toolset registration so the two can never drift
+         (a turn with no deploy tools never needs, and never gets, the credential).
+
+    A True result authorizes minting via the unchanged, fail-closed
+    capability_issuer.mint_for_turn(system="A", ...). False → no mint → the turn
+    runs uncredentialed and protected resources default-deny, exactly as today.
+
+    See reviews/specs/p1-deploy-telegram-systema-design-2026-06-03.md §3-§4.
+    """
+    try:
+        from gateway.config import Platform
+        if not bool(user_config.get("dd_system_a_principal", False)):
+            return False
+        if platform != Platform.TELEGRAM:
+            return False
+        if "deploy" not in (enabled_toolsets or ()):
+            return False
+        return True
+    except Exception:
+        # Any failure resolving the gate → fail closed (no System-A).
+        return False
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -10197,6 +10244,47 @@ class GatewayRunner:
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
+        # ── Option-3 capability credential — messaging-path System-A principal ──
+        # The HTTP path (api_server.py) mints the per-turn capability after
+        # classifying the Bearer principal. The messaging path has no request /
+        # Bearer token, so the System-A principal here is proven by *which gateway
+        # process is running*: the default P1 coordinator gateway sets
+        # ``dd_system_a_principal: true`` in its own config; specialist profile
+        # gateways do NOT (fail-closed default). We mint System-A ONLY for this
+        # gateway's genuine Telegram coordinator turn, AND only when the deploy
+        # toolset is actually enabled for the surface (couples B to A). Any other
+        # caller (other platform, profile gateway, lane/delivery via HTTP, a
+        # child dispatched out-of-process) does not satisfy the AND-gate and gets
+        # no mint → contextvar unset → resources default-deny, exactly as today.
+        # This extends the single principal model with one more *trusted-process*
+        # source; the A/B→caps mapping stays singular and fail-closed in
+        # capability_issuer.mint_for_turn. See
+        # reviews/specs/p1-deploy-telegram-systema-design-2026-06-03.md.
+        # The credential is bound to the task-local capability_context contextvar;
+        # because run_conversation runs via _run_in_executor_with_context (which
+        # copy_context()s), a credential set here propagates into the tool egress.
+        # Cleared in the finally (clear_credential) to prevent cross-turn bleed on
+        # the cached event loop / reused AIAgent instance.
+        _dd_capability_minted = False
+        try:
+            if _is_system_a_messaging_turn(
+                user_config=user_config,
+                platform=source.platform,
+                enabled_toolsets=enabled_toolsets,
+            ):
+                from gateway import capability_issuer
+                # mint_for_turn binds the credential into the capability_context
+                # contextvar itself. Returns None (and binds nothing) if the
+                # signer key is absent — fail-closed.
+                if capability_issuer.mint_for_turn(system="A", session_id=session_id):
+                    _dd_capability_minted = True
+        except Exception as _cap_err:
+            # Capability minting must NEVER block a turn (same posture as
+            # api_server.py). On any failure the turn proceeds uncredentialed and
+            # protected resources default-deny — the correct fail-closed outcome.
+            logger.debug("messaging-path capability mint skipped: %s", _cap_err)
+            _dd_capability_minted = False
+
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
             display_config = {}
@@ -11929,6 +12017,17 @@ class GatewayRunner:
                     channel_prompt=next_channel_prompt,
                 )
         finally:
+            # Clear any per-turn System-A capability credential bound for this
+            # messaging turn so it never bleeds into the next turn that reuses
+            # this cached AIAgent / event-loop context. No-op if nothing was
+            # minted (e.g. non-coordinator turn). See the mint block above.
+            if _dd_capability_minted:
+                try:
+                    from gateway import capability_context as _cap_ctx
+                    _cap_ctx.clear_credential()
+                except Exception:
+                    pass
+
             # Complete the MC Live run before tearing down keepalive.
             try:
                 _result_obj = response if isinstance(response, dict) else (result_holder[0] or {})
