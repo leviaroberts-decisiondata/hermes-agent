@@ -279,10 +279,53 @@ class TestI3ActiveTaskAttach:
 class _FakeAgent:
     """Stands in for the gateway agent; carries the X-DD-WTS-Task-Id binding and
     (P-C) the X-DD session_key used to route the reaper's result-return."""
-    def __init__(self, bound=None, session_key=None):
+    def __init__(self, bound=None, session_key=None, route_key=None):
         self._dd_wts_task_id = bound
         if session_key is not None:
             self._dd_session_key = session_key
+        if route_key is not None:
+            self._dd_route_key = route_key
+
+
+def _gateway_attached_agent(source, bound=None):
+    """Build a stand-in agent whose ``_dd_*`` keys are set by the REAL gateway
+    attach path — NOT authored here.
+
+    Increment-1 invariant ("consume, never inject"): the test must never write
+    the ``agent:main:…`` routing literal onto the agent itself; it must let the
+    production code derive it from a ``SessionSource`` exactly as a live turn
+    does. We reproduce the two production steps the gateway runs per turn:
+
+      1. ``build_session_key(source)``            → the *routing* key (agent:main:…)
+      2. ``_dd_observability_session_key(sid)``   → the scrubbed *obs* key
+      3. ``_attach_dd_context_for_turn(..., session_key=obs, route_key=routing)``
+         which is what assigns ``_dd_session_key`` (obs) + ``_dd_route_key``
+         (routing) on the agent — the SAME call the gateway makes at
+         gateway/run.py:10980.
+
+    The returned agent therefore carries keys the *gateway code* produced. If the
+    route-key fix is reverted (route_key collapses back into the obs key), the
+    derived ``_dd_route_key`` becomes unparseable and registration skips — so the
+    assertion genuinely depends on the live key derivation, not a literal.
+    """
+    from gateway.session import build_session_key
+    from gateway.run import _dd_observability_session_key, _attach_dd_context_for_turn
+
+    routing_key = build_session_key(source)
+    obs_key = _dd_observability_session_key("20260604_070452_cdd73484")
+
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    _attach_dd_context_for_turn(
+        agent,
+        run_id="run-test",
+        session_key=obs_key,        # what the gateway puts on _dd_session_key
+        route_key=routing_key,      # what the gateway puts on _dd_route_key
+        wts_task_id=bound,
+    )
+    return agent, routing_key, obs_key
 
 
 class TestWS8ActiveTaskFeed:
@@ -431,6 +474,61 @@ class TestPCReaperRegistration:
         monkeypatch.setenv("FAKE_EXIT", "75")
         monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
         out = r2l.route_to_lane(lane="qa", goal="review", parent_agent=_FakeAgent())
+        assert "HANDOFF PENDING" in out
+        assert not fake_reaper["argv_log"].exists()
+        assert "no parseable caller session_key" in out.lower()
+
+    # The MC-Live observability grouping key the real gateway puts on
+    # ``_dd_session_key`` — scrubbed of chat ids, so it NEVER parses for routing.
+    OBS_SK = "agent:hermes:gateway:20260604_070452_cdd73484"
+
+    def test_real_gateway_uses_route_key_not_observability_key(self, fake_tree, fake_reaper, monkeypatch):
+        # REGRESSION (Levi P1 canary 2026-06-04): the live gateway sets
+        # _dd_session_key to the *observability* key (agent:hermes:gateway:…),
+        # which has no chat_id, and the *routing* key (agent:main:…) on
+        # _dd_route_key. Registration must use the route key and succeed —
+        # earlier this skipped with "no parseable caller session_key" and the
+        # closeout never returned to Levi's Telegram.
+        #
+        # Increment-1 invariant: the routing key is NOT authored here. We build a
+        # SessionSource (the input a synthetic user supplies) and let the REAL
+        # gateway attach path derive _dd_route_key from it via build_session_key
+        # + _attach_dd_context_for_turn. The chat id 8737984752 is *source input*;
+        # the agent:main:… key the reaper sees is *derived by production code*.
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="8737984752", chat_type="dm")
+        agent, routing_key, obs_key = _gateway_attached_agent(source)
+        # The derived keys must match production shapes — and crucially DIFFER
+        # (route key carries the chat id; obs key does not). If a regression
+        # collapses them, this guard catches it before the reaper assertion.
+        assert routing_key == "agent:main:telegram:dm:8737984752"
+        assert routing_key.startswith("agent:main:")
+        assert obs_key.startswith("agent:hermes:gateway:")
+        assert getattr(agent, "_dd_route_key") == routing_key
+        assert getattr(agent, "_dd_session_key") == obs_key
+
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
+        out = r2l.route_to_lane(lane="qa", goal="review", parent_agent=agent)
+        assert "HANDOFF PENDING" in out
+        argv = self._reaper_argv(fake_reaper)
+        assert argv[0] == "--register"
+        assert argv[2] == routing_key       # the DERIVED routing key, not a literal
+        assert argv[3] == "telegram"
+        assert argv[4] == "8737984752"
+        assert argv[5] == "dm"
+        assert "reaper-registration: OK" in out
+
+    def test_observability_key_alone_skips_registration(self, fake_tree, fake_reaper, monkeypatch):
+        # The exact failure mode hit in production: ONLY the observability key is
+        # present (no _dd_route_key). It can't parse → registration is skipped,
+        # honestly and fail-soft.
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
+        out = r2l.route_to_lane(
+            lane="qa", goal="review", parent_agent=_FakeAgent(session_key=self.OBS_SK)
+        )
         assert "HANDOFF PENDING" in out
         assert not fake_reaper["argv_log"].exists()
         assert "no parseable caller session_key" in out.lower()

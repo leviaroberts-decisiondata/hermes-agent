@@ -831,6 +831,7 @@ def _attach_dd_context_for_turn(
     session_key: str,
     parent_run_id: Optional[str] = None,
     wts_task_id: Optional[str] = None,
+    route_key: Optional[str] = None,
 ) -> dict:
     """Attach the per-turn DecisionData identity context to a (cached) AIAgent.
 
@@ -856,6 +857,13 @@ def _attach_dd_context_for_turn(
     }
     agent._dd_run_id = run_id
     agent._dd_session_key = session_key
+    # The reaper's result-return needs the *routing* session key
+    # (``agent:main:{platform}:{chat_type}:{chat_id}`` — build_session_key
+    # output) to mirror a detached lane's closeout back to THIS conversation.
+    # ``session_key`` above is the non-sensitive MC-Live observability grouping
+    # key (``agent:hermes:gateway:…``), which carries no chat_id, so route_to_lane
+    # must read this separate attribute. Keep both: observability stays scrubbed.
+    agent._dd_route_key = route_key or session_key
     agent._dd_parent_run_id = parent_run_id
     agent._dd_wts_task_id = wts_task_id
     agent._dd_context = ctx
@@ -10973,6 +10981,7 @@ class GatewayRunner:
                 agent,
                 run_id=_dd_run_id,
                 session_key=_dd_session_key,
+                route_key=session_key,
             )
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None

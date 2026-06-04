@@ -134,8 +134,18 @@ def _register_pending_with_reaper(out: str, parent_agent) -> str:
     if not m:
         return "reaper-registration: skipped (no run_dir on status line)"
     run_dir = m.group(1).strip()
-    session_key = str(getattr(parent_agent, "_dd_session_key", "") or "").strip()
+    # The reaper routes its result-return by platform+chat_id, which only the
+    # *routing* session key (``agent:main:{platform}:{chat_type}:{chat_id}`` —
+    # build_session_key output) carries. The gateway attaches that as
+    # ``_dd_route_key``; ``_dd_session_key`` is the scrubbed MC-Live observability
+    # grouping key (``agent:hermes:gateway:…``) and has no chat_id, so it never
+    # parses here. Prefer the routing key; fall back to the observability key for
+    # callers (tests / older gateways) that only set the latter.
+    session_key = str(getattr(parent_agent, "_dd_route_key", "") or "").strip()
     origin = _parse_session_origin(session_key)
+    if not origin:
+        session_key = str(getattr(parent_agent, "_dd_session_key", "") or "").strip()
+        origin = _parse_session_origin(session_key)
     if not origin:
         # We can still register the run for mirror-only return, but without a
         # caller session the re-inject (P1 reconciliation) cannot target a session.
