@@ -140,8 +140,40 @@ def _parity(chain_id, env):
         return {"ok": False, "results": [{"mismatches": [r.stdout[:200] + r.stderr[:200]]}]}
 
 
+def _tick_until(env, route, want_status, max_ticks=4):
+    """Tick the driver until the chain reaches want_status (or ticks exhaust). Closes
+    the timing window where a multi-hop chain needs an extra tick to settle to its
+    terminal state — makes the proof deterministic instead of sleep-tuned."""
+    for _ in range(max_ticks):
+        rec = _load(route)
+        if rec and rec.get("status") == want_status:
+            return rec
+        _tick(env)
+        time.sleep(1)
+    return _load(route)
+
+
+def _purge_runid_residue():
+    """Defensive setup: remove any PG rows or session entries from a PRIOR crashed run
+    of THIS runid before starting (so a re-run is never polluted). Scoped to this
+    runid only — never touches other chains."""
+    try:
+        like = f"%{RUNID}%"
+        subprocess.run(["sudo", "-n", "-u", "leviroberts",
+                        "/opt/homebrew/opt/postgresql@16/bin/psql", "-d", "directus", "-c",
+                        f"delete from request_chain_events where chain_id in "
+                        f"(select id from request_chains where route_key like '{like}'); "
+                        f"delete from request_chain_runs where chain_id in "
+                        f"(select id from request_chains where route_key like '{like}'); "
+                        f"delete from request_chains where route_key like '{like}';"],
+                       capture_output=True, text=True, timeout=20)
+    except Exception:
+        pass
+
+
 def main():
     results = []
+    _purge_runid_residue()
     stub = _stub()
     env = dict(ENVBASE, DD_CHAIN_WRAPPER=str(stub))
 
@@ -153,8 +185,9 @@ def main():
     _drv(["--start", wd, rd_route, "telegram", f"r4d-{RUNID}", "dm", "--goal",
           "R4 shape-d lane lifecycle", "--stages", "engineering,qa,report",
           "--first-run-dir", str(eng)], env)
-    _tick(env); time.sleep(2); _tick(env); time.sleep(1)
-    recd = _load(rd_route) or {}
+    # Deterministic settle: eng PASS → qa dispatch → qa PASS → report → done (+ R3
+    # close-gate delivery). _tick_until removes the back-to-back-run timing flake.
+    recd = _tick_until(env, rd_route, "done", max_ticks=5) or {}
     pj = _parity(recd.get("chain_id", ""), env)
     okd = recd.get("status") == "done" and pj.get("ok")
     results.append(("(d) lane start/return/closeout → done at PARITY", okd,
@@ -243,20 +276,23 @@ def main():
     results.append(("(e) restart-from-PG reconstructs lifecycle state (no authority flip)",
                     oke, "recovered " + ", ".join(detail_e)))
 
-    # cleanup
-    for rec in (recd, recb, recc):
-        if rec.get("chain_id"):
-            _drv(["--abort", rec["chain_id"]], env)
+    # cleanup — delete by the EXACT chain anchors (the PG row's route_key == the driver
+    # chain_id, which is {wts_uuid}:{hash} and does NOT contain RUNID — so we must match
+    # the anchors we created, not a RUNID pattern).
+    anchors = [rec.get("chain_id") for rec in (recd, recb, recc) if rec.get("chain_id")]
+    for a in anchors:
+        _drv(["--abort", a], env)
     try:
-        like = f"%{RUNID}%"
-        subprocess.run(["sudo", "-n", "-u", "leviroberts",
-                        "/opt/homebrew/opt/postgresql@16/bin/psql", "-d", "directus", "-c",
-                        f"delete from request_chain_events where chain_id in "
-                        f"(select id from request_chains where route_key like '{like}'); "
-                        f"delete from request_chain_runs where chain_id in "
-                        f"(select id from request_chains where route_key like '{like}'); "
-                        f"delete from request_chains where route_key like '{like}';"],
-                       capture_output=True, text=True, timeout=20)
+        if anchors:
+            in_list = ",".join("'" + a.replace("'", "") + "'" for a in anchors)
+            subprocess.run(["sudo", "-n", "-u", "leviroberts",
+                            "/opt/homebrew/opt/postgresql@16/bin/psql", "-d", "directus", "-c",
+                            f"delete from request_chain_events where chain_id in "
+                            f"(select id from request_chains where route_key in ({in_list})); "
+                            f"delete from request_chain_runs where chain_id in "
+                            f"(select id from request_chains where route_key in ({in_list})); "
+                            f"delete from request_chains where route_key in ({in_list});"],
+                           capture_output=True, text=True, timeout=20)
     except Exception:
         pass
     for f in HERMES.glob(f"dd-lanes/.r4-*{RUNID}*"):

@@ -175,26 +175,27 @@ def main():
     results.append(("C.retry: session appears → next tick delivers → audit=delivered, done",
                     okC, f"status={recC.get('status')} audit={recC.get('delivery_audit_status')}"))
 
-    # cleanup ledger (abort our chains) + PG rows
+    # cleanup ledger (abort our chains) + PG rows. Delete by the EXACT chain anchors
+    # (the PG row's route_key == the driver chain_id {wts_uuid}:{hash}, which does NOT
+    # contain RUNID — a RUNID pattern never matches, so match the anchors we created).
+    anchors = []
     for route in (routeA, routeB):
         rec = _load(route)
-        if rec:
+        if rec and rec.get("chain_id"):
+            anchors.append(rec["chain_id"])
             subprocess.run([PY, str(CHAIN_DRIVER), "--abort", rec["chain_id"]],
                            capture_output=True, text=True, timeout=15)
     try:
-        import dd_chain_pg as pg
-        for anchor_route in (routeA, routeB):
-            rec = _load(anchor_route)
-        # purge by route_key prefix via psql
-        like = f"%{RUNID}%"
-        subprocess.run(["sudo", "-n", "-u", "leviroberts",
-                        "/opt/homebrew/opt/postgresql@16/bin/psql", "-d", "directus", "-c",
-                        f"delete from request_chain_events where chain_id in "
-                        f"(select id from request_chains where route_key like '{like}'); "
-                        f"delete from request_chain_runs where chain_id in "
-                        f"(select id from request_chains where route_key like '{like}'); "
-                        f"delete from request_chains where route_key like '{like}';"],
-                       capture_output=True, text=True, timeout=20)
+        if anchors:
+            in_list = ",".join("'" + a.replace("'", "") + "'" for a in anchors)
+            subprocess.run(["sudo", "-n", "-u", "leviroberts",
+                            "/opt/homebrew/opt/postgresql@16/bin/psql", "-d", "directus", "-c",
+                            f"delete from request_chain_events where chain_id in "
+                            f"(select id from request_chains where route_key in ({in_list})); "
+                            f"delete from request_chain_runs where chain_id in "
+                            f"(select id from request_chains where route_key in ({in_list})); "
+                            f"delete from request_chains where route_key in ({in_list});"],
+                           capture_output=True, text=True, timeout=20)
     except Exception:
         pass
     _cleanup_sessions()
