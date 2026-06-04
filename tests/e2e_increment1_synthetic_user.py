@@ -777,6 +777,123 @@ def canon6_chain_driver(rep: Reporter):
         teardown_session(routing_key)
 
 
+# ── CANON 7: POST-APPROVAL deploy watch + real report stage (W2-B2) ──
+# Proves the trigger the deploy stage was missing: a chain parked in deploy advances
+# when the human DECIDES (queue row flips), runs the real verification, and delivers
+# the closeout via the reaper-reinject path — then a reject becomes a BLOCKER. Driven
+# by a STUB deploy-row file (DD_CHAIN_DEPLOY_ROW_FILE), no mc-api touched, synthetic chat.
+def _write_row_file(rows: dict) -> Path:
+    p = LANES_DIR / f".chain-deployrow-{RUNID}.json"
+    p.write_text(json.dumps(rows), encoding="utf-8")
+    return p
+
+
+def canon7_post_approval(rep: Reporter):
+    print("\n── CANON 7: post-approval deploy watch + real report stage (W2-B2) ──")
+    if not CHAIN_DRIVER.exists():
+        rep.record("C7.present: dd-chain-driver installed", False, "missing")
+        return
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=SYNTH_CHAT_ID, chat_type="dm")
+    routing_key = build_session_key(source)
+    setup_session(routing_key)
+    row_id = f"row-{RUNID}"
+    # Seed a chain parked AT deploy with the row id, deploy leg lit.
+    env = dict(os.environ, DD_DEPLOY_SUBMIT_ENABLED="1")
+    try:
+        # ── 7a: row still pending → no advance (the honest awaiting-approval rest). ──
+        rf = _write_row_file({row_id: {"id": row_id, "status": "pending",
+                                       "service_name": "synthetic-svc", "service_port": None}})
+        wts = f"00000000-0000-4000-8000-d7{RUNID[:10]}"
+        st = subprocess.run(
+            [_chain_py(), str(CHAIN_DRIVER), "--start", wts, routing_key, "telegram",
+             SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa,deploy,report",
+             "--start-stage", "deploy", "--deploy-row", row_id,
+             "--deploy-service", "synthetic-svc"],
+            capture_output=True, text=True, timeout=30, env=env)
+        chain_id = re.search(r"chain_id=(\S+)", st.stdout or "")
+        chain_id = chain_id.group(1) if chain_id else None
+        rep.record("C7.seed: chain seeded parked at deploy with a row id",
+                   bool(chain_id), st.stdout.strip() or st.stderr.strip())
+        if not chain_id:
+            return
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"], capture_output=True,
+                       text=True, timeout=60, env=dict(env, DD_CHAIN_DEPLOY_ROW_FILE=str(rf)))
+        c = _load_chain(chain_id) or {}
+        rep.record("C7.pending: a still-pending row does NOT advance (honest awaiting-approval)",
+                   c.get("stage") == "deploy" and c.get("status") == "blocked",
+                   f"stage={c.get('stage')} status={c.get('status')} blocker={c.get('blocker')}")
+
+        # ── 7b: human APPROVES (row→deployed) → advance → report → verify → closeout. ──
+        rf.write_text(json.dumps({row_id: {
+            "id": row_id, "status": "deployed", "decided_by": "QA-SYNTHETIC",
+            "deployed_at": "2026-06-04T20:01:17Z", "service_name": "synthetic-svc",
+            "service_port": None, "target_commit": "d27b808c84b1abcd",
+            "diff_stat": "4 files changed, 51 insertions, 18 deletions",
+            "diff_summary": 'rename row action to "Send test"',
+            "files_changed": ["a.tsx", "b.tsx", "c.tsx", "d.tsx"],
+        }}), encoding="utf-8")
+        before = session_transcript()
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"], capture_output=True,
+                       text=True, timeout=60, env=dict(env, DD_CHAIN_DEPLOY_ROW_FILE=str(rf)))
+        c = _load_chain(chain_id) or {}
+        # report is the last stage; advancing into it runs _finish → status=done.
+        closed = c.get("status") == "done" and c.get("stage") == "report"
+        rep.record("C7.advance: approved row advances deploy → report → done",
+                   closed, f"stage={c.get('stage')} status={c.get('status')} "
+                           f"verification={c.get('verification')}")
+        # the verification ran (deterministic) and is recorded on the chain
+        ver = c.get("verification") or {}
+        rep.record("C7.verify: the report stage ran live verification (deterministic)",
+                   "health_ok" in ver and "detail" in ver,
+                   f"verification={ver}")
+        # the closeout landed in the caller transcript with what-shipped + verification
+        after = session_transcript()
+        new = after[len(before):]
+        closeout_ok = ("WORK COMPLETE" in new) and ("d27b808c" in new) and \
+                      ("Verification:" in new) and ("51 insertions" in new)
+        rep.record("C7.closeout: substantive closeout (commit+diffstat+verification) reinjected",
+                   closeout_ok, f"closeout present={bool(new.strip())}; "
+                                f"{'has commit+diffstat+verification' if closeout_ok else new[:200]}")
+        if chain_id:
+            _abort_chain(chain_id)
+
+        # ── 7c: human REJECTS (row→rejected) → BLOCKER state, escalated. ──
+        rj_id = f"rrow-{RUNID}"
+        rjf = _write_row_file({rj_id: {"id": rj_id, "status": "rejected",
+                                       "reject_reason": "diff touches prod secrets",
+                                       "service_name": "synthetic-svc"}})
+        # the row file path differs; point the env at rjf
+        rwts = f"00000000-0000-4000-8000-r7{RUNID[:10]}"
+        rs = subprocess.run(
+            [_chain_py(), str(CHAIN_DRIVER), "--start", rwts, routing_key, "telegram",
+             SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa,deploy,report",
+             "--start-stage", "deploy", "--deploy-row", rj_id, "--deploy-service", "synthetic-svc"],
+            capture_output=True, text=True, timeout=30, env=env)
+        rj_chain = re.search(r"chain_id=(\S+)", rs.stdout or "")
+        rj_chain = rj_chain.group(1) if rj_chain else None
+        rbefore = session_transcript()
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"], capture_output=True,
+                       text=True, timeout=60, env=dict(env, DD_CHAIN_DEPLOY_ROW_FILE=str(rjf)))
+        rc = _load_chain(rj_chain) or {}
+        rnew = session_transcript()[len(rbefore):]
+        rejected_blocker = rc.get("status") == "blocked" and \
+            "rejected" in (rc.get("blocker") or "") and "secrets" in (rc.get("blocker") or "") and \
+            "ESCALATION" in rnew
+        rep.record("C7.reject: a rejected deploy becomes a BLOCKER state, escalated (no silent park)",
+                   rejected_blocker, f"status={rc.get('status')} blocker={rc.get('blocker')}; "
+                                     f"escalation in transcript={'ESCALATION' in rnew}")
+        if rj_chain:
+            _abort_chain(rj_chain)
+    finally:
+        for p in (LANES_DIR / f".chain-deployrow-{RUNID}.json",):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        _purge_synthetic_residue(RUNID)
+        teardown_session(routing_key)
+
+
 CHAIN_LOG = HERMES_HOME / "logs" / "dd-chain-driver.log"
 
 
@@ -848,12 +965,14 @@ def main():
             canon2_route_key(rep, simulate_old_code=True)
         elif args.chain_only:
             canon6_chain_driver(rep)
+            canon7_post_approval(rep)
         else:
             canon2_route_key(rep, simulate_old_code=False)
             canon3_wts_guard(rep)
             canon4_deploy_denied(rep)
             canon5_honesty(rep)
             canon6_chain_driver(rep)
+            canon7_post_approval(rep)
     finally:
         teardown_session(build_session_key(
             SessionSource(platform=Platform.TELEGRAM, chat_id=SYNTH_CHAT_ID, chat_type="dm")))

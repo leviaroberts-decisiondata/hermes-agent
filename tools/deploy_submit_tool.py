@@ -52,11 +52,16 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from pathlib import Path
 
 from tools.registry import registry, tool_error
 
 # mc-api deploy-queue base — localhost only.
 _MC_API_BASE = os.getenv("MC_API_BASE_URL", "http://127.0.0.1:8502")
+# Shared (home-anchored) hermes bin, where the chain driver lives — mirrors how
+# route_to_lane_tool resolves the wrapper. NOT a per-profile HERMES_HOME.
+_SHARED_HERMES_BIN = Path.home() / ".hermes" / "bin"
 
 
 def _deploy_submit_enabled() -> bool:
@@ -204,6 +209,27 @@ def deploy_submit(
     one_line_stat = (diff_stat or "").strip().splitlines()
     diff_stat_clean = one_line_stat[0].strip() if one_line_stat else ""
 
+    # W2-B2 (Levi's ask): the approval screen must show WHAT is being approved. When
+    # the caller didn't supply rich notes, AUTO-COMPOSE a human-readable summary from
+    # the closeout summary + commit list + one-line diffstat. notes is the right home
+    # (NOT pre_deploy_test — the executor runs that as shell; NOT diff_stat — that is
+    # varchar(500) and kept to one line). Caller-supplied notes always win.
+    notes_clean = (notes or "").strip()
+    if not notes_clean:
+        parts = []
+        if (diff_summary or "").strip():
+            parts.append(f"What this ships: {diff_summary.strip()}")
+        if target_commit and target_commit.strip():
+            parts.append(f"Target commit: {target_commit.strip()[:12]}")
+        if files:
+            shown = ", ".join(files[:8]) + (f" (+{len(files)-8} more)" if len(files) > 8 else "")
+            parts.append(f"Files ({len(files)}): {shown}")
+        if diff_stat_clean:
+            parts.append(f"Diffstat: {diff_stat_clean}")
+        parts.append("Submitted by DD P1 via the chain driver; approve to take it live, "
+                     "then P1 verifies the live service and closes out.")
+        notes_clean = "\n".join(parts)
+
     body = {
         "service_name": service_name,
         "files_changed": files,
@@ -212,7 +238,7 @@ def deploy_submit(
         # pre_deploy_test defaults to "" — prose chokes the shell runner; mc-api
         # auto-resolves the real test command from its service config.
         "pre_deploy_test": "",
-        "notes": (notes or "").strip(),
+        "notes": notes_clean,
     }
     # test_results is a JSON column (the executor later writes a structured
     # {passed, output, exit_code} object). A bare prose string makes Directus
@@ -294,6 +320,29 @@ def deploy_submit(
         out["conflict_details"] = payload["conflict_details"]
     if isinstance(payload, dict) and payload.get("depends_on"):
         out["depends_on"] = payload["depends_on"]
+
+    # W2-B2: STAMP the row id onto the active chain record so the chain driver's
+    # queue-decision watch can poll it for the human's approve/reject and then
+    # advance deploy → report → done (the trigger the deploy stage was missing).
+    # Best-effort + fail-soft: a missing chain / missing helper never affects the
+    # submit result the caller sees. Keyed on the SAME (wts_task, route_key) the
+    # driver keys chains on — route_key is the gateway-attached _dd_route_key.
+    if entry_id:
+        try:
+            route_key = str(getattr(parent_agent, "_dd_route_key", "") or "").strip()
+            if resolved_wts and route_key:
+                helper = _SHARED_HERMES_BIN / "dd-chain-driver"
+                if helper.exists():
+                    import subprocess as _sp
+                    _sp.run(
+                        [sys.executable, str(helper),
+                         "--set-deploy-row", resolved_wts, route_key, str(entry_id),
+                         "--deploy-service", service_name],
+                        capture_output=True, text=True, timeout=20,
+                    )
+        except Exception:
+            pass  # never let chain bookkeeping affect the submit result
+
     return json.dumps(out)
 
 
