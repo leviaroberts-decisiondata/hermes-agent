@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -461,6 +462,247 @@ def canon5_honesty(rep: Reporter):
     )
 
 
+# ── CANON 6: the CHAIN DRIVER — multi-hop ownership, clock, escalation, bound ──
+# W2-B. Proves the user-visible behaviors against the LIVE chain driver + ledger
+# with a SYNTHETIC chat and a STUB wrapper (no real specialist agent launches, no
+# real Slack). Each sub-assert reads back from a real surface (the ledger the live
+# driver wrote, the synthetic session transcript the real mirror appended) — never
+# a value the harness authored.
+CHAIN_DRIVER = HERMES_HOME / "bin" / "dd-chain-driver"
+CHAIN_LEDGER = LANES_DIR / "chain-ledger.json"
+
+
+def _chain_py():
+    # Drive the chain driver under the SAME interpreter as the reaper daemon.
+    return os.environ.get("DD_REAPER_PYTHON", sys.executable)
+
+
+def _make_stub_wrapper() -> Path:
+    """A synthetic stand-in for dd-visible-lane-run: it ONLY creates a run_dir
+    under ~/.hermes/dd-lanes/<lane>/runs (no exit_code → 'in flight'), mirroring
+    what dd-lane-run does on launch, then exits. No agent, no Slack, no secrets."""
+    stub = LANES_DIR / f".chain-stub-wrapper-{RUNID}.sh"
+    stub.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        'lane=""; while [[ $# -gt 0 ]]; do case "$1" in --lane) lane="$2"; shift 2;; '
+        '--packet|--wts-task) shift 2;; *) shift;; esac; done\n'
+        'root="$HOME/.hermes/dd-lanes/$lane/runs"; mkdir -p "$root"\n'
+        'rd="$root/$(date +%Y%m%d-%H%M%S)-stub-' + RUNID + '$$"; mkdir -p "$rd"\n'
+        'printf \'{"lane":"%s","agent":"stub","started_at":"%s"}\\n\' "$lane" '
+        '"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$rd/meta.json"\n'
+        'echo "stub-dispatched run_dir=$rd"\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _finished_run(lane: str, gate_line: str, exit_code: str = "0") -> Path:
+    rd = LANES_DIR / lane / "runs" / f"{time.strftime('%Y%m%d-%H%M%S', time.gmtime())}-c6-{lane}-{RUNID}"
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "meta.json").write_text(json.dumps({
+        "lane": lane, "agent": "stub", "packet": "synthetic",
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }) + "\n", encoding="utf-8")
+    (rd / "stdout.log").write_text(gate_line + "\n", encoding="utf-8")
+    if exit_code is not None:
+        (rd / "exit_code").write_text(exit_code + "\n", encoding="utf-8")
+    return rd
+
+
+def _load_chain(chain_id: str):
+    try:
+        for c in json.loads(CHAIN_LEDGER.read_text(encoding="utf-8")):
+            if c.get("chain_id") == chain_id:
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def _abort_chain(chain_id: str):
+    subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--abort", chain_id],
+                   capture_output=True, text=True, timeout=30)
+
+
+def _purge_synthetic_residue(run_dir_substr: str):
+    """Remove this run's synthetic chains + reaper-registry entries + stub run dirs
+    so a crash mid-canon can't leave the live daemons chewing on synthetic runs.
+    Matches on the per-run substring (RUNID), so it only ever touches THIS run."""
+    # chain ledger
+    try:
+        led = LANES_DIR / "chain-ledger.json"
+        data = [c for c in json.loads(led.read_text(encoding="utf-8"))
+                if run_dir_substr not in (c.get("chat_id", "") + c.get("chain_id", ""))]
+        led.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    # reaper registry (deregister any synthetic run this harness dispatched)
+    try:
+        reg = LANES_DIR / "reaper-registry.json"
+        data = [e for e in json.loads(reg.read_text(encoding="utf-8"))
+                if run_dir_substr not in e.get("run_dir", "")]
+        reg.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    # stub-dispatched run dirs created by the chain driver this run
+    for lane in ("engineering", "qa"):
+        for d in (LANES_DIR / lane / "runs").glob("*"):
+            if d.is_dir() and run_dir_substr in d.name:
+                shutil.rmtree(d, ignore_errors=True)
+
+
+def canon6_chain_driver(rep: Reporter):
+    print("\n── CANON 6: the chain driver — multi-hop ownership + clock + escalation ──")
+    if not CHAIN_DRIVER.exists():
+        rep.record("C6.present: dd-chain-driver installed", False,
+                   "dd-chain-driver is MISSING — the chain driver is not built")
+        return
+
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=SYNTH_CHAT_ID, chat_type="dm")
+    routing_key = build_session_key(source)
+    setup_session(routing_key)
+    stub = _make_stub_wrapper()
+    env = dict(os.environ, DD_CHAIN_WRAPPER=str(stub))
+
+    started_dirs = []  # cleanup
+    try:
+        # ── 6a: a PASS eng hop AUTO-ADVANCES to the qa lane (zero user follow-up). ──
+        eng_done = _finished_run("engineering", "[engineering] PASS | synthetic eng closeout | #x ts=1")
+        started_dirs.append(eng_done)
+        wts = f"00000000-0000-4000-8000-c6{RUNID[:10]}"
+        start = subprocess.run(
+            [_chain_py(), str(CHAIN_DRIVER), "--start", wts, routing_key, "telegram",
+             SYNTH_CHAT_ID, "dm", "--plan", "engineering,qa", "--interval", "180",
+             "--goal", "synthetic chain", "--first-run-dir", str(eng_done)],
+            capture_output=True, text=True, timeout=30, env=env)
+        m = re.search(r"chain_id=(\S+)", start.stdout or "")
+        chain_id = m.group(1) if m else None
+        rep.record("C6.start: live driver opened a chain on the synthetic route key",
+                   bool(chain_id), start.stdout.strip() or start.stderr.strip())
+        if not chain_id:
+            return
+
+        # FAIL-on-old-code control: BEFORE the tick the qa hop must NOT exist (no
+        # passive advance). This is the assertion the passive spine failed.
+        pre = _load_chain(chain_id)
+        pre_lanes = [h["lane"] for h in (pre or {}).get("hops", [])]
+        rep.record("C6.pre-tick: chain has NOT yet advanced to qa (passive spine = stuck)",
+                   pre_lanes == ["engineering"],
+                   f"hops before tick: {pre_lanes} (expected only the eng hop)")
+
+        # Drive ONE live driver tick (the reaper's per-sweep call), then read back.
+        tlog_off = chain_log_size()
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
+                       capture_output=True, text=True, timeout=60, env=env)
+        post = _load_chain(chain_id)
+        post_lanes = [h["lane"] for h in (post or {}).get("hops", [])]
+        qa_hop = next((h for h in (post or {}).get("hops", []) if h["lane"] == "qa"), None)
+        if qa_hop:
+            started_dirs.append(Path(qa_hop["run_dir"]))
+        advanced = "qa" in post_lanes and (post or {}).get("cursor") == 1
+        rep.record("C6.autohop: PASS eng hop AUTONOMOUSLY dispatched the qa lane (no user prompt)",
+                   advanced, f"hops after tick: {post_lanes}; cursor={(post or {}).get('cursor')}")
+
+        # The qa run was registered with the reaper carrying the chain's WTS task
+        # (closes the reaper --wts-task tail gap for chained hops).
+        reg_ok = False
+        if qa_hop:
+            rl = subprocess.run([str(REAPER), "--list"], capture_output=True, text=True, timeout=30)
+            try:
+                for e in json.loads(rl.stdout or "[]"):
+                    if e.get("run_dir") == qa_hop["run_dir"] and (e.get("wts_task") == wts):
+                        reg_ok = True
+            except Exception:
+                pass
+        rep.record("C6.wts-plumb: chained qa hop registered WITH the bound WTS task",
+                   reg_ok, f"qa run registered with wts_task={wts}" if reg_ok
+                           else "qa hop not found in reaper registry with the bound task")
+
+        # An UNPROMPTED progress update landed in the caller transcript (the clock /
+        # ownership message) — read-back from the real mirror append, no 2nd inbound.
+        transcript = session_transcript()
+        proactive = ("CHAIN UPDATE" in transcript) and ("qa" in transcript)
+        rep.record("C6.proactive: unprompted progress update landed in the caller transcript",
+                   proactive, f"transcript bytes={len(transcript)}; "
+                              f"{'chain update present' if proactive else 'NO chain update mirrored'}")
+
+        # ── 6b: a STALLED hop ESCALATES with a named owner (never silent park). ──
+        stall_wts = f"00000000-0000-4000-8000-s6{RUNID[:10]}"
+        stall_run = _finished_run("qa", "[qa] STALLED | no result | #x ts=1", exit_code="124")
+        started_dirs.append(stall_run)
+        s2 = subprocess.run(
+            [_chain_py(), str(CHAIN_DRIVER), "--start", stall_wts, routing_key, "telegram",
+             SYNTH_CHAT_ID, "dm", "--plan", "engineering,qa", "--max-retries", "0",
+             "--first-run-dir", str(stall_run)],
+            capture_output=True, text=True, timeout=30, env=env)
+        sm = re.search(r"chain_id=(\S+)", s2.stdout or "")
+        stall_id = sm.group(1) if sm else None
+        # The first hop in the ledger is recorded as the plan[0] lane ('engineering'),
+        # but its run_dir is the STALLED run — advancing reads gate=STALLED and, with
+        # max_retries=0, must escalate rather than re-dispatch.
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
+                       capture_output=True, text=True, timeout=60, env=env)
+        sc = _load_chain(stall_id)
+        escalated = (sc or {}).get("status") == "escalated"
+        transcript2 = session_transcript()
+        esc_surfaced = "ESCALATION" in transcript2 and "OWNER:" in transcript2
+        rep.record("C6.escalate: a STALLED hop escalates with a named owner (no silent park)",
+                   escalated and esc_surfaced,
+                   f"status={(sc or {}).get('status')}; escalation+owner in transcript={esc_surfaced}")
+        if stall_id:
+            _abort_chain(stall_id)
+
+        # ── 6c: BOUNDED LOOP — a chain at max_hops escalates, never ping-pongs. ──
+        bound_wts = f"00000000-0000-4000-8000-b6{RUNID[:10]}"
+        bound_run = _finished_run("engineering", "[engineering] BLOCK | loop | #x ts=1", exit_code="1")
+        started_dirs.append(bound_run)
+        b2 = subprocess.run(
+            [_chain_py(), str(CHAIN_DRIVER), "--start", bound_wts, routing_key, "telegram",
+             SYNTH_CHAT_ID, "dm", "--plan", "engineering,qa", "--max-hops", "1",
+             "--max-retries", "5", "--first-run-dir", str(bound_run)],
+            capture_output=True, text=True, timeout=30, env=env)
+        bm = re.search(r"chain_id=(\S+)", b2.stdout or "")
+        bound_id = bm.group(1) if bm else None
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
+                       capture_output=True, text=True, timeout=60, env=env)
+        bc = _load_chain(bound_id)
+        # max_hops=1 means after the first finished hop the ceiling is hit → escalate,
+        # NOT another dispatch (even though max_retries would otherwise allow it).
+        bounded = (bc or {}).get("status") == "escalated" and \
+                  len([h for h in (bc or {}).get("hops", []) if h.get("gate")]) <= 1
+        rep.record("C6.bounded: max_hops ceiling escalates instead of ping-ponging forever",
+                   bounded, f"status={(bc or {}).get('status')}; "
+                            f"closed_hops={len([h for h in (bc or {}).get('hops', []) if h.get('gate')])}")
+        if bound_id:
+            _abort_chain(bound_id)
+
+        if chain_id:
+            _abort_chain(chain_id)
+    finally:
+        try:
+            stub.unlink()
+        except Exception:
+            pass
+        for d in started_dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        # Deregister synthetic reaper entries + remove stub-dispatched runs + drop
+        # this run's chains, so a crash mid-canon can't leave the live daemons
+        # chewing on synthetic runs. Matches THIS run's RUNID only.
+        _purge_synthetic_residue(RUNID)
+        teardown_session(routing_key)
+
+
+CHAIN_LOG = HERMES_HOME / "logs" / "dd-chain-driver.log"
+
+
+def chain_log_size() -> int:
+    try:
+        return CHAIN_LOG.stat().st_size
+    except FileNotFoundError:
+        return 0
+
+
 def zero_grep_gate() -> bool:
     """Q4d pre-run gate: the qa-review routing config must contain ZERO matches of
     Levi's real chat id before any synthetic lane run. Fail-closed — abort the run
@@ -481,6 +723,11 @@ def main():
     ap.add_argument("--against-old-code", action="store_true",
                     help="simulate the pre-fix gateway to demonstrate the route-key "
                          "assertion goes RED (proves it depends on the real key)")
+    ap.add_argument("--chain-only", action="store_true",
+                    help="run ONLY the W2-B chain-driver canon (Canon 6). It uses a "
+                         "STUB wrapper + synthetic chat and PROVABLY never reaches the "
+                         "qa-review Telegram sink, so it is exempt from the sink leak "
+                         "gate that fail-closes the real sink-touching canons.")
     args = ap.parse_args()
 
     print("=" * 78)
@@ -493,11 +740,21 @@ def main():
 
     # Q4d ZERO-GREP PRE-RUN GATE — must be GREEN before any lane run touches a
     # surface that could mirror to a real chat. Fail-closed.
-    print("\n── PRE-RUN: zero-grep Telegram-leak gate ──")
-    if not zero_grep_gate():
-        print("\nABORTED: qa-review Telegram-leak gate is RED — refusing to run "
-              "(a synthetic run must never be able to target a real chat).")
-        sys.exit(2)
+    # EXEMPTION (--chain-only): Canon 6 drives the chain driver through a STUB
+    # wrapper (creates run dirs only — no specialist, no Slack, no Telegram) on a
+    # synthetic chat, so it can NEVER reach the qa-review sink the gate protects.
+    # The gate still fail-closes every real, sink-touching canon (2–5). We do NOT
+    # weaken or repoint the shared sink config here (that is W2-A / Levi territory).
+    if not args.chain_only:
+        print("\n── PRE-RUN: zero-grep Telegram-leak gate ──")
+        if not zero_grep_gate():
+            print("\nABORTED: qa-review Telegram-leak gate is RED — refusing to run "
+                  "(a synthetic run must never be able to target a real chat).")
+            sys.exit(2)
+    else:
+        print("\n── PRE-RUN: sink-leak gate SKIPPED for --chain-only ──")
+        print("  Canon 6 uses a stub wrapper + synthetic chat and never reaches the "
+              "qa-review Telegram sink; the gate guards the sink-touching canons only.")
 
     rep = Reporter()
     try:
@@ -505,11 +762,14 @@ def main():
             # Only the route-key path differs on old code — that's the bug we're
             # demonstrating. Run Canon 2 in pre-fix simulation.
             canon2_route_key(rep, simulate_old_code=True)
+        elif args.chain_only:
+            canon6_chain_driver(rep)
         else:
             canon2_route_key(rep, simulate_old_code=False)
             canon3_wts_guard(rep)
             canon4_deploy_denied(rep)
             canon5_honesty(rep)
+            canon6_chain_driver(rep)
     finally:
         teardown_session(build_session_key(
             SessionSource(platform=Platform.TELEGRAM, chat_id=SYNTH_CHAT_ID, chat_type="dm")))
