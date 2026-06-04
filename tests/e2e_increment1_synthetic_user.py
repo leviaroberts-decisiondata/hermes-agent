@@ -552,8 +552,29 @@ def _purge_synthetic_residue(run_dir_substr: str):
                 shutil.rmtree(d, ignore_errors=True)
 
 
+def _make_git_stub(mode: str) -> Path:
+    """A stand-in `git` for the publish-bridge test. mode=ok → exit 0 with a
+    [new branch] line; mode=fail → exit 1 with a permission-denied line (the
+    real dd-delivery write-wall W2-A documented). Never touches a real repo."""
+    g = LANES_DIR / f".chain-gitstub-{mode}-{RUNID}.sh"
+    if mode == "ok":
+        body = ('#!/usr/bin/env bash\necho " * [new branch]  feat/x -> feat/x" >&2\nexit 0\n')
+    else:
+        body = ('#!/usr/bin/env bash\n'
+                'echo "error: insufficient permission for adding an object to repository database .git/objects" >&2\n'
+                'exit 1\n')
+    g.write_text(body, encoding="utf-8")
+    g.chmod(0o755)
+    return g
+
+
+def _stages(rec):
+    return [h["stage"] for h in (rec or {}).get("history", []) if h.get("kind") == "run"]
+
+
 def canon6_chain_driver(rep: Reporter):
-    print("\n── CANON 6: the chain driver — multi-hop ownership + clock + escalation ──")
+    print("\n── CANON 6: WORK OWNERSHIP — five-field record, autonomous stages, "
+          "deploy-stage, publish bridge, escalation, bound ──")
     if not CHAIN_DRIVER.exists():
         rep.record("C6.present: dd-chain-driver installed", False,
                    "dd-chain-driver is MISSING — the chain driver is not built")
@@ -563,49 +584,62 @@ def canon6_chain_driver(rep: Reporter):
     routing_key = build_session_key(source)
     setup_session(routing_key)
     stub = _make_stub_wrapper()
+    git_ok = _make_git_stub("ok")
+    git_fail = _make_git_stub("fail")
     env = dict(os.environ, DD_CHAIN_WRAPPER=str(stub))
 
     started_dirs = []  # cleanup
     try:
-        # ── 6a: a PASS eng hop AUTO-ADVANCES to the qa lane (zero user follow-up). ──
+        # ── 6a: the OWNERSHIP RECORD carries the five fields, current at all times. ──
         eng_done = _finished_run("engineering", "[engineering] PASS | synthetic eng closeout | #x ts=1")
         started_dirs.append(eng_done)
         wts = f"00000000-0000-4000-8000-c6{RUNID[:10]}"
         start = subprocess.run(
             [_chain_py(), str(CHAIN_DRIVER), "--start", wts, routing_key, "telegram",
-             SYNTH_CHAT_ID, "dm", "--plan", "engineering,qa", "--interval", "180",
-             "--goal", "synthetic chain", "--first-run-dir", str(eng_done)],
+             SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa,deploy,report",
+             "--interval", "180", "--goal", "synthetic chain", "--first-run-dir", str(eng_done)],
             capture_output=True, text=True, timeout=30, env=env)
         m = re.search(r"chain_id=(\S+)", start.stdout or "")
         chain_id = m.group(1) if m else None
-        rep.record("C6.start: live driver opened a chain on the synthetic route key",
+        rep.record("C6.start: live driver opened a work-ownership record",
                    bool(chain_id), start.stdout.strip() or start.stderr.strip())
         if not chain_id:
             return
 
-        # FAIL-on-old-code control: BEFORE the tick the qa hop must NOT exist (no
-        # passive advance). This is the assertion the passive spine failed.
-        pre = _load_chain(chain_id)
-        pre_lanes = [h["lane"] for h in (pre or {}).get("hops", [])]
-        rep.record("C6.pre-tick: chain has NOT yet advanced to qa (passive spine = stuck)",
-                   pre_lanes == ["engineering"],
-                   f"hops before tick: {pre_lanes} (expected only the eng hop)")
+        pre = _load_chain(chain_id) or {}
+        five = ("stage", "owner", "next_stage", "blocker", "eta")
+        have_five = all(k in pre for k in five) and pre.get("stage") == "engineering" \
+            and pre.get("next_stage") == "qa"
+        rep.record("C6.fields: record carries the five first-class ownership fields, current",
+                   have_five, f"stage={pre.get('stage')} owner={pre.get('owner')} "
+                              f"next={pre.get('next_stage')} blocker={pre.get('blocker')} "
+                              f"eta={pre.get('eta')}")
 
-        # Drive ONE live driver tick (the reaper's per-sweep call), then read back.
-        tlog_off = chain_log_size()
+        # deploy + report are REAL stages in the pipeline; deploy carries the standing gate.
+        deploy_modeled = pre.get("stages") == ["engineering", "qa", "deploy", "report"] and \
+            pre.get("stage_state", {}).get("deploy") == "blocked:operator-gate-P-F"
+        rep.record("C6.deploy-stage: deploy is a REAL stage with a standing operator-gate state",
+                   deploy_modeled, f"stages={pre.get('stages')}; "
+                                   f"stage_state.deploy={pre.get('stage_state', {}).get('deploy')}")
+
+        # FAIL-on-old-code control: BEFORE the tick the record has NOT advanced to qa.
+        rep.record("C6.pre-tick: record has NOT advanced past engineering (passive spine = stuck)",
+                   _stages(pre) == ["engineering"],
+                   f"stages before tick: {_stages(pre)} (expected only engineering)")
+
+        # ── 6b: a PASS eng stage AUTONOMOUSLY advances to qa (zero follow-up). ──
         subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
                        capture_output=True, text=True, timeout=60, env=env)
-        post = _load_chain(chain_id)
-        post_lanes = [h["lane"] for h in (post or {}).get("hops", [])]
-        qa_hop = next((h for h in (post or {}).get("hops", []) if h["lane"] == "qa"), None)
+        post = _load_chain(chain_id) or {}
+        qa_hop = next((h for h in post.get("history", [])
+                       if h.get("kind") == "run" and h["stage"] == "qa"), None)
         if qa_hop:
             started_dirs.append(Path(qa_hop["run_dir"]))
-        advanced = "qa" in post_lanes and (post or {}).get("cursor") == 1
-        rep.record("C6.autohop: PASS eng hop AUTONOMOUSLY dispatched the qa lane (no user prompt)",
-                   advanced, f"hops after tick: {post_lanes}; cursor={(post or {}).get('cursor')}")
+        advanced = "qa" in _stages(post) and post.get("stage") == "qa" and post.get("stage_index") == 1
+        rep.record("C6.autohop: PASS eng stage AUTONOMOUSLY dispatched qa (record drove it)",
+                   advanced, f"stages after tick: {_stages(post)}; stage={post.get('stage')} "
+                             f"index={post.get('stage_index')}")
 
-        # The qa run was registered with the reaper carrying the chain's WTS task
-        # (closes the reaper --wts-task tail gap for chained hops).
         reg_ok = False
         if qa_hop:
             rl = subprocess.run([str(REAPER), "--list"], capture_output=True, text=True, timeout=30)
@@ -615,75 +649,121 @@ def canon6_chain_driver(rep: Reporter):
                         reg_ok = True
             except Exception:
                 pass
-        rep.record("C6.wts-plumb: chained qa hop registered WITH the bound WTS task",
+        rep.record("C6.wts-plumb: advanced qa stage registered WITH the bound WTS task",
                    reg_ok, f"qa run registered with wts_task={wts}" if reg_ok
-                           else "qa hop not found in reaper registry with the bound task")
+                           else "qa run not found in reaper registry with the bound task")
 
-        # An UNPROMPTED progress update landed in the caller transcript (the clock /
-        # ownership message) — read-back from the real mirror append, no 2nd inbound.
         transcript = session_transcript()
-        proactive = ("CHAIN UPDATE" in transcript) and ("qa" in transcript)
-        rep.record("C6.proactive: unprompted progress update landed in the caller transcript",
+        proactive = ("WORK OWNERSHIP" in transcript) and ("stage:" in transcript) and ("qa" in transcript)
+        rep.record("C6.proactive: an unprompted five-field ownership update landed in the transcript",
                    proactive, f"transcript bytes={len(transcript)}; "
-                              f"{'chain update present' if proactive else 'NO chain update mirrored'}")
+                              f"{'ownership snapshot present' if proactive else 'NO snapshot mirrored'}")
+        if chain_id:
+            _abort_chain(chain_id)
 
-        # ── 6b: a STALLED hop ESCALATES with a named owner (never silent park). ──
+        # ── 6c: PUBLISH BRIDGE — eng PASS with a branch triggers the operator push. ──
+        pub_wts = f"00000000-0000-4000-8000-p6{RUNID[:10]}"
+        pub_eng = _finished_run("engineering", "[engineering] PASS | built, needs publish | #x ts=1")
+        started_dirs.append(pub_eng)
+        pub_cwd = LANES_DIR / f".chain-pubcwd-{RUNID}"
+        pub_cwd.mkdir(exist_ok=True)
+        p2 = subprocess.run(
+            [_chain_py(), str(CHAIN_DRIVER), "--start", pub_wts, routing_key, "telegram",
+             SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa", "--first-run-dir", str(pub_eng),
+             "--publish-branch", "feat/x", "--publish-cwd", str(pub_cwd)],
+            capture_output=True, text=True, timeout=30, env=env)
+        pub_id = re.search(r"chain_id=(\S+)", p2.stdout or "")
+        pub_id = pub_id.group(1) if pub_id else None
+        # tick with the OK git stub → push succeeds → published recorded → advances to qa
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
+                       capture_output=True, text=True, timeout=60,
+                       env=dict(env, DD_CHAIN_GIT=str(git_ok)))
+        pc = _load_chain(pub_id) or {}
+        pub_qa = next((h for h in pc.get("history", [])
+                       if h.get("kind") == "run" and h["stage"] == "qa"), None)
+        if pub_qa:
+            started_dirs.append(Path(pub_qa["run_dir"]))
+        published = bool(pc.get("published")) and "qa" in _stages(pc)
+        rep.record("C6.publish-ok: eng PASS + branch → operator-bridge push, then advance to qa",
+                   published, f"published={pc.get('published')}; stages={_stages(pc)}")
+        if pub_id:
+            _abort_chain(pub_id)
+
+        # publish FAILURE → BLOCKER state on the record (never a silent park).
+        pubf_wts = f"00000000-0000-4000-8000-pf{RUNID[:10]}"
+        pubf_eng = _finished_run("engineering", "[engineering] PASS | built, needs publish | #x ts=1")
+        started_dirs.append(pubf_eng)
+        pf2 = subprocess.run(
+            [_chain_py(), str(CHAIN_DRIVER), "--start", pubf_wts, routing_key, "telegram",
+             SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa", "--first-run-dir", str(pubf_eng),
+             "--publish-branch", "feat/x", "--publish-cwd", str(pub_cwd)],
+            capture_output=True, text=True, timeout=30, env=env)
+        pf_id = re.search(r"chain_id=(\S+)", pf2.stdout or "")
+        pf_id = pf_id.group(1) if pf_id else None
+        subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
+                       capture_output=True, text=True, timeout=60,
+                       env=dict(env, DD_CHAIN_GIT=str(git_fail)))
+        pf = _load_chain(pf_id) or {}
+        push_blocked = (pf.get("status") in ("blocked", "escalated")) and \
+            ("publish failed" in (pf.get("blocker") or "")) and "qa" not in _stages(pf)
+        rep.record("C6.publish-fail: a failed self-service push becomes a BLOCKER (no silent park)",
+                   push_blocked, f"status={pf.get('status')}; blocker={pf.get('blocker')}; "
+                                 f"stages={_stages(pf)}")
+        if pf_id:
+            _abort_chain(pf_id)
+
+        # ── 6d: a STALLED stage ESCALATES with a named owner (never silent park). ──
         stall_wts = f"00000000-0000-4000-8000-s6{RUNID[:10]}"
         stall_run = _finished_run("qa", "[qa] STALLED | no result | #x ts=1", exit_code="124")
         started_dirs.append(stall_run)
         s2 = subprocess.run(
             [_chain_py(), str(CHAIN_DRIVER), "--start", stall_wts, routing_key, "telegram",
-             SYNTH_CHAT_ID, "dm", "--plan", "engineering,qa", "--max-retries", "0",
+             SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa", "--max-retries", "0",
              "--first-run-dir", str(stall_run)],
             capture_output=True, text=True, timeout=30, env=env)
-        sm = re.search(r"chain_id=(\S+)", s2.stdout or "")
-        stall_id = sm.group(1) if sm else None
-        # The first hop in the ledger is recorded as the plan[0] lane ('engineering'),
-        # but its run_dir is the STALLED run — advancing reads gate=STALLED and, with
-        # max_retries=0, must escalate rather than re-dispatch.
+        stall_id = re.search(r"chain_id=(\S+)", s2.stdout or "")
+        stall_id = stall_id.group(1) if stall_id else None
         subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
                        capture_output=True, text=True, timeout=60, env=env)
-        sc = _load_chain(stall_id)
-        escalated = (sc or {}).get("status") == "escalated"
+        sc = _load_chain(stall_id) or {}
+        escalated = sc.get("status") == "escalated"
         transcript2 = session_transcript()
         esc_surfaced = "ESCALATION" in transcript2 and "OWNER:" in transcript2
-        rep.record("C6.escalate: a STALLED hop escalates with a named owner (no silent park)",
+        rep.record("C6.escalate: a STALLED stage escalates with a named owner (no silent park)",
                    escalated and esc_surfaced,
-                   f"status={(sc or {}).get('status')}; escalation+owner in transcript={esc_surfaced}")
+                   f"status={sc.get('status')}; blocker={sc.get('blocker')}; "
+                   f"escalation+owner in transcript={esc_surfaced}")
         if stall_id:
             _abort_chain(stall_id)
 
-        # ── 6c: BOUNDED LOOP — a chain at max_hops escalates, never ping-pongs. ──
+        # ── 6e: BOUNDED LOOP — a record at max_hops escalates, never ping-pongs. ──
         bound_wts = f"00000000-0000-4000-8000-b6{RUNID[:10]}"
         bound_run = _finished_run("engineering", "[engineering] BLOCK | loop | #x ts=1", exit_code="1")
         started_dirs.append(bound_run)
         b2 = subprocess.run(
             [_chain_py(), str(CHAIN_DRIVER), "--start", bound_wts, routing_key, "telegram",
-             SYNTH_CHAT_ID, "dm", "--plan", "engineering,qa", "--max-hops", "1",
+             SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa", "--max-hops", "1",
              "--max-retries", "5", "--first-run-dir", str(bound_run)],
             capture_output=True, text=True, timeout=30, env=env)
-        bm = re.search(r"chain_id=(\S+)", b2.stdout or "")
-        bound_id = bm.group(1) if bm else None
+        bound_id = re.search(r"chain_id=(\S+)", b2.stdout or "")
+        bound_id = bound_id.group(1) if bound_id else None
         subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
                        capture_output=True, text=True, timeout=60, env=env)
-        bc = _load_chain(bound_id)
-        # max_hops=1 means after the first finished hop the ceiling is hit → escalate,
-        # NOT another dispatch (even though max_retries would otherwise allow it).
-        bounded = (bc or {}).get("status") == "escalated" and \
-                  len([h for h in (bc or {}).get("hops", []) if h.get("gate")]) <= 1
+        bc = _load_chain(bound_id) or {}
+        bounded = bc.get("status") == "escalated" and \
+            len([h for h in bc.get("history", []) if h.get("gate")]) <= 1
         rep.record("C6.bounded: max_hops ceiling escalates instead of ping-ponging forever",
-                   bounded, f"status={(bc or {}).get('status')}; "
-                            f"closed_hops={len([h for h in (bc or {}).get('hops', []) if h.get('gate')])}")
+                   bounded, f"status={bc.get('status')}; "
+                            f"closed_hops={len([h for h in bc.get('history', []) if h.get('gate')])}")
         if bound_id:
             _abort_chain(bound_id)
-
-        if chain_id:
-            _abort_chain(chain_id)
     finally:
-        try:
-            stub.unlink()
-        except Exception:
-            pass
+        for p in (stub, git_ok, git_fail):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        shutil.rmtree(LANES_DIR / f".chain-pubcwd-{RUNID}", ignore_errors=True)
         for d in started_dirs:
             shutil.rmtree(d, ignore_errors=True)
         # Deregister synthetic reaper entries + remove stub-dispatched runs + drop
