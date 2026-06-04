@@ -9617,6 +9617,19 @@ class AIAgent:
                 packet=function_args.get("packet"),
                 parent_agent=self,
             )
+        elif function_name == "wts_bind":
+            # G1 (P5 review): wts_bind needs `parent_agent` to derive the Telegram
+            # chat id from this turn's routing key, same threading reason as
+            # route_to_lane. Call directly so parent_agent is forwarded.
+            from tools.wts_bind_tool import wts_bind as _wts_bind
+            return _wts_bind(
+                goal=function_args.get("goal"),
+                chat=function_args.get("chat"),
+                thread=function_args.get("thread"),
+                notes=function_args.get("notes"),
+                resolve_only=bool(function_args.get("resolve_only", False)),
+                parent_agent=self,
+            )
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -10208,6 +10221,23 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('route_to_lane', function_args, tool_duration, result=_rtl_result)}")
+            elif function_name == "wts_bind":
+                # G1 (P5 review, sequential path): thread parent_agent so wts_bind
+                # can derive the Telegram chat id from this turn's routing key.
+                from tools.wts_bind_tool import wts_bind as _wts_bind
+                try:
+                    function_result = _wts_bind(
+                        goal=function_args.get("goal"),
+                        chat=function_args.get("chat"),
+                        thread=function_args.get("thread"),
+                        notes=function_args.get("notes"),
+                        resolve_only=bool(function_args.get("resolve_only", False)),
+                        parent_agent=self,
+                    )
+                except Exception as tool_error:
+                    function_result = f"Error executing tool 'wts_bind': {tool_error}"
+                    logger.error("wts_bind raised: %s", tool_error, exc_info=True)
+                tool_duration = time.time() - tool_start_time
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
