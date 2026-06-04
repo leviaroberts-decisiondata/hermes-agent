@@ -499,6 +499,21 @@ async def vision_analyze_tool(
 
         detected_mime_type = _detect_image_mime_type(temp_image_path)
         if not detected_mime_type:
+            # Give the model an ACTIONABLE error. The most common misfire is
+            # pointing image vision at a VIDEO (e.g. a Slack screen recording
+            # .mp4/.mov) — tell the model to use the video-review path instead of
+            # re-trying image vision. Raised, then caught by the handler below and
+            # returned as a tool-error result (the turn never stalls on this).
+            _ext = temp_image_path.suffix.lower().lstrip(".")
+            _video_exts = {"mp4", "mov", "m4v", "webm", "mkv", "avi", "gif"}
+            if _ext in _video_exts:
+                raise ValueError(
+                    f"This is a {_ext.upper()} video, not a still image — vision_analyze "
+                    f"only handles images. Do NOT retry image vision on it; use the "
+                    f"video review path (the inbound video is already routed to the "
+                    f"video-review service), or describe the request from the video's "
+                    f"transcript/feedback instead."
+                )
             raise ValueError("Only real image files are supported for vision analysis.")
         
         # Convert image to base64 — send at full resolution first.
