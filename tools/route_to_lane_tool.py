@@ -41,6 +41,14 @@ _SHARED_HOME = Path.home() / ".hermes"
 _WRAPPER = _SHARED_HOME / "bin" / "dd-visible-lane-run"
 _CHANNELS_JSON = _SHARED_HOME / "dd-lanes" / "channels.json"
 _LANE_DIR = _SHARED_HOME / "dd-lanes"
+# G2 (P5 review): the FULL 10-lane registry (a superset of channels.json). Only
+# design/engineering/qa are Slack-backed (route_to_lane-able); the other 7 lanes
+# (pmo, architecture, product, knowledge, devops, engineering-2/-3) run on the
+# Telegram transport via this runner. The unknown-lane error reads this so it can
+# tell P1 *"that lane is real — use the Telegram runner"* instead of a bare list
+# of 3, which is exactly what let P1 silently drop the PMO step (session L22/L23).
+_TELEGRAM_TARGETS_JSON = _SHARED_HOME / "dd-lanes" / "telegram-targets.json"
+_TELEGRAM_RUNNER = _SHARED_HOME / "bin" / "dd-telegram-visible-lane-run"
 # P-C / B-1a: the result-return SPINE. When a handoff returns PENDING (the lane
 # detached and outlives the wrapper's watch budget), we register the run with the
 # openclaw-owned reaper so it returns the closeout to THIS caller's session even
@@ -154,6 +162,22 @@ def _known_lanes() -> list[str]:
         return []
 
 
+def _all_lanes() -> list[str]:
+    """The FULL specialist lane registry (Slack-backed + Telegram-only).
+
+    Reads telegram-targets.json (a superset of channels.json). Used only to make
+    the unknown-lane error actionable — so a real-but-not-Slack-backed lane
+    (pmo/architecture/product/knowledge/devops/engineering-2/-3) is named and
+    P1 is pointed at the Telegram runner instead of silently dropping the step.
+    Returns [] on any read error (the caller degrades to the channels.json list).
+    """
+    try:
+        cfg = json.loads(_TELEGRAM_TARGETS_JSON.read_text(encoding="utf-8"))
+        return sorted((cfg.get("lanes") or {}).keys())
+    except Exception:
+        return []
+
+
 def check_route_to_lane_requirements() -> bool:
     """Gate: available only when the sanctioned wrapper + lane config exist.
 
@@ -213,8 +237,45 @@ def route_to_lane(
         return tool_error("route_to_lane: 'lane' is required (e.g. qa, design, engineering).")
     known = _known_lanes()
     if known and lane not in known:
+        # G2 (P5 review): a LOUD, actionable failure — never a silent drop.
+        # Distinguish two cases so P1 (and the human reading the turn) can act:
+        #   (a) the lane is a REAL specialist lane but not Slack-backed → it must
+        #       run on the Telegram transport; emit the exact runner command.
+        #   (b) the lane is not in any registry → a true typo/unknown lane.
+        # Real-flow bug this fixes: P1 hit "unknown lane 'pmo'" and, seeing only
+        # the 3 Slack lanes, abandoned the PMO step and folded it into
+        # engineering (session L22/L23). Naming the real lane + its runner makes
+        # dropping the step the obviously-wrong move instead of the easy one.
+        all_lanes = _all_lanes()
+        telegram_only = [l for l in all_lanes if l not in known]
+        runner_available = _TELEGRAM_RUNNER.exists() and os.access(_TELEGRAM_RUNNER, os.X_OK)
+        if lane in telegram_only:
+            runner_hint = (
+                f"Run it on the Telegram transport instead:\n"
+                f"    {_TELEGRAM_RUNNER} --lane {lane} --packet <packet.md> [--wts-task <id>]\n"
+                f"(First bind a WTS task with `dd-wts-bind` on a governance/Telegram "
+                f"turn, then pass its id as --wts-task so REQUEST+RESPONSE land on ONE "
+                f"task — see p1-specialists.md.)"
+            )
+            if not runner_available:
+                runner_hint = (
+                    f"The Telegram runner ({_TELEGRAM_RUNNER}) is NOT reachable from "
+                    f"this surface — do NOT silently drop this step; surface the blocker "
+                    f"to the user (the '{lane}' lane could not be reached)."
+                )
+            return tool_error(
+                f"route_to_lane: lane '{lane}' is a REAL specialist lane but is NOT "
+                f"Slack-backed, so route_to_lane cannot reach it. This is NOT a reason "
+                f"to drop the step or fold it into another lane. {runner_hint}\n"
+                f"route_to_lane-able lanes (Slack): {', '.join(known)}.\n"
+                f"Telegram-only lanes: {', '.join(telegram_only) or '(none)'}."
+            )
         return tool_error(
-            f"route_to_lane: unknown lane '{lane}'. Known lanes: {', '.join(known)}."
+            f"route_to_lane: unknown lane '{lane}' — it is not in ANY lane registry "
+            f"(typo?). Do NOT silently drop this step; pick a real lane or tell the "
+            f"user the requested lane does not exist.\n"
+            f"route_to_lane-able lanes (Slack): {', '.join(known)}.\n"
+            f"All specialist lanes: {', '.join(all_lanes) or ', '.join(known)}."
         )
 
     # WS8 §4 / P-D §G7 (the active-task FEED): when the caller did not pass

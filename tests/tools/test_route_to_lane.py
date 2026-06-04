@@ -97,6 +97,58 @@ class TestI1CorrectInvocation:
         assert not fake_tree["argv_log"].exists()  # wrapper never called
 
 
+# ── G2: loud, actionable unknown-lane failure (never a silent drop) ───────
+class TestG2LoudUnknownLane:
+    """A real-but-not-Slack lane (pmo/architecture/…) must produce a LOUD error
+    that names the lane as real and gives the exact Telegram-runner command —
+    not the bare 3-lane list that let P1 silently drop the PMO step. A truly
+    unknown lane must tell the model to surface it to the user."""
+
+    def _with_telegram_targets(self, fake_tree, monkeypatch, runner_exists=True):
+        lanes_dir = fake_tree["lanes_dir"]
+        # Superset registry: the 3 Slack lanes + the 7 Telegram-only lanes.
+        (lanes_dir / "telegram-targets.json").write_text(
+            '{"lanes":{"design":{},"engineering":{},"qa":{},'
+            '"pmo":{},"architecture":{},"product":{},"knowledge":{},'
+            '"devops":{},"engineering-2":{},"engineering-3":{}}}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(r2l, "_TELEGRAM_TARGETS_JSON", lanes_dir / "telegram-targets.json")
+        runner = fake_tree["wrapper"].parent / "dd-telegram-visible-lane-run"
+        if runner_exists:
+            runner.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            runner.chmod(0o755)
+        monkeypatch.setattr(r2l, "_TELEGRAM_RUNNER", runner)
+        return runner
+
+    def test_telegram_only_lane_names_runner_and_refuses_drop(self, fake_tree, monkeypatch):
+        runner = self._with_telegram_targets(fake_tree, monkeypatch)
+        out = r2l.route_to_lane(lane="pmo", goal="plan the work")
+        # Names the lane as REAL, gives the exact runner command, forbids dropping.
+        assert "real specialist lane" in out.lower()
+        assert "dd-telegram-visible-lane-run" in out
+        assert "--lane pmo" in out
+        assert "not" in out.lower() and "drop" in out.lower()
+        # Did NOT invoke the Slack wrapper.
+        assert not fake_tree["argv_log"].exists()
+
+    def test_telegram_only_lane_when_runner_unreachable_still_loud(self, fake_tree, monkeypatch):
+        self._with_telegram_targets(fake_tree, monkeypatch, runner_exists=False)
+        out = r2l.route_to_lane(lane="architecture", goal="review")
+        assert "real specialist lane" in out.lower()
+        # No silent drop even when the runner can't be reached from this surface.
+        assert "not reachable" in out.lower() or "could not be reached" in out.lower()
+        assert "drop" in out.lower()
+
+    def test_truly_unknown_lane_tells_model_to_surface_to_user(self, fake_tree, monkeypatch):
+        self._with_telegram_targets(fake_tree, monkeypatch)
+        out = r2l.route_to_lane(lane="frobnicate", goal="x")
+        assert "unknown lane" in out.lower()
+        assert "not in any lane registry" in out.lower()
+        assert "user" in out.lower()  # instructs surfacing to the user
+        assert not fake_tree["argv_log"].exists()
+
+
 # ── I2: honest verification ───────────────────────────────────────────────
 class TestI2HonestVerification:
     def test_success_when_exit0_and_status_line(self, fake_tree, monkeypatch):

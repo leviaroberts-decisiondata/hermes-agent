@@ -1088,7 +1088,16 @@ def _load_cursorrules(cwd_path: Path) -> str:
 # so it is NOT resolved via HERMES_HOME (which points at a profile dir for
 # specialists). Override with DD_CONTEXT_TREE_ROOT (tests / relocation).
 _CONTEXT_TREE_AWARENESS_NODES = ["global", "operating-model", "platform"]
-_CONTEXT_TREE_PER_NODE_CHAR_CAP = 6000
+# Per-node cap raised 6000 → 8500 (P5 review G1/G2): the composed operating-model
+# node (shared _core.md + the p1-specialists role view) is THE coordination
+# contract and legitimately the largest node — at 6000 it was truncating the
+# lane-registry / WTS-binding rules mid-section, which is exactly the awareness gap
+# the review found (P1 silently dropped lanes / skipped WTS binding). The other two
+# awareness nodes are tiny (global ~1.4k, platform ~0.9k), so the total stays far
+# under the 20000 total cap (≈10.8k for all three). Gateway-side only; the Slack
+# loader (dd-slack-service/src/context-tree.js) composes a different, smaller view
+# and is untouched.
+_CONTEXT_TREE_PER_NODE_CHAR_CAP = 8500
 _CONTEXT_TREE_TOTAL_CHAR_CAP = 20000
 
 
