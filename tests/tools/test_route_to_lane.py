@@ -140,6 +140,54 @@ class TestI2HonestVerification:
         assert "do not report this as completed" in out.lower()
 
 
+# ── P-D / G5: gate-aware OK — a FAILED specialist is never reported OK ─────────
+class TestG5GateAwareOK:
+    """A specialist can exit 0 while its result body declares a failure verdict;
+    the wrapper stamps the honest FAIL onto the status line (exit-code-first), and
+    route_to_lane must report FAILED — never a false HANDOFF OK — when the parsed
+    gate is a failure verdict, even on a clean (exit 0) wrapper exit."""
+
+    def test_exit0_but_gate_fail_reported_failed_not_ok(self, fake_tree, monkeypatch):
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] FAIL | tests 3/7 failed | #dd-lane-qa ts=1.1")
+        out = r2l.route_to_lane(lane="qa", goal="review")
+        assert "HANDOFF OK" not in out
+        assert "HANDOFF FAILED" in out
+        assert "FAIL gate" in out
+        assert "tests 3/7 failed" in out  # the failure detail surfaces to the caller
+
+    def test_exit0_but_gate_blocked_reported_failed(self, fake_tree, monkeypatch):
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] BLOCKED | needs WTS token | #dd-lane-qa ts=2.2")
+        out = r2l.route_to_lane(lane="qa", goal="review")
+        assert "HANDOFF OK" not in out
+        assert "HANDOFF FAILED" in out
+        assert "BLOCKED gate" in out
+
+    def test_exit0_and_gate_pass_still_ok(self, fake_tree, monkeypatch):
+        # Regression guard: a genuine PASS is still HANDOFF OK (G5 must not
+        # over-block).
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | all green | #dd-lane-qa ts=3.3")
+        out = r2l.route_to_lane(lane="qa", goal="review")
+        assert "HANDOFF OK" in out
+
+    def test_exit0_and_gate_warn_is_not_a_failure(self, fake_tree, monkeypatch):
+        # WARN is an advisory PASS-with-notes, not a failure verdict → still OK.
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] WARN | minor lint nits | #dd-lane-qa ts=4.4")
+        out = r2l.route_to_lane(lane="qa", goal="review")
+        assert "HANDOFF OK" in out
+
+    def test_parse_status_gate_extracts_token(self):
+        assert r2l._parse_status_gate("[qa] FAIL | x | #c ts=1", "qa") == "FAIL"
+        assert r2l._parse_status_gate("[qa] PASS | x", "qa") == "PASS"
+        assert r2l._parse_status_gate("[design] BLOCKED | y", "design") == "BLOCKED"
+        # no normalized line for this lane → None
+        assert r2l._parse_status_gate("random chatter", "qa") is None
+        assert r2l._parse_status_gate("", "qa") is None
+
+
 # ── I3: attach to active task + bucket-fallback surfaced ──────────────────
 class TestI3ActiveTaskAttach:
     def test_wts_task_forwarded_as_flag(self, fake_tree, monkeypatch):
@@ -189,17 +237,35 @@ class TestWS8ActiveTaskFeed:
     BOUND = "11112222-3333-4444-5555-666677778888"
     EXPLICIT = "99990000-aaaa-bbbb-cccc-ddddeeeeffff"
 
-    def test_feed_off_by_default_no_bound_used(self, fake_tree, monkeypatch):
-        # Flag OFF (default): the bound id on parent_agent is IGNORED — legacy
-        # caller-supplied-only behaviour is byte-identical.
+    def test_feed_on_by_default_uses_bound_anchor(self, fake_tree, monkeypatch):
+        # P-D / G7: the feed is now DEFAULT-ON. With NO env var set + an omitted
+        # wts_task + a bound anchor on parent_agent, the wrapper gets the bound id
+        # so every handoff carries a durable tracker link by default.
         monkeypatch.delenv("ROUTE_TO_LANE_WTS_FEED", raising=False)
         monkeypatch.setenv("FAKE_EXIT", "0")
         monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=7.7")
         r2l.route_to_lane(lane="qa", goal="review", parent_agent=_FakeAgent(self.BOUND))
-        assert "--wts-task" not in _argv(fake_tree)
+        argv = _argv(fake_tree)
+        assert "--wts-task" in argv
+        assert argv[argv.index("--wts-task") + 1] == self.BOUND
+        # the packet's WTS: line also carries the fed id
+        pkt = Path(argv[argv.index("--packet") + 1])
+        assert f"WTS: {self.BOUND}" in pkt.read_text(encoding="utf-8")
 
-    def test_feed_on_defaults_wts_from_bound_anchor(self, fake_tree, monkeypatch):
-        # Flag ON + omitted wts_task + bound context → wrapper gets the bound id.
+    def test_explicit_opt_out_disables_the_feed(self, fake_tree, monkeypatch):
+        # P-D / G7: ROUTE_TO_LANE_WTS_FEED=0 (or false/off/no) is the EXPLICIT
+        # opt-out → the bound id on parent_agent is IGNORED (legacy
+        # caller-supplied-only behaviour).
+        for off in ("0", "false", "off", "no"):
+            monkeypatch.setenv("ROUTE_TO_LANE_WTS_FEED", off)
+            monkeypatch.setenv("FAKE_EXIT", "0")
+            monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=7.7")
+            r2l.route_to_lane(lane="qa", goal="review", parent_agent=_FakeAgent(self.BOUND))
+            assert "--wts-task" not in _argv(fake_tree), f"opt-out '{off}' should disable the feed"
+
+    def test_feed_on_explicit_1_uses_bound_anchor(self, fake_tree, monkeypatch):
+        # Explicit ROUTE_TO_LANE_WTS_FEED=1 also feeds (back-compat with the
+        # pre-G7 enable flag).
         monkeypatch.setenv("ROUTE_TO_LANE_WTS_FEED", "1")
         monkeypatch.setenv("FAKE_EXIT", "0")
         monkeypatch.setenv("FAKE_STDOUT", "[qa] PASS | ok | #dd-lane-qa ts=8.8")

@@ -56,6 +56,37 @@ _WRAPPER_PREFLIGHT_CODES = {2, 3, 5, 6, 7, 8, 10}
 _WRAPPER_PENDING_CODE = 75
 
 
+# P-D / G5: gate verdicts on the wrapper's normalized status line that mean the
+# specialist did NOT pass. The wrapper stamps the gate exit-code-first (a non-zero
+# lane exit is an unconditional FAIL; a self-declared `Gate:` line may only refine
+# a zero-exit). We treat any of these as "not OK" so a failed lane can never be
+# reported as HANDOFF OK. PENDING is deliberately NOT here — it is the honest
+# middle state handled by the dedicated PENDING branch (exit 75), not a failure.
+_FAILURE_GATES = {"FAIL", "FAILED", "BLOCK", "BLOCKED", "ERROR", "STALLED", "NEEDS-YOU", "NEEDSYOU"}
+
+
+def _parse_status_gate(out: str, lane: str) -> "str | None":
+    """Extract the GATE token from the wrapper's normalized status line.
+
+    The line is ``[<lane>] <GATE> | <oneline> | …``; we read the token between the
+    ``[<lane>]`` prefix and the first ``|``. Returns the upper-cased gate, or None
+    when no normalized line is present (caller treats that as "did not confirm").
+    """
+    if not out:
+        return None
+    prefix = f"[{lane}]"
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith(prefix):
+            continue
+        rest = line[len(prefix):].strip()
+        token = rest.split("|", 1)[0].strip()
+        # The gate is the first whitespace-delimited word (e.g. "PASS", "FAIL").
+        token = token.split()[0] if token.split() else ""
+        return token.upper() or None
+    return None
+
+
 def _parse_session_origin(session_key: str) -> "dict | None":
     """Parse a gateway session_key into platform/chat_type/chat_id/thread.
 
@@ -186,16 +217,20 @@ def route_to_lane(
             f"route_to_lane: unknown lane '{lane}'. Known lanes: {', '.join(known)}."
         )
 
-    # WS8 §4 (the active-task FEED): when the caller did not pass wts_task,
-    # DEFAULT it to the thread's bound id carried into the turn from the Slack
-    # anchor (dd-slack-service stamps X-DD-WTS-Task-Id → the gateway exposes it
-    # as parent_agent._dd_wts_task_id). This closes I3 WITHOUT P1 remembering the
-    # id. An EXPLICIT wts_task arg always wins (the model may override). Neither
-    # present → empty → the wrapper fails honest (no bucket). Default-OFF behind
-    # ROUTE_TO_LANE_WTS_FEED=1 so the legacy (caller-supplied-only) path is
-    # byte-identical until the Phase-B cutover.
+    # WS8 §4 / P-D §G7 (the active-task FEED): when the caller did not pass
+    # wts_task, DEFAULT it to the thread's bound id carried into the turn from the
+    # Slack anchor (dd-slack-service stamps X-DD-WTS-Task-Id → the gateway exposes
+    # it as parent_agent._dd_wts_task_id). This means every handoff+result carries
+    # a durable tracker link by default — without P1 ever remembering the id.
+    #   * An EXPLICIT wts_task arg always wins (the model may override).
+    #   * No bound id present → empty → the wrapper fails honest (no bucket).
+    # P-D / G7: the feed is now DEFAULT-ON (a missing anchor link is silent
+    # corruption — "nothing should disappear"). Set ROUTE_TO_LANE_WTS_FEED=0
+    # (or "false"/"off"/"no") for an EXPLICIT opt-out back to caller-supplied-only.
+    _feed_flag = (os.getenv("ROUTE_TO_LANE_WTS_FEED") or "").strip().lower()
+    _feed_on = _feed_flag not in ("0", "false", "off", "no")
     wts_source = "explicit" if (wts_task and wts_task.strip()) else "none"
-    if (not (wts_task or "").strip()) and os.getenv("ROUTE_TO_LANE_WTS_FEED") == "1":
+    if (not (wts_task or "").strip()) and _feed_on:
         bound = getattr(parent_agent, "_dd_wts_task_id", None)
         if bound and str(bound).strip():
             wts_task = str(bound).strip()
@@ -232,11 +267,36 @@ def route_to_lane(
     err = (proc.stderr or "").strip()
     code = proc.returncode
 
-    # I2: HONEST verification.
-    # The wrapper prints exactly one normalized status line on success:
+    # I2 + P-D/G5: HONEST verification.
+    # The wrapper prints exactly one normalized status line:
     #   [<lane>] <GATE> | <oneline> | #<channel> ts=<...> ...
-    # Success requires BOTH exit==0 AND that status line present.
-    ran_ok = code == 0 and out.startswith(f"[{lane}]")
+    # HANDOFF OK requires ALL of:
+    #   * exit==0 (the wrapper completed without a hard failure), AND
+    #   * the normalized status line is present ([<lane>] prefix), AND
+    #   * the parsed GATE is NOT a failure verdict.
+    # G5: a specialist can exit 0 while its result body declares `Gate: FAIL`
+    # (the wrapper now stamps the honest FAIL onto the status line, exit-code-first).
+    # Accepting OK on exit==0 + prefix alone would hide that failure behind an
+    # OK-shaped envelope. So we parse the gate and require it not be FAIL/BLOCK/etc.
+    status_gate = _parse_status_gate(out, lane)
+    gate_is_failure = status_gate in _FAILURE_GATES
+    ran_ok = code == 0 and out.startswith(f"[{lane}]") and not gate_is_failure
+    if (not ran_ok) and code == 0 and out.startswith(f"[{lane}]") and gate_is_failure:
+        # The lane RAN and returned, but its gate is a FAILURE verdict. Report it
+        # honestly as FAILED (with the gate + the wrapper's own status line), NOT
+        # as a false OK. This is the G5 fix on the synchronous path.
+        warn = ""
+        if err:
+            warn_lines = [l for l in err.splitlines() if "warn" in l.lower()]
+            if warn_lines:
+                warn = "\n[handoff warnings]\n" + "\n".join(warn_lines[:8])
+        return tool_error(
+            f"HANDOFF FAILED — the '{lane}' lane ran but returned a {status_gate} "
+            f"gate (the specialist did NOT pass). Do NOT report this handoff as "
+            f"succeeded; surface the failure and its detail to the user.\n"
+            f"{out}"
+            f"{warn}"
+        )
     if ran_ok:
         # Surface any non-fatal delivery warnings (e.g. I3 bucket fallback) loudly.
         warn = ""
