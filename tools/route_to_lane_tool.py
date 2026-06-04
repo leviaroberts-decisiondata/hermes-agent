@@ -30,6 +30,8 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+import re
+
 from tools.registry import registry, tool_error
 
 _HERMES_HOME = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
@@ -39,6 +41,11 @@ _SHARED_HOME = Path.home() / ".hermes"
 _WRAPPER = _SHARED_HOME / "bin" / "dd-visible-lane-run"
 _CHANNELS_JSON = _SHARED_HOME / "dd-lanes" / "channels.json"
 _LANE_DIR = _SHARED_HOME / "dd-lanes"
+# P-C / B-1a: the result-return SPINE. When a handoff returns PENDING (the lane
+# detached and outlives the wrapper's watch budget), we register the run with the
+# openclaw-owned reaper so it returns the closeout to THIS caller's session even
+# after this turn ends. Without registration the finished run would orphan (G2).
+_REAPER = _SHARED_HOME / "bin" / "dd-lane-reaper"
 
 # Wrapper exit codes that mean "the lane never ran" (arg/config errors), vs a
 # run that executed but the specialist returned a non-zero gate.
@@ -47,6 +54,65 @@ _WRAPPER_PREFLIGHT_CODES = {2, 3, 5, 6, 7, 8, 10}
 # run survives and is collectable later via `dd-lane-run --poll <run_dir>`.
 # This is an HONEST PENDING — neither success nor hard failure.
 _WRAPPER_PENDING_CODE = 75
+
+
+def _parse_session_origin(session_key: str) -> "dict | None":
+    """Parse a gateway session_key into platform/chat_type/chat_id/thread.
+
+    Session keys follow ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}]``
+    (mirrors gateway.run._parse_session_key). The 6th element is treated as a
+    thread_id only for ``dm``/``thread`` chat types (where it is unambiguous);
+    for group/channel it may be a per-user-isolation user_id, so we leave it out.
+    Returns None when the key does not match.
+    """
+    if not session_key:
+        return None
+    parts = session_key.split(":")
+    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+        out = {"platform": parts[2], "chat_type": parts[3], "chat_id": parts[4]}
+        if len(parts) > 5 and parts[3] in ("dm", "thread"):
+            out["thread_id"] = parts[5]
+        return out
+    return None
+
+
+def _register_pending_with_reaper(out: str, parent_agent) -> str:
+    """P-C / B-1a: register a detached PENDING run with the openclaw reaper.
+
+    The reaper (a standalone launchd agent) returns the lane's real closeout to
+    THIS caller's session even after the turn ends — closing G1/G2/G3/G9. We give
+    it the run_dir (surfaced on the wrapper's PENDING status line as
+    ``run_dir=<path>``) plus the caller's session routing (parsed from
+    ``parent_agent._dd_session_key``) so it knows where to deliver the result.
+
+    Best-effort and fail-soft: a registration failure NEVER changes the PENDING
+    result the caller sees (the run still survives and is pollable). Returns a
+    short status token for the caller-facing message (booleans only; no secrets).
+    """
+    if not _REAPER.exists() or not os.access(_REAPER, os.X_OK):
+        return "reaper-registration: skipped (reaper not installed)"
+    m = re.search(r"run_dir=(\S+)", out or "")
+    if not m:
+        return "reaper-registration: skipped (no run_dir on status line)"
+    run_dir = m.group(1).strip()
+    session_key = str(getattr(parent_agent, "_dd_session_key", "") or "").strip()
+    origin = _parse_session_origin(session_key)
+    if not origin:
+        # We can still register the run for mirror-only return, but without a
+        # caller session the re-inject (P1 reconciliation) cannot target a session.
+        return "reaper-registration: skipped (no parseable caller session_key)"
+    cmd = [
+        str(_REAPER), "--register", run_dir, session_key,
+        origin["platform"], origin["chat_id"], origin["chat_type"],
+        origin.get("thread_id", "") or "",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as exc:
+        return f"reaper-registration: FAILED to invoke ({type(exc).__name__})"
+    if proc.returncode == 0:
+        return f"reaper-registration: OK (run will return its closeout to this session; run_dir={run_dir})"
+    return f"reaper-registration: FAILED (exit={proc.returncode})"
 
 
 def _known_lanes() -> list[str]:
@@ -188,11 +254,18 @@ def route_to_lane(
     # PENDING — the lane RAN and is still in flight (detached); honest middle
     # state. NOT success (do not report done), NOT a hard failure.
     if code == _WRAPPER_PENDING_CODE:
+        # P-C / B-1a: register the detached run with the reaper so its real
+        # closeout returns to THIS session automatically (zero user follow-up).
+        reaper_note = _register_pending_with_reaper(out, parent_agent)
         return tool_error(
             f"HANDOFF PENDING — the '{lane}' lane started and is still running "
-            f"(detached). Do NOT report this as completed; poll for the result "
-            f"before reconciling.\n"
+            f"(detached). You do NOT need to poll: the result-return reaper will "
+            f"deliver the lane's actual closeout (branch/SHA/tests/status OR the "
+            f"exact blocker) back into THIS conversation as a new turn when the run "
+            f"finishes, and mirror it to Telegram. Do NOT report this as completed "
+            f"yet; wait for that closeout.\n"
             f"packet: {packet_path}\n"
+            f"{reaper_note}\n"
             f"{out or '(no status line)'}"
         )
 
