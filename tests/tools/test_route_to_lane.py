@@ -177,9 +177,12 @@ class TestI3ActiveTaskAttach:
 
 # ── WS8 §4: the active-task FEED — default --wts-task from the turn's bound id ──
 class _FakeAgent:
-    """Stands in for the gateway agent; carries the X-DD-WTS-Task-Id binding."""
-    def __init__(self, bound=None):
+    """Stands in for the gateway agent; carries the X-DD-WTS-Task-Id binding and
+    (P-C) the X-DD session_key used to route the reaper's result-return."""
+    def __init__(self, bound=None, session_key=None):
         self._dd_wts_task_id = bound
+        if session_key is not None:
+            self._dd_session_key = session_key
 
 
 class TestWS8ActiveTaskFeed:
@@ -237,3 +240,102 @@ class TestWS8ActiveTaskFeed:
         out = r2l.route_to_lane(lane="qa", goal="review", parent_agent=None)
         assert "HANDOFF OK" in out
         assert "--wts-task" not in _argv(fake_tree)
+
+
+# ── P-C / B-1a: the PENDING branch registers the detached run with the reaper ──
+class TestPCReaperRegistration:
+    """When a handoff returns PENDING, route_to_lane must register the detached
+    run with dd-lane-reaper so its closeout returns to THIS caller's session.
+
+    The registration is best-effort + fail-soft: it never changes the PENDING
+    result, but when it can it hands the reaper the run_dir + the caller's
+    session routing (parsed from parent_agent._dd_session_key).
+    """
+
+    SK = "agent:main:telegram:dm:8737984752"
+    # A PENDING status line that carries the run_dir segment dd-visible-lane-run
+    # now appends on the detached path.
+    PENDING_LINE = (
+        "[qa] PENDING | run still in flight | #dd-lane-qa ts=9.9 "
+        "https://app.slack.com/x | run_dir=/tmp/dd-lanes/qa/runs/RUN-XYZ"
+    )
+
+    @pytest.fixture
+    def fake_reaper(self, tmp_path, monkeypatch):
+        """A scriptable dd-lane-reaper that records its argv."""
+        reaper = tmp_path / "bin" / "dd-lane-reaper"
+        reaper.parent.mkdir(parents=True, exist_ok=True)
+        argv_log = tmp_path / "reaper-argv.log"
+        reaper.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env bash
+            printf '%s\\n' "$@" > "{argv_log}"
+            exit "${{FAKE_REAPER_EXIT:-0}}"
+        """), encoding="utf-8")
+        reaper.chmod(reaper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        monkeypatch.setattr(r2l, "_REAPER", reaper)
+        return {"reaper": reaper, "argv_log": argv_log}
+
+    def _reaper_argv(self, fake_reaper):
+        return fake_reaper["argv_log"].read_text(encoding="utf-8").splitlines()
+
+    def test_pending_registers_run_with_reaper(self, fake_tree, fake_reaper, monkeypatch):
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
+        out = r2l.route_to_lane(
+            lane="qa", goal="review", parent_agent=_FakeAgent(session_key=self.SK)
+        )
+        assert "HANDOFF PENDING" in out
+        argv = self._reaper_argv(fake_reaper)
+        # --register <run_dir> <session_key> <platform> <chat_id> <chat_type> [thread]
+        assert argv[0] == "--register"
+        assert argv[1] == "/tmp/dd-lanes/qa/runs/RUN-XYZ"
+        assert argv[2] == self.SK
+        assert argv[3] == "telegram"
+        assert argv[4] == "8737984752"
+        assert argv[5] == "dm"
+        # The caller-facing message tells P1 the reaper will return the result.
+        assert "reaper-registration: OK" in out
+
+    def test_pending_without_run_dir_segment_skips_registration(self, fake_tree, fake_reaper, monkeypatch):
+        # Older wrapper / no run_dir on the line → registration is skipped, but
+        # the PENDING result is still returned honestly (fail-soft).
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", "[qa] PENDING | in flight | #dd-lane-qa ts=9.9")
+        out = r2l.route_to_lane(
+            lane="qa", goal="review", parent_agent=_FakeAgent(session_key=self.SK)
+        )
+        assert "HANDOFF PENDING" in out
+        assert not fake_reaper["argv_log"].exists()  # reaper never invoked
+        assert "no run_dir" in out.lower()
+
+    def test_pending_without_session_key_skips_registration(self, fake_tree, fake_reaper, monkeypatch):
+        # No parseable caller session_key → cannot target a session for re-inject.
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
+        out = r2l.route_to_lane(lane="qa", goal="review", parent_agent=_FakeAgent())
+        assert "HANDOFF PENDING" in out
+        assert not fake_reaper["argv_log"].exists()
+        assert "no parseable caller session_key" in out.lower()
+
+    def test_register_failure_never_breaks_the_pending_result(self, fake_tree, fake_reaper, monkeypatch):
+        # The reaper invocation fails (non-zero) → the PENDING result is unchanged;
+        # only the note reflects the failure.
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
+        monkeypatch.setenv("FAKE_REAPER_EXIT", "3")
+        out = r2l.route_to_lane(
+            lane="qa", goal="review", parent_agent=_FakeAgent(session_key=self.SK)
+        )
+        assert "HANDOFF PENDING" in out
+        assert "reaper-registration: FAILED" in out
+
+    def test_parse_session_origin_dm_and_thread(self):
+        dm = r2l._parse_session_origin("agent:main:telegram:dm:8737984752")
+        assert dm == {"platform": "telegram", "chat_type": "dm", "chat_id": "8737984752"}
+        th = r2l._parse_session_origin("agent:main:slack:thread:C123:1699.45")
+        assert th["thread_id"] == "1699.45" and th["platform"] == "slack"
+        # group/channel: the 6th element is NOT treated as a thread (could be a uid).
+        grp = r2l._parse_session_origin("agent:main:slack:channel:C9:U7")
+        assert "thread_id" not in grp
+        assert r2l._parse_session_origin("garbage") is None
+        assert r2l._parse_session_origin("") is None
