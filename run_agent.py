@@ -1862,7 +1862,7 @@ class AIAgent:
         _is_delivery_build = bool(self.skip_context_files and not self.load_soul_identity)
         self._delivery_stripped_tools: tuple = ()
         if _is_delivery_build and self.tools:
-            _strip = {"route_to_lane"}
+            _strip = {"route_to_lane", "wts_bind"}
             _before = {t["function"]["name"] for t in self.tools}
             self.tools = [t for t in self.tools if t["function"]["name"] not in _strip]
             self._delivery_stripped_tools = tuple(sorted(_before & _strip))

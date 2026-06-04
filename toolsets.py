@@ -53,7 +53,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation + lane routing
-    "execute_code", "delegate_task", "route_to_lane",
+    "execute_code", "delegate_task", "route_to_lane", "wts_bind",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -189,7 +189,7 @@ TOOLSETS = {
     
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks; route work to specialist lanes",
-        "tools": ["delegate_task", "route_to_lane"],
+        "tools": ["delegate_task", "route_to_lane", "wts_bind"],
         "includes": []
     },
 
@@ -286,7 +286,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search",
-            "execute_code", "delegate_task", "route_to_lane",
+            "execute_code", "delegate_task", "route_to_lane", "wts_bind",
         ],
         "includes": []
     },
@@ -314,7 +314,7 @@ TOOLSETS = {
             # Session history search
             "session_search",
             # Code execution + delegation + lane routing
-            "execute_code", "delegate_task", "route_to_lane",
+            "execute_code", "delegate_task", "route_to_lane", "wts_bind",
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
