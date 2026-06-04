@@ -10265,7 +10265,14 @@ class GatewayRunner:
         # copy_context()s), a credential set here propagates into the tool egress.
         # Cleared in the finally (clear_credential) to prevent cross-turn bleed on
         # the cached event loop / reused AIAgent instance.
-        _dd_capability_minted = False
+        #
+        # Review advisory (1): the "needs clearing" flag is set the moment we
+        # DECIDE to mint — BEFORE the mint call — so the finally-clear is
+        # unconditional with respect to the mint. If mint_for_turn binds the
+        # credential and then raises before any post-mint statement runs, the
+        # finally still clears it. clear_credential() is a safe no-op when nothing
+        # was bound, so over-clearing is harmless; under-clearing (a leak) is not.
+        _dd_capability_clear_needed = False
         try:
             if _is_system_a_messaging_turn(
                 user_config=user_config,
@@ -10273,17 +10280,21 @@ class GatewayRunner:
                 enabled_toolsets=enabled_toolsets,
             ):
                 from gateway import capability_issuer
+                # Arm the finally-clear BEFORE minting: from here on, any path that
+                # could have bound the contextvar is guaranteed to be cleared.
+                _dd_capability_clear_needed = True
                 # mint_for_turn binds the credential into the capability_context
                 # contextvar itself. Returns None (and binds nothing) if the
                 # signer key is absent — fail-closed.
-                if capability_issuer.mint_for_turn(system="A", session_id=session_id):
-                    _dd_capability_minted = True
+                capability_issuer.mint_for_turn(system="A", session_id=session_id)
         except Exception as _cap_err:
             # Capability minting must NEVER block a turn (same posture as
             # api_server.py). On any failure the turn proceeds uncredentialed and
             # protected resources default-deny — the correct fail-closed outcome.
+            # We deliberately leave _dd_capability_clear_needed as-is: if it was
+            # armed before the mint raised, the finally will still clear any
+            # partially-bound credential.
             logger.debug("messaging-path capability mint skipped: %s", _cap_err)
-            _dd_capability_minted = False
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -12019,9 +12030,10 @@ class GatewayRunner:
         finally:
             # Clear any per-turn System-A capability credential bound for this
             # messaging turn so it never bleeds into the next turn that reuses
-            # this cached AIAgent / event-loop context. No-op if nothing was
-            # minted (e.g. non-coordinator turn). See the mint block above.
-            if _dd_capability_minted:
+            # this cached AIAgent / event-loop context. Armed before the mint
+            # (review advisory 1), so this runs even if mint_for_turn bound the
+            # credential and then raised. No-op if nothing was minted.
+            if _dd_capability_clear_needed:
                 try:
                     from gateway import capability_context as _cap_ctx
                     _cap_ctx.clear_credential()
