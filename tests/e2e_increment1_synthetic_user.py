@@ -615,12 +615,16 @@ def canon6_chain_driver(rep: Reporter):
                               f"next={pre.get('next_stage')} blocker={pre.get('blocker')} "
                               f"eta={pre.get('eta')}")
 
-        # deploy + report are REAL stages in the pipeline; deploy carries the standing gate.
+        # deploy + report are REAL stages. deploy's stage_state reflects the LEG:
+        # lit (DD_DEPLOY_SUBMIT_ENABLED=1) → "live:awaiting-human-approval" (the honest
+        # submit gate, W2); dark → "blocked:operator-gate-P-F" (P-F pending). Both are
+        # valid modelings of a real, honestly-gated stage — assert it's one of them.
+        _ds = pre.get("stage_state", {}).get("deploy")
         deploy_modeled = pre.get("stages") == ["engineering", "qa", "deploy", "report"] and \
-            pre.get("stage_state", {}).get("deploy") == "blocked:operator-gate-P-F"
-        rep.record("C6.deploy-stage: deploy is a REAL stage with a standing operator-gate state",
-                   deploy_modeled, f"stages={pre.get('stages')}; "
-                                   f"stage_state.deploy={pre.get('stage_state', {}).get('deploy')}")
+            _ds in ("live:awaiting-human-approval", "blocked:operator-gate-P-F")
+        rep.record("C6.deploy-stage: deploy is a REAL stage with an honest gate state (lit or dark)",
+                   deploy_modeled, f"stages={pre.get('stages')}; stage_state.deploy={_ds} "
+                                   f"({'LIVE leg' if _ds == 'live:awaiting-human-approval' else 'DARK/P-F'})")
 
         # FAIL-on-old-code control: BEFORE the tick the record has NOT advanced to qa.
         rep.record("C6.pre-tick: record has NOT advanced past engineering (passive spine = stuck)",
