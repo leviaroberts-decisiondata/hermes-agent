@@ -207,6 +207,76 @@ class TestPackageAssembly:
         assert captured2["body"]["target_commit"] == "deadbeef"
 
 
+class TestPortStamping:
+    """P3: deploy_submit resolves service_port at submit from the same registries
+    mc-api reads, stamps it onto the row, and fails SOFT (null + loud log) for an
+    unknown service — a submit is never blocked on port resolution. An explicit
+    service_port override always wins (the retired --deploy-port escape hatch)."""
+
+    def _capture(self):
+        captured = {}
+
+        def fake_post(url, *, json_body=None, **kw):
+            captured["url"] = url
+            captured["body"] = json_body
+            return _resp(200, {"id": 11, "status": "pending", "conflict_flag": False,
+                               "service_port": json_body.get("service_port")})
+
+        return captured, fake_post
+
+    def test_known_service_in_port_registry_is_stamped(self):
+        captured, fake = self._capture()
+        # _resolve_service_port reads the live registries; dd-website IS in
+        # port-registry.json (client_facing → 8600), so resolution is real.
+        with mock_patch("gateway.capability_egress.post_with_capability", side_effect=fake):
+            parsed = json.loads(deploy_submit("dd-website"))
+        assert isinstance(captured["body"].get("service_port"), int)
+        assert captured["body"]["service_port"] == 8600
+        assert parsed["service_port"] == 8600
+        assert parsed["service_port_unresolved"] is False
+
+    def test_unknown_service_fails_soft_null_and_loud_log(self, caplog):
+        captured, fake = self._capture()
+        import logging as _logging
+        with caplog.at_level(_logging.WARNING, logger="dd.deploy_submit"):
+            with mock_patch("gateway.capability_egress.post_with_capability", side_effect=fake):
+                # mc-api is the REAL gap: in deploy-commands.json but NOT
+                # port-registry.json → server resolves null. (dd-analystaq is the
+                # other; both rely on the client fallback / null+log.)
+                parsed = json.loads(deploy_submit("mc-api"))
+        # null is OMITTED from the body (mc-api will leave the column null)
+        assert "service_port" not in captured["body"]
+        # but the submit STILL SUCCEEDS — never blocked on port resolution
+        assert parsed["ok"] is True
+        assert parsed["service_port_unresolved"] is True
+        # and it logged loudly
+        assert any("service_port_unresolved" in r.message for r in caplog.records)
+
+    def test_explicit_override_wins(self):
+        captured, fake = self._capture()
+        with mock_patch("gateway.capability_egress.post_with_capability", side_effect=fake):
+            # mc-api would resolve null; the override forces the port.
+            parsed = json.loads(deploy_submit("mc-api", service_port=8502))
+        assert captured["body"]["service_port"] == 8502
+        assert parsed["service_port"] == 8502
+        assert parsed["service_port_unresolved"] is False
+
+    def test_override_ignored_when_non_numeric(self):
+        captured, fake = self._capture()
+        # a junk override falls through to registry resolution (dd-website known)
+        with mock_patch("gateway.capability_egress.post_with_capability", side_effect=fake):
+            deploy_submit("dd-website", service_port="not-a-port")
+        assert captured["body"]["service_port"] == 8600
+
+    def test_resolver_fail_soft_on_missing_registry(self, monkeypatch):
+        import tools.deploy_submit_tool as _dst
+        from pathlib import Path as _P
+        monkeypatch.setattr(_dst, "_PORT_REGISTRY_PATH", _P("/nonexistent/port-registry.json"))
+        monkeypatch.setattr(_dst, "_DEPLOY_COMMANDS_PATH", _P("/nonexistent/deploy-commands.json"))
+        # must not raise — returns None
+        assert _dst._resolve_service_port("mc-api") is None
+
+
 class TestReturnContract:
     def test_success_returns_id_status_string(self):
         def fake(url, *, json_body=None, **kw):

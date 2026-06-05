@@ -51,17 +51,72 @@ are unreachable from this tool regardless of the flag.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 
 from tools.registry import registry, tool_error
 
+_LOG = logging.getLogger("dd.deploy_submit")
+
 # mc-api deploy-queue base — localhost only.
 _MC_API_BASE = os.getenv("MC_API_BASE_URL", "http://127.0.0.1:8502")
 # Shared (home-anchored) hermes bin, where the chain driver lives — mirrors how
 # route_to_lane_tool resolves the wrapper. NOT a per-profile HERMES_HOME.
 _SHARED_HERMES_BIN = Path.home() / ".hermes" / "bin"
+
+# P3 port-stamping: the SAME registries mc-api reads to resolve a service's port
+# and to validate that an agent-submitted service is known. Resolving the port
+# HERE (at submit) and stamping it onto the row kills the --deploy-port stopgap
+# the chain driver carried for services whose deploy row landed with a null port
+# (dd-analystaq, which is in deploy-commands.json but NOT port-registry.json).
+_PORT_REGISTRY_PATH = Path.home() / ".openclaw" / "port-registry.json"
+_DEPLOY_COMMANDS_PATH = Path.home() / ".openclaw" / "deploy-commands.json"
+
+
+def _resolve_service_port(service_name: str):
+    """Resolve a service's port from the on-disk registries at submit time.
+
+    Mirrors mc-api's `_resolve_service_port` (the authoritative server-side
+    resolver) so the stamp the tool sends matches what mc-api would compute —
+    the client value is only ever a FALLBACK mc-api honors when its own lookup
+    is null (a service present in deploy-commands.json but absent from
+    port-registry.json). Resolution order:
+
+      1. port-registry.json category sweep (the canonical port map).
+      2. deploy-commands.json — if the service is known there but carries no
+         port (today none do), confirm it is a real, known service and return
+         None rather than guessing.
+
+    FAIL-SOFT by contract: any error, or an unknown service, returns None. A
+    null return must NEVER block a submit — the caller logs loudly and proceeds
+    so the human approval gate is never gated on cosmetic port resolution.
+    """
+    svc = (service_name or "").strip()
+    if not svc:
+        return None
+    try:
+        with open(_PORT_REGISTRY_PATH) as f:
+            reg = json.load(f)
+        for cat in ("infrastructure", "client_facing", "integration", "engines", "personal"):
+            entry = reg.get(cat, {}).get(svc) if isinstance(reg.get(cat), dict) else None
+            if isinstance(entry, dict) and entry.get("port"):
+                return int(entry["port"])
+    except Exception as e:  # registry missing/malformed — fail soft, never block
+        _LOG.warning("deploy_submit.port_registry_read_failed %s", {"svc": svc, "err": repr(e)})
+    # Known in deploy-commands.json but no port column today → explicit None.
+    try:
+        with open(_DEPLOY_COMMANDS_PATH) as f:
+            cmds = json.load(f)
+        svc_cmds = cmds.get("services", cmds)
+        if isinstance(svc_cmds, dict) and svc in svc_cmds:
+            entry = svc_cmds.get(svc) or {}
+            if isinstance(entry, dict) and entry.get("port"):
+                return int(entry["port"])
+    except Exception:
+        pass
+    return None
 
 
 def _deploy_submit_enabled() -> bool:
@@ -137,6 +192,16 @@ DEPLOY_SUBMIT_SCHEMA = {
                 "type": "string",
                 "description": "The commit SHA the deploy should build from, if known.",
             },
+            "service_port": {
+                "type": "integer",
+                "description": (
+                    "Override the verification port for this deploy. Normally OMIT "
+                    "— the tool resolves the service's port from the registry and "
+                    "mc-api stamps it. Supply only to force a port for a service "
+                    "the registries don't map (the retired --deploy-port escape "
+                    "hatch)."
+                ),
+            },
             "wts_task_id": {
                 "type": "string",
                 "description": (
@@ -160,6 +225,7 @@ def deploy_submit(
     notes: str = "",
     target_commit: str = "",
     wts_task_id: str = "",
+    service_port=None,
     parent_agent=None,
 ) -> str:
     # Tool handlers MUST return a STRING — the agent's tool-result pipeline
@@ -251,6 +317,32 @@ def deploy_submit(
         body["target_commit"] = target_commit.strip()
     if resolved_wts:
         body["wts_task_id"] = resolved_wts
+
+    # P3 PORT-STAMPING: resolve service_port at submit and stamp it onto the row.
+    # An explicit override always wins (kept as the retired --deploy-port escape
+    # hatch); otherwise resolve from the same registries mc-api reads. mc-api is
+    # authoritative and prefers its OWN resolution — the value we send is only a
+    # fallback it honors when its lookup is null (a service in deploy-commands.json
+    # but absent from port-registry.json, e.g. dd-analystaq). Resolve to a real int
+    # or omit; NEVER block a submit on port resolution — a null is a loud log, not
+    # a failure (the human approval gate must not depend on a cosmetic port).
+    resolved_port = None
+    if service_port is not None and str(service_port).strip().isdigit():
+        resolved_port = int(str(service_port).strip())
+    else:
+        resolved_port = _resolve_service_port(service_name)
+    port_unresolved = resolved_port is None
+    if resolved_port is not None:
+        body["service_port"] = resolved_port
+    else:
+        # Loud, structured, but non-fatal — the submit proceeds with a null port
+        # (the chain driver's verify stage will report "no service_port" honestly).
+        _LOG.warning(
+            "deploy_submit.service_port_unresolved %s",
+            {"service_name": service_name,
+             "detail": "no port in port-registry.json or deploy-commands.json; "
+                       "row will carry null service_port (health verify will be skipped)"},
+        )
     # Tie the queue entry to this turn's session for the audit trail, if known.
     sid = getattr(parent_agent, "session_id", None) or getattr(parent_agent, "_session_id", None)
     if sid and str(sid).strip():
@@ -305,6 +397,12 @@ def deploy_submit(
         "conflict_flag": conflict_flag,
         "wts_task_id": resolved_wts or None,
         "wts_link_dropped": wts_link_dropped,
+        # P3: echo what the queue row will carry for the verification port. mc-api
+        # may override with its own resolution; this is the value the tool stamped.
+        "service_port": (payload.get("service_port")
+                         if isinstance(payload, dict) and payload.get("service_port") is not None
+                         else resolved_port),
+        "service_port_unresolved": port_unresolved,
         "message": (
             f"Queued for approval, id={entry_id}. Approval/execute remain a "
             f"System-A / human action — this only submitted the request."
@@ -362,6 +460,7 @@ registry.register(
         notes=args.get("notes", ""),
         target_commit=args.get("target_commit", ""),
         wts_task_id=args.get("wts_task_id", ""),
+        service_port=args.get("service_port"),
         parent_agent=kw.get("parent_agent"),
     ),
     emoji="📦",
