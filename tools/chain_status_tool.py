@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -102,6 +103,104 @@ def _api_get(path: str) -> "tuple[int, dict | None]":
             return e.code, json.loads(raw)
         except Exception:
             return e.code, {"raw": raw[:300]}
+
+
+# ── stale / disagreement detection vs the in-context [WORK OWNERSHIP] snapshot ──
+#
+# WHY (WS-5 terminal-mirror gap, read side): the JSON ledger is write-authoritative;
+# PG is a read mirror. A terminal/escalated transition can land in the ledger while the
+# PG row stays FROZEN at an older active state with pg_write_error=None (Session C
+# §2.2b). The driver-side fix (verify-after-write + terminal-inclusive catch-up) closes
+# that on the WRITE path — but a row can still be momentarily stale between the missed
+# sync and the next catch-up tick, and the cutover guardrails require P1 to NOT silently
+# trust a PG row that disagrees with the authoritative ledger.
+#
+# The driver pushes the authoritative ledger truth into THIS turn's context as a
+# `[WORK OWNERSHIP …]` snapshot (gateway.mirror → session transcript → _session_messages).
+# So we cross-check the PG row against the most-recent such snapshot and, on disagreement,
+# flag it LOUDLY and tell P1 to trust the snapshot/ledger over the row — exactly the
+# tiebreaker the guardrails name. This catches the pg_write_error=None class the row's own
+# mirror-flag cannot (the flag is not even materialized onto the PG row).
+_WORK_OWNERSHIP_RE = re.compile(r"\[WORK OWNERSHIP\b", re.IGNORECASE)
+_SNAP_STAGE_RE = re.compile(r"\bstage:\s*([^·|\n]+)", re.IGNORECASE)
+_SNAP_OWNER_RE = re.compile(r"\bowner:\s*([^·|\n]+)", re.IGNORECASE)
+_SNAP_BLOCKER_RE = re.compile(r"\bblocker:\s*([^·|\n]+)", re.IGNORECASE)
+# Snapshot wording that means the authoritative ledger considers the chain escalated /
+# parked-on-a-human (NOT actively progressing). Mirrors the driver's own owner/blocker
+# language for the escalated + deploy-gate states (dd-chain-driver refresh_fields).
+_ESCALATION_SIGNALS = (
+    "escalated to you", "escalating the deploy", "awaiting your",
+    "needs you", "awaiting your unblock", "awaiting your design",
+    "held — awaiting", "awaiting human deploy approval",
+)
+
+
+def _latest_work_ownership_snapshot(parent_agent) -> "dict | None":
+    """Parse the MOST RECENT [WORK OWNERSHIP …] snapshot from this turn's session
+    messages (the authoritative-ledger truth the driver mirrored into context). Returns
+    {stage, owner, blocker, escalated, raw} or None if no snapshot is present. Pure
+    string parsing; never raises (returns None on any trouble)."""
+    try:
+        msgs = getattr(parent_agent, "_session_messages", None) or []
+    except Exception:
+        return None
+    best = None
+    for m in msgs:  # in order; keep the LAST snapshot seen
+        try:
+            content = m.get("content") if isinstance(m, dict) else None
+        except Exception:
+            content = None
+        if not isinstance(content, str) or not _WORK_OWNERSHIP_RE.search(content):
+            continue
+        stage_m = _SNAP_STAGE_RE.search(content)
+        owner_m = _SNAP_OWNER_RE.search(content)
+        blocker_m = _SNAP_BLOCKER_RE.search(content)
+        low = content.lower()
+        best = {
+            "stage": (stage_m.group(1).strip() if stage_m else None),
+            "owner": (owner_m.group(1).strip() if owner_m else None),
+            "blocker": (blocker_m.group(1).strip() if blocker_m else None),
+            "escalated": any(sig in low for sig in _ESCALATION_SIGNALS),
+            "raw": content[:400],
+        }
+    return best
+
+
+def _norm_stage(s) -> str:
+    return " ".join(str(s or "").lower().split()).strip()
+
+
+def _detect_disagreement(chain: dict, snap: "dict | None") -> "str | None":
+    """Compare the PG row against the in-context authoritative snapshot. Return a human
+    warning string on disagreement, else None. Conservative: only fires on a CONCRETE
+    contradiction (stage mismatch, or the snapshot says escalated/awaiting-you while the
+    PG row reads a non-terminal active/blocked status) — not on mere absence of a
+    snapshot. The snapshot/ledger always wins the tiebreaker per the cutover guardrails."""
+    if not snap:
+        return None
+    g = chain.get
+    pg_status = _norm_stage(g("status"))
+    pg_stage = _norm_stage(g("current_stage"))
+    snap_stage = _norm_stage(snap.get("stage"))
+    reasons = []
+    # (1) stage contradiction
+    if snap_stage and pg_stage and snap_stage != pg_stage:
+        reasons.append(f"stage: snapshot/ledger='{snap_stage}' vs PG row='{pg_stage}'")
+    # (2) the authoritative snapshot reads escalated / awaiting-you, but the PG row is
+    # still a live non-terminal status — the exact §2.2b freeze (escalated→frozen active).
+    if snap.get("escalated") and pg_status in ("active", "blocked"):
+        reasons.append(
+            f"escalation: snapshot/ledger reads ESCALATED / awaiting-you "
+            f"(blocker='{snap.get('blocker') or '?'}') vs PG row status='{pg_status}'")
+    if not reasons:
+        return None
+    return (
+        "⚠ STALE MIRROR — the request_chains row DISAGREES with the authoritative "
+        "[WORK OWNERSHIP] snapshot in your context (the ledger truth the driver mirrored "
+        "into this turn). " + " ; ".join(reasons) + ". TRUST THE SNAPSHOT / LEDGER, not "
+        "this PG row — the row is a read mirror and may be momentarily frozen behind a "
+        "terminal/escalated transition. Tell Levi the ledger state, NOT the row state."
+    )
 
 
 # ── turn-context resolution ──────────────────────────────────────────────────
@@ -279,7 +378,7 @@ def chain_status(
                 code, resp = _api_get(f"/items/request_chains/{qf}")
                 data = [resp["data"]] if (code == 200 and (resp or {}).get("data")) else None
             if data:
-                return _answer_for(data, f"chain_id={cid}")
+                return _answer_for(data, f"chain_id={cid}", parent_agent)
             # explicit selector missed — offer candidates rather than dead-end.
             missed.append(f"chain_id={cid!r}")
 
@@ -293,7 +392,7 @@ def chain_status(
                 f"&sort=-created_at&limit=1")
             data = (resp or {}).get("data") if code == 200 else None
             if data:
-                return _answer_for(data, f"wts_task={wid}")
+                return _answer_for(data, f"wts_task={wid}", parent_agent)
             if explicit_wts:
                 missed.append(f"wts_task={wid!r}")
             # fall through to channel if no chain is bound to the task
@@ -308,7 +407,7 @@ def chain_status(
                 f"&sort=-created_at&limit=1")
             data = (resp or {}).get("data") if code == 200 else None
             if data:
-                return _answer_for(data, f"channel={ch}")
+                return _answer_for(data, f"channel={ch}", parent_agent)
             if explicit_ch:
                 missed.append(f"channel={ch!r}")
 
@@ -336,7 +435,7 @@ def chain_status(
             )
 
 
-def _answer_for(data, scope_desc: str) -> str:
+def _answer_for(data, scope_desc: str, parent_agent=None) -> str:
     if not data:
         return (f"chain_status: no request_chains row for {scope_desc}. "
                 f"Either no chain has been minted for this work yet, or it predates "
@@ -354,9 +453,20 @@ def _answer_for(data, scope_desc: str) -> str:
             events = (resp or {}).get("data") or []
     except Exception:
         events = []
-    return ("WHERE ARE WE — sourced from the request_chains spine "
-            "(read-only; JSON ledger remains authoritative):\n"
-            + _fmt_chain(chain, events))
+    # STALE-MIRROR / DISAGREEMENT DETECTION (WS-5): cross-check the row against the
+    # authoritative [WORK OWNERSHIP] snapshot in this turn's context. On a concrete
+    # contradiction (stage mismatch, or snapshot-escalated vs PG-active) lead with a
+    # loud warning so P1 reports the LEDGER truth, never the frozen row.
+    warning = None
+    try:
+        warning = _detect_disagreement(chain, _latest_work_ownership_snapshot(parent_agent))
+    except Exception:
+        warning = None
+    head = ("WHERE ARE WE — sourced from the request_chains spine "
+            "(read-only; JSON ledger remains authoritative):\n")
+    if warning:
+        head = warning + "\n\n" + head
+    return head + _fmt_chain(chain, events)
 
 
 CHAIN_STATUS_SCHEMA = {
@@ -372,6 +482,10 @@ CHAIN_STATUS_SCHEMA = {
         "chain automatically from this turn's bound WTS task or channel; pass chain_id=, "
         "wts_task=, or channel= to target a specific one. If a row's mirror write last failed "
         "(pg_write_error set) the tool flags it — trust the ledger/snapshot over a flagged row. "
+        "It also CROSS-CHECKS the row against the authoritative [WORK OWNERSHIP] snapshot in your "
+        "context and, on disagreement (e.g. the ledger says escalated/needs-you while the PG row "
+        "still reads active), leads with a loud STALE-MIRROR warning — report the LEDGER/snapshot "
+        "state, never the frozen row. "
         "Never fabricate a status: if no chain resolves (e.g. a Telegram DM turn cannot "
         "auto-resolve a Slack-keyed chain) — or if an explicit selector misses — it returns a "
         "READ-ONLY list of the most recently active chains across all surfaces so you can pass "
