@@ -478,19 +478,24 @@ def _chain_py():
 
 
 def _make_stub_wrapper() -> Path:
-    """A synthetic stand-in for dd-visible-lane-run: it ONLY creates a run_dir
-    under ~/.hermes/dd-lanes/<lane>/runs (no exit_code → 'in flight'), mirroring
-    what dd-lane-run does on launch, then exits. No agent, no Slack, no secrets."""
+    """A synthetic stand-in for dd-visible-lane-run that faithfully reproduces the
+    wrapper's PENDING contract: it creates a run_dir under ~/.hermes/dd-lanes/<lane>/runs
+    (no exit_code → 'in flight'), prints the wrapper's normalized status line
+    `[<lane>] PENDING | … | run_dir=<rd>`, and exits 75 (EX_TEMPFAIL) — exactly what the
+    real wrapper emits when a specialist detaches and outlives its watch budget. The
+    driver registers that detached run with the reaper and the finished-run watch drives
+    the eventual transition. No agent, no Slack, no secrets."""
     stub = LANES_DIR / f".chain-stub-wrapper-{RUNID}.sh"
     stub.write_text(
-        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "#!/usr/bin/env bash\nset -uo pipefail\n"
         'lane=""; while [[ $# -gt 0 ]]; do case "$1" in --lane) lane="$2"; shift 2;; '
         '--packet|--wts-task) shift 2;; *) shift;; esac; done\n'
         'root="$HOME/.hermes/dd-lanes/$lane/runs"; mkdir -p "$root"\n'
         'rd="$root/$(date +%Y%m%d-%H%M%S)-stub-' + RUNID + '$$"; mkdir -p "$rd"\n'
         'printf \'{"lane":"%s","agent":"stub","started_at":"%s"}\\n\' "$lane" '
         '"$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$rd/meta.json"\n'
-        'echo "stub-dispatched run_dir=$rd"\n',
+        'echo "[$lane] PENDING | stub detached; awaiting closeout | run_dir=$rd"\n'
+        'exit 75\n',
         encoding="utf-8",
     )
     stub.chmod(0o755)
