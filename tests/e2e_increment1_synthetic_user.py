@@ -572,6 +572,36 @@ def _stages(rec):
     return [h["stage"] for h in (rec or {}).get("history", []) if h.get("kind") == "run"]
 
 
+def _make_real_lane_repo() -> "tuple[Path, str, str]":
+    """A REAL throwaway git repo under /tmp (a trusted publish root) on a lane-owned
+    branch with two commits, wired to a REAL bare `origin` remote. Returns
+    (repo_path, branch, tip_sha). Used to exercise the PUBLISH-READY marker validation
+    AND the operator-bridge push against ACTUAL git (the trust boundary + real push),
+    not a stub — so the positive path is a genuine end-to-end real-git proof."""
+    import tempfile
+    base = Path(tempfile.mkdtemp(prefix="p2lanerepo-", dir="/tmp"))
+    repo = base / "work"; repo.mkdir()
+    bare = base / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], capture_output=True, text=True)
+    br = "eng1/p2-marker"
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), *a],
+                                  capture_output=True, text=True)
+    g("init", "-q", "-b", br, ".")
+    g("config", "user.email", "lane@dd"); g("config", "user.name", "lane")
+    g("config", "commit.gpgsign", "false")
+    g("remote", "add", "origin", str(bare))
+    (repo / "f.txt").write_text("a\n"); g("add", "f.txt"); g("commit", "-qm", "c1")
+    (repo / "f.txt").write_text("a\nb\n"); g("commit", "-qam", "c2")
+    tip = g("rev-parse", "HEAD").stdout.strip()
+    return repo, br, tip
+
+
+def _emit_marker(run_dir: Path, line: str):
+    """Append a PUBLISH-READY marker line to a finished run's stdout.log (as a lane would)."""
+    p = run_dir / "stdout.log"
+    p.write_text(p.read_text(encoding="utf-8") + line + "\n", encoding="utf-8")
+
+
 def canon6_chain_driver(rep: Reporter):
     print("\n── CANON 6: WORK OWNERSHIP — five-field record, autonomous stages, "
           "deploy-stage, publish bridge, escalation, bound ──")
@@ -715,6 +745,121 @@ def canon6_chain_driver(rep: Reporter):
                                  f"stages={_stages(pf)}")
         if pf_id:
             _abort_chain(pf_id)
+
+        # ── 6c2: PUBLISH-READY MARKER (P2) — lane emits the marker; the driver parses,
+        # VALIDATES against a REAL git repo (the trust boundary), and only then pushes.
+        # The marker is the self-service seam: no --publish-branch is passed on --start;
+        # the branch/SHA come ENTIRELY from the (untrusted) lane stdout.log. ──
+        repo, real_br, real_tip = _make_real_lane_repo()
+
+        def _marker_chain(suffix, marker_line, git_stub):
+            """Start an eng→qa chain with NO publish args, emit the given marker on the
+            eng run, tick with the given git stub, return the loaded record + qa-hop."""
+            w = f"00000000-0000-4000-8000-{suffix}{RUNID[:9]}"
+            eng = _finished_run("engineering", "[engineering] PASS | built on a branch | #x ts=1")
+            started_dirs.append(eng)
+            if marker_line:
+                _emit_marker(eng, marker_line)
+            st = subprocess.run(
+                [_chain_py(), str(CHAIN_DRIVER), "--start", w, routing_key, "telegram",
+                 SYNTH_CHAT_ID, "dm", "--stages", "engineering,qa", "--first-run-dir", str(eng)],
+                capture_output=True, text=True, timeout=30, env=env)
+            cid = re.search(r"chain_id=(\S+)", st.stdout or "")
+            cid = cid.group(1) if cid else None
+            subprocess.run([_chain_py(), str(CHAIN_DRIVER), "--tick"],
+                           capture_output=True, text=True, timeout=60,
+                           env=dict(env, DD_CHAIN_GIT=str(git_stub)))
+            rec = _load_chain(cid) or {}
+            qh = next((h for h in rec.get("history", [])
+                       if h.get("kind") == "run" and h["stage"] == "qa"), None)
+            if qh:
+                started_dirs.append(Path(qh["run_dir"]))
+            return cid, rec
+
+        # POSITIVE: a valid marker (real branch + real tip SHA + real repo cwd) →
+        # validated → operator-bridge push (stub OK) → publish history entry carrying
+        # branch/SHA/diffstat → advance to qa.
+        # REAL git throughout: validation reads the real repo AND the operator-bridge
+        # push lands on the real bare origin — a true end-to-end self-service proof.
+        mk_ok = f"PUBLISH-READY: branch={real_br} commit={real_tip} cwd={repo}"
+        ok_id, ok_rec = _marker_chain("m1", mk_ok, "git")
+        pub_hist = next((h for h in ok_rec.get("history", []) if h.get("kind") == "publish"), None)
+        marker_accepted = (
+            bool(ok_rec.get("published")) and "qa" in _stages(ok_rec)
+            and ok_rec.get("publish_branch") == real_br
+            and (ok_rec.get("publish_sha") or "") == real_tip
+            and pub_hist is not None and pub_hist.get("branch") == real_br
+        )
+        rep.record("C6.marker-ok: valid PUBLISH-READY → validated → pushed → publish event w/ branch+SHA",
+                   marker_accepted,
+                   f"published={ok_rec.get('published')}; branch={ok_rec.get('publish_branch')}; "
+                   f"sha={(ok_rec.get('publish_sha') or '')[:12]}; "
+                   f"diff_stat={(pub_hist or {}).get('diff_stat')!r}; stages={_stages(ok_rec)}")
+        if ok_id:
+            _abort_chain(ok_id)
+
+        # NEGATIVE 1 — DISALLOWED PREFIX: branch outside the lane allowlist → REJECT,
+        # BLOCKER, NO push (git stub would have failed loudly if invoked), NO advance.
+        mk_bad_prefix = f"PUBLISH-READY: branch=random/evil commit={real_tip} cwd={repo}"
+        bp_id, bp_rec = _marker_chain("m2", mk_bad_prefix, git_fail)
+        bp_reject = (bp_rec.get("status") == "blocked"
+                     and "marker rejected" in (bp_rec.get("blocker") or "")
+                     and not bp_rec.get("published") and "qa" not in _stages(bp_rec))
+        rep.record("C6.marker-prefix: disallowed branch prefix → rejected + BLOCKER, no push, no advance",
+                   bp_reject, f"status={bp_rec.get('status')}; blocker={bp_rec.get('blocker')}; "
+                              f"stages={_stages(bp_rec)}")
+        if bp_id:
+            _abort_chain(bp_id)
+
+        # NEGATIVE 2 — SHA NOT ON BRANCH: allowed prefix + real repo, but a SHA that is
+        # not the tip-or-ancestor of the named branch → REJECT, BLOCKER, NO push. Use a
+        # FRESH repo so the orphan commit can't perturb the positive-test repo state.
+        repo2, real_br2, _tip2 = _make_real_lane_repo()
+        import subprocess as _sp
+        _sp.run(["git", "-C", str(repo2), "checkout", "-q", "--orphan", "stray"])
+        _sp.run(["git", "-C", str(repo2), "-c", "commit.gpgsign=false", "commit",
+                 "-q", "--allow-empty", "-m", "stray"])
+        stray = _sp.run(["git", "-C", str(repo2), "rev-parse", "HEAD"],
+                        capture_output=True, text=True).stdout.strip()
+        _sp.run(["git", "-C", str(repo2), "checkout", "-q", real_br2])
+        mk_bad_sha = f"PUBLISH-READY: branch={real_br2} commit={stray} cwd={repo2}"
+        # Validation reads the REAL repo with REAL git (DD_CHAIN_GIT="git"); it rejects
+        # at the SHA-on-branch check BEFORE any push, so no push stub is exercised.
+        bs_id, bs_rec = _marker_chain("m3", mk_bad_sha, "git")
+        bs_blk = bs_rec.get("blocker") or ""
+        bs_reject = (bs_rec.get("status") == "blocked"
+                     and "marker rejected" in bs_blk
+                     and ("neither the tip nor an ancestor" in bs_blk)  # the RIGHT reason
+                     and not bs_rec.get("published") and "qa" not in _stages(bs_rec))
+        rep.record("C6.marker-sha: SHA not on the named branch → rejected + BLOCKER, no push",
+                   bs_reject, f"status={bs_rec.get('status')}; blocker={bs_blk}")
+        if bs_id:
+            _abort_chain(bs_id)
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(repo2.parent, ignore_errors=True)
+        except Exception:
+            pass
+
+        # NEGATIVE 3 — MALFORMED / SHELL-INJECTION: the value carries a shell metachar;
+        # it must NOT parse into a branch value (no interpolation anywhere) → REJECT.
+        mk_malformed = f"PUBLISH-READY: branch=$(touch /tmp/p2_pwned_{RUNID}) commit={real_tip} cwd={repo}"
+        mf_id, mf_rec = _marker_chain("m4", mk_malformed, git_fail)
+        pwned = Path(f"/tmp/p2_pwned_{RUNID}").exists()
+        mf_reject = (mf_rec.get("status") == "blocked"
+                     and not mf_rec.get("published") and "qa" not in _stages(mf_rec)
+                     and not pwned)
+        rep.record("C6.marker-inject: shell-metachar marker never interpolates → rejected, no push, no exec",
+                   mf_reject, f"status={mf_rec.get('status')}; blocker={mf_rec.get('blocker')}; "
+                              f"pwned_file_created={pwned}")
+        if mf_id:
+            _abort_chain(mf_id)
+        try:
+            import shutil
+            shutil.rmtree(repo.parent, ignore_errors=True)
+            Path(f"/tmp/p2_pwned_{RUNID}").unlink(missing_ok=True)
+        except Exception:
+            pass
 
         # ── 6d: a STALLED stage ESCALATES with a named owner (never silent park). ──
         stall_wts = f"00000000-0000-4000-8000-s6{RUNID[:10]}"
