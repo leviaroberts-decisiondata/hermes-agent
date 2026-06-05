@@ -66,7 +66,12 @@ def load(cid):
 
 def main():
     stub = make_stub()
-    env = dict(os.environ, DD_CHAIN_WRAPPER=str(stub))
+    # This probe exercises the DISPATCH MECHANISM (root-cause fix: a never-entered first
+    # lane is dispatched + the next_check_at clock). The 2026-06-04 design hold
+    # (DD_SLACK_LANE_DISPATCH_HOLD, default ON) deliberately parks slack chains at an
+    # escalated-held state instead of dispatching — so we explicitly turn the hold OFF
+    # here to test the dispatch path itself. The hold's own behavior is proven separately.
+    env = dict(os.environ, DD_CHAIN_WRAPPER=str(stub), DD_SLACK_LANE_DISPATCH_HOLD="0")
     route = f"slack:probe:{RUNID}:1.0"
     cid = None
     try:
