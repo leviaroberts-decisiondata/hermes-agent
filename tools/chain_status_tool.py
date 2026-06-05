@@ -121,6 +121,84 @@ def _resolve_wts_task(parent_agent) -> "str | None":
     return str(tid).strip() if tid else None
 
 
+# ── candidates listing (the no-resolve fallback) ─────────────────────────────
+# Fields surfaced in the candidates view. STRICTLY non-credential: ids, the
+# ask snippet, origin, and lifecycle position only — never a token, owner email,
+# or anything credential-ish. Kept narrow on purpose.
+_CAND_FIELDS = (
+    "id,route_key,title,ask_summary,source_surface,source_channel_id,"
+    "status,current_stage,updated_at,created_at"
+)
+_CAND_LIMIT = 8
+
+
+def _candidates() -> "list[dict]":
+    """The N most-recently-active chains across ALL surfaces, read-only.
+
+    Ranked so a chain that is actually MOVING ranks above stale/never-ticked
+    probe rows whose updated_at is null. Directus sorts nulls first on a
+    descending sort, which would float a never-ticked probe to the top — so we
+    over-fetch and re-rank in Python: rows WITH a timestamp first (newest first),
+    null-timestamp rows last. Returns [] on any read failure — the caller
+    degrades to guidance text, never a fabricated chain.
+    """
+    try:
+        # Over-fetch (2×) so the Python re-rank has real movers to pull forward
+        # even when several null-timestamp probe rows exist.
+        code, resp = _api_get(
+            f"/items/request_chains?sort=-updated_at,-created_at"
+            f"&limit={_CAND_LIMIT * 2}&fields={_CAND_FIELDS}")
+        if code != 200:
+            return []
+        rows = (resp or {}).get("data") or []
+
+        def _rank(r):
+            # (has-timestamp DESC, updated_at DESC, created_at DESC) — Python sort
+            # is stable & ascending, so negate via a tuple where True>False.
+            ts = r.get("updated_at") or ""
+            return (1 if ts else 0, ts, r.get("created_at") or "")
+
+        rows.sort(key=_rank, reverse=True)
+        return rows[:_CAND_LIMIT]
+    except Exception:
+        pass
+    return []
+
+
+def _fmt_candidates(cands: list, reason: str) -> str:
+    """Render the read-only candidates listing P1 offers when no chain resolved
+    from args/turn. One compact line per chain; never fabricates a status."""
+    head = (
+        "chain_status: " + reason + "\n"
+        "No chain resolved for this turn (note: a Telegram DM turn cannot auto-resolve a "
+        "Slack-keyed chain — pass an explicit selector). Here are the most recently active "
+        "chains across ALL surfaces (READ-ONLY) — pass chain_id= or channel= to select one. "
+        "Do NOT answer about work status from memory or chat history; ground it in one of "
+        "these or say you could not resolve it."
+    )
+    if not cands:
+        return head + "\n  (no chains found in the request_chains spine)"
+    lines = [head, ""]
+    for c in cands:
+        g = c.get
+        snippet = (g("title") or g("ask_summary") or "(no title)")
+        snippet = " ".join(str(snippet).split())[:80]
+        origin = f"{g('source_surface') or '?'}"
+        ch = g("source_channel_id")
+        if ch:
+            origin += f" {ch}"
+        lines.append(
+            f"  • {g('id')}  [route_key={g('route_key')}]\n"
+            f"      ask: {snippet}\n"
+            f"      origin: {origin}  |  status: {g('status')}  |  "
+            f"stage: {g('current_stage')}  |  updated_at: {g('updated_at') or '(never)'}"
+        )
+    lines.append("")
+    lines.append("Select with: chain_status(chain_id=\"<id-or-route_key>\") "
+                 "or chain_status(channel=\"<channel/chat id>\").")
+    return "\n".join(lines)
+
+
 def _fmt_chain(chain: dict, events: list) -> str:
     """Compose the canonical "where are we" answer from a request_chains row + its
     recent events. The five ownership fields lead (stage · owner · next · blocker ·
@@ -171,8 +249,12 @@ def chain_status(
       3. this turn's bound WTS task (_dd_wts_task_id) → newest chain
       4. this turn's channel/chat (from the routing key) → newest active chain
 
-    Returns the structured five-field status + recent events, or an honest
-    tool_error / 'no chain' note (never a fabricated status).
+    Returns the structured five-field status + recent events. When NOTHING
+    resolves (e.g. a Telegram DM turn that cannot auto-resolve a Slack-keyed
+    chain), or when an explicit chain_id/wts_task/channel MISSES, it returns a
+    READ-ONLY candidates listing — the most recently active chains across all
+    surfaces, with guidance to pass chain_id= or channel= to select one. Never a
+    fabricated status, and never a bare dead-end error.
     """
     if not check_chain_status_requirements():
         return tool_error(
@@ -181,6 +263,10 @@ def chain_status(
             "status; do NOT claim a request_chains read you could not make."
         )
 
+    # Track whether the model passed an explicit selector that MISSED, so the
+    # no-resolve fallback can say "that selector matched nothing — here are the
+    # candidates" rather than a bare "nothing resolved".
+    missed = []
     try:
         # 1. explicit chain_id — match route_key anchor OR the row uuid.
         if chain_id and chain_id.strip():
@@ -192,9 +278,13 @@ def chain_status(
             if not data:
                 code, resp = _api_get(f"/items/request_chains/{qf}")
                 data = [resp["data"]] if (code == 200 and (resp or {}).get("data")) else None
-            return _answer_for(data, f"chain_id={cid}")
+            if data:
+                return _answer_for(data, f"chain_id={cid}")
+            # explicit selector missed — offer candidates rather than dead-end.
+            missed.append(f"chain_id={cid!r}")
 
         # 2/3. WTS task (explicit, else the turn's bound task)
+        explicit_wts = bool((wts_task or "").strip())
         wid = (wts_task or "").strip() or _resolve_wts_task(parent_agent)
         if wid:
             qf = urllib.parse.quote(wid)
@@ -204,9 +294,12 @@ def chain_status(
             data = (resp or {}).get("data") if code == 200 else None
             if data:
                 return _answer_for(data, f"wts_task={wid}")
+            if explicit_wts:
+                missed.append(f"wts_task={wid!r}")
             # fall through to channel if no chain is bound to the task
 
         # 4. channel/chat from the turn — newest active chain on this surface.
+        explicit_ch = bool((channel or "").strip())
         ch = (channel or "").strip() or _resolve_channel(parent_agent)
         if ch:
             qf = urllib.parse.quote(ch)
@@ -214,18 +307,33 @@ def chain_status(
                 f"/items/request_chains?filter[source_channel_id][_eq]={qf}"
                 f"&sort=-created_at&limit=1")
             data = (resp or {}).get("data") if code == 200 else None
-            return _answer_for(data, f"channel={ch}")
+            if data:
+                return _answer_for(data, f"channel={ch}")
+            if explicit_ch:
+                missed.append(f"channel={ch!r}")
 
-        return tool_error(
-            "chain_status: could not resolve a chain — no chain_id given, no WTS task "
-            "bound to this turn, and no channel/chat id in this turn's routing key. "
-            "Pass chain_id=, wts_task=, or channel= explicitly."
-        )
+        # Nothing resolved (or every explicit selector missed). Return a
+        # READ-ONLY candidates listing instead of a bare error so the model can
+        # SELECT the right chain — and so it never falls back to memory/chat.
+        if missed:
+            reason = (f"the selector(s) {', '.join(missed)} matched no chain.")
+        else:
+            reason = ("no chain_id/wts_task/channel given and none could be "
+                      "auto-resolved from this turn.")
+        return _fmt_candidates(_candidates(), reason)
     except Exception as exc:
-        return tool_error(
-            f"chain_status: read failed ({type(exc).__name__}) — do NOT fabricate a "
-            f"status; use the in-context [WORK OWNERSHIP …] snapshot instead."
-        )
+        # Even on read failure, try to offer candidates; if that also fails the
+        # listing degrades to honest guidance. NEVER fabricate a status.
+        try:
+            return _fmt_candidates(
+                _candidates(),
+                f"the read errored ({type(exc).__name__}); these are the most "
+                f"recent chains I could still list.")
+        except Exception:
+            return tool_error(
+                f"chain_status: read failed ({type(exc).__name__}) — do NOT fabricate a "
+                f"status; use the in-context [WORK OWNERSHIP …] snapshot instead."
+            )
 
 
 def _answer_for(data, scope_desc: str) -> str:
@@ -264,7 +372,12 @@ CHAIN_STATUS_SCHEMA = {
         "chain automatically from this turn's bound WTS task or channel; pass chain_id=, "
         "wts_task=, or channel= to target a specific one. If a row's mirror write last failed "
         "(pg_write_error set) the tool flags it — trust the ledger/snapshot over a flagged row. "
-        "Never fabricate a status: if no chain resolves, the tool says so."
+        "Never fabricate a status: if no chain resolves (e.g. a Telegram DM turn cannot "
+        "auto-resolve a Slack-keyed chain) — or if an explicit selector misses — it returns a "
+        "READ-ONLY list of the most recently active chains across all surfaces so you can pass "
+        "chain_id= or channel= to select the right one. NEVER answer a status question from "
+        "memory/chat history when this tool errors or lists candidates — select a chain or say "
+        "you could not resolve it."
     ),
     "parameters": {
         "type": "object",
