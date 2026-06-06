@@ -725,7 +725,17 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # =============================================================================
 
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
+    """Return the canonical auth store path.
+
+    By default credentials live under HERMES_HOME/auth.json. Multi-gateway
+    deployments can set HERMES_AUTH_STORE_PATH to intentionally share one
+    OAuth credential store while keeping homes/sessions/logs isolated.
+    """
+    override = os.environ.get("HERMES_AUTH_STORE_PATH", "").strip()
+    if override:
+        path = Path(override).expanduser()
+    else:
+        path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
     # user's auth store, refuse rather than silently corrupt it. This catches
     # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the

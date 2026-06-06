@@ -8,7 +8,13 @@ hermes_cli/auth.py.
 import json
 from pathlib import Path
 
-from hermes_cli.auth import _save_auth_store, _load_auth_store, clear_provider_auth
+from hermes_cli.auth import (
+    _save_auth_store,
+    _load_auth_store,
+    clear_provider_auth,
+    read_credential_pool,
+    write_credential_pool,
+)
 
 
 def _populated_store():
@@ -101,3 +107,46 @@ def test_save_allows_provider_to_provider_update(tmp_path, monkeypatch):
 
     after = _load_auth_store()
     assert set(after.get("providers", {}).keys()) == {"openai-codex", "copilot"}
+
+
+def test_auth_store_path_env_override_keeps_home_state_separate(tmp_path, monkeypatch):
+    """HERMES_AUTH_STORE_PATH can share credentials without sharing HERMES_HOME."""
+    hermes_home = tmp_path / "personal_home"
+    shared_auth = tmp_path / "shared_auth" / "auth.json"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_AUTH_STORE_PATH", str(shared_auth))
+
+    _save_auth_store(_populated_store())
+
+    assert shared_auth.exists()
+    assert not (hermes_home / "auth.json").exists()
+    after = _load_auth_store()
+    assert "openai-codex" in after.get("providers", {})
+
+
+def test_auth_store_path_env_override_uses_shared_lock_path(tmp_path, monkeypatch):
+    """The auth lock follows the shared auth store, not the process home."""
+    from hermes_cli.auth import _auth_lock_path
+
+    hermes_home = tmp_path / "p1_home"
+    shared_auth = tmp_path / "shared_auth" / "auth.json"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_AUTH_STORE_PATH", str(shared_auth))
+
+    assert _auth_lock_path() == shared_auth.with_suffix(".lock")
+
+
+def test_auth_store_path_env_override_shares_credential_pool(tmp_path, monkeypatch):
+    """Credential-pool providers, including Codex/Copilot, use the shared store."""
+    first_home = tmp_path / "p1_home"
+    second_home = tmp_path / "personal_home"
+    shared_auth = tmp_path / "shared_auth" / "auth.json"
+    monkeypatch.setenv("HERMES_HOME", str(first_home))
+    monkeypatch.setenv("HERMES_AUTH_STORE_PATH", str(shared_auth))
+
+    write_credential_pool("openai-codex", [{"access_token": "a", "source": "test"}])
+
+    monkeypatch.setenv("HERMES_HOME", str(second_home))
+    assert read_credential_pool("openai-codex") == [{"access_token": "a", "source": "test"}]
+    assert not (first_home / "auth.json").exists()
+    assert not (second_home / "auth.json").exists()
