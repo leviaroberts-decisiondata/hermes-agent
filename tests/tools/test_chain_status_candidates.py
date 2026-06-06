@@ -53,7 +53,7 @@ def _token(monkeypatch):
 
 
 def _stub_get(monkeypatch, candidates_rows, *, channel_hit=None, wts_hit=None,
-              chainid_hit=None):
+              chainid_hit=None, thread_hit=None, message_hit=None):
     """Stub _api_get: candidate sort query returns candidates_rows; explicit
     filters return their *_hit (or empty)."""
     def fake(path):
@@ -61,6 +61,10 @@ def _stub_get(monkeypatch, candidates_rows, *, channel_hit=None, wts_hit=None,
             return 200, {"data": list(candidates_rows)}
         if "filter[source_channel_id]" in path:
             return 200, {"data": [channel_hit] if channel_hit else []}
+        if "filter[source_thread_id]" in path:
+            return 200, {"data": [thread_hit] if thread_hit else []}
+        if "filter[source_message_id]" in path:
+            return 200, {"data": [message_hit] if message_hit else []}
         if "filter[wts_task_id]" in path:
             return 200, {"data": [wts_hit] if wts_hit else []}
         if "filter[route_key]" in path:
@@ -124,6 +128,88 @@ def test_candidates_carry_no_credential_fields(monkeypatch):
     out = cs.chain_status(parent_agent=_TelegramTurn()).lower()
     for bad in ("token", "bearer", "authorization", "password", "secret"):
         assert bad not in out
+
+
+# ── PART A: natural-key resolution (graduation criterion) ────────────────────
+# A grader/operator has NO inside knowledge of the driver chain anchor. A SINGLE
+# query by a key they reasonably hold — thread ts, message/queue id, channel, or
+# the gateway routing alias — must return the turn's state, and the canonical
+# chain key (route_key anchor) must be surfaced in the answer.
+_THREADED = {
+    "id": "9a0b1c2d", "route_key": "no-task:abc123", "title": "threaded ask",
+    "ask_summary": "threaded ask", "source_surface": "slack",
+    "source_channel_id": "C0B7C4BC6KD", "source_thread_id": "1780695815.0001",
+    "source_message_id": "1780695820.0007",
+    "status": "active", "current_stage": "executing",
+    "updated_at": "2026-06-05T04:00:00.000Z", "created_at": "2026-06-05T04:00:00.000Z",
+}
+
+
+def test_resolve_by_thread_ts_returns_status(monkeypatch):
+    """A single query by the Slack thread ts (no anchor knowledge) resolves the turn."""
+    _stub_get(monkeypatch, [_HELD], thread_hit=_THREADED)
+    out = cs.chain_status(thread_ts="1780695815.0001", parent_agent=_TelegramTurn())
+    assert "WHERE ARE WE" in out
+    assert "9a0b1c2d" in out
+    assert "most recently active chains" not in out
+
+
+def test_resolve_by_message_id_returns_status(monkeypatch):
+    """A single query by the originating message ts / queue id resolves the turn."""
+    _stub_get(monkeypatch, [_HELD], message_hit=_THREADED)
+    out = cs.chain_status(message_id="1780695820.0007", parent_agent=_TelegramTurn())
+    assert "WHERE ARE WE" in out
+    assert "9a0b1c2d" in out
+
+
+def test_resolve_by_route_alias_derives_thread_then_channel(monkeypatch):
+    """The gateway routing alias (NOT a stored column) resolves via derived origin —
+    the no-inside-knowledge bridge. With a thread segment it hits source_thread_id."""
+    _stub_get(monkeypatch, [_HELD], thread_hit=_THREADED)
+    out = cs.chain_status(
+        route_alias="agent:main:slack:channel:C0B7C4BC6KD:1780695815.0001",
+        parent_agent=_TelegramTurn())
+    assert "WHERE ARE WE" in out
+    assert "9a0b1c2d" in out
+
+
+def test_resolve_by_route_alias_channel_only(monkeypatch):
+    """A channel-only alias (no thread segment) falls back to source_channel_id."""
+    _stub_get(monkeypatch, [_HELD], channel_hit=_THREADED)
+    out = cs.chain_status(
+        route_alias="agent:main:slack:channel:C0B7C4BC6KD",
+        parent_agent=_TelegramTurn())
+    assert "WHERE ARE WE" in out
+    assert "9a0b1c2d" in out
+
+
+def test_canonical_chain_key_surfaced_for_next_query(monkeypatch):
+    """The answer must surface the canonical chain key (route_key anchor) so the
+    next query can target it directly — standardized + queryable."""
+    _stub_get(monkeypatch, [_HELD], thread_hit=_THREADED)
+    out = cs.chain_status(thread_ts="1780695815.0001", parent_agent=_TelegramTurn())
+    assert "no-task:abc123" in out          # the canonical anchor
+    assert "canonical" in out.lower()
+    assert "chain_id=" in out               # explicit guidance to query by it
+
+
+def test_route_alias_parser_extracts_channel_and_thread():
+    """Unit: the alias parser splits channel + optional thread; rejects non-aliases."""
+    ch, th = cs._parse_route_alias("agent:main:slack:channel:C0ABC:1780.5")
+    assert ch == "C0ABC" and th == "1780.5"
+    ch, th = cs._parse_route_alias("agent:main:slack:channel:C0ABC")
+    assert ch == "C0ABC" and th is None
+    ch, th = cs._parse_route_alias("not-a-routing-key")
+    assert ch is None and th is None
+
+
+def test_natural_key_miss_still_lists_candidates(monkeypatch):
+    """A natural-key selector that misses offers candidates + names the miss — never
+    a dead-end (same honesty contract as channel/wts)."""
+    _stub_get(monkeypatch, [_HELD], thread_hit=None)
+    out = cs.chain_status(thread_ts="9999.0000", parent_agent=_TelegramTurn())
+    assert "matched no chain" in out
+    assert "cd605a8b" in out
 
 
 def test_read_failure_still_offers_candidates_or_honest_guidance(monkeypatch):
