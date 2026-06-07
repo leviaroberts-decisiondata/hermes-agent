@@ -116,10 +116,12 @@ class TestG2LoudUnknownLane:
         monkeypatch.setattr(r2l, "_TELEGRAM_TARGETS_JSON", lanes_dir / "telegram-targets.json")
         runner = fake_tree["wrapper"].parent / "dd-telegram-visible-lane-run"
         tg_argv_log = fake_tree["argv_log"].parent / "telegram-argv.log"
+        tg_env_log = fake_tree["argv_log"].parent / "telegram-env.log"
         if runner_exists:
             runner.write_text(textwrap.dedent(f"""\
                 #!/usr/bin/env bash
                 printf '%s\\n' "$@" > "{tg_argv_log}"
+                printf 'HERMES_ROUTE_KEY=%s\\nHERMES_SESSION_KEY=%s\\nDD_WTS_TASK_ID=%s\\n' "${{HERMES_ROUTE_KEY:-}}" "${{HERMES_SESSION_KEY:-}}" "${{DD_WTS_TASK_ID:-}}" > "{tg_env_log}"
                 lane=""
                 while [[ $# -gt 0 ]]; do
                   case "$1" in --lane) lane="$2"; shift 2 ;; *) shift ;; esac
@@ -130,6 +132,7 @@ class TestG2LoudUnknownLane:
             runner.chmod(0o755)
         monkeypatch.setattr(r2l, "_TELEGRAM_RUNNER", runner)
         fake_tree["telegram_argv_log"] = tg_argv_log
+        fake_tree["telegram_env_log"] = tg_env_log
         return runner
 
     def test_telegram_only_lane_names_runner_and_refuses_drop(self, fake_tree, monkeypatch):
@@ -144,6 +147,26 @@ class TestG2LoudUnknownLane:
         argv = fake_tree["telegram_argv_log"].read_text(encoding="utf-8").splitlines()
         assert "--lane" in argv and argv[argv.index("--lane") + 1] == "pmo"
         assert "--packet" in argv
+
+    def test_telegram_only_lane_passes_route_and_wts_env_to_runner(self, fake_tree, monkeypatch):
+        self._with_telegram_targets(fake_tree, monkeypatch)
+
+        class Parent:
+            _dd_route_key = "agent:main:telegram:dm:8737984752"
+            _dd_session_key = "agent:hermes:gateway:telegram:8737984752"
+
+        out = r2l.route_to_lane(
+            lane="pmo",
+            goal="plan the work",
+            wts_task="a6a469c4-7a40-4b8d-a47d-d7b621e8ddbb",
+            parent_agent=Parent(),
+        )
+
+        assert "HANDOFF OK" in out
+        env_lines = fake_tree["telegram_env_log"].read_text(encoding="utf-8").splitlines()
+        assert "HERMES_ROUTE_KEY=agent:main:telegram:dm:8737984752" in env_lines
+        assert "HERMES_SESSION_KEY=agent:main:telegram:dm:8737984752" in env_lines
+        assert "DD_WTS_TASK_ID=a6a469c4-7a40-4b8d-a47d-d7b621e8ddbb" in env_lines
 
     def test_telegram_only_lane_when_runner_unreachable_still_loud(self, fake_tree, monkeypatch):
         self._with_telegram_targets(fake_tree, monkeypatch, runner_exists=False)

@@ -336,9 +336,20 @@ def route_to_lane(
     if wts_task and wts_task.strip():
         cmd += ["--wts-task", wts_task.strip()]
 
+    env = os.environ.copy()
+    route_key = str(getattr(parent_agent, "_dd_route_key", "") or "").strip()
+    session_key = str(getattr(parent_agent, "_dd_session_key", "") or "").strip()
+    if route_key:
+        env["HERMES_ROUTE_KEY"] = route_key
+        env.setdefault("HERMES_SESSION_KEY", route_key)
+    elif session_key:
+        env.setdefault("HERMES_SESSION_KEY", session_key)
+    if wts_task and wts_task.strip():
+        env["DD_WTS_TASK_ID"] = wts_task.strip()
+
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=900,
+            cmd, capture_output=True, text=True, timeout=900, env=env,
         )
     except subprocess.TimeoutExpired:
         return tool_error(
