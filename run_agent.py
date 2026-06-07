@@ -7841,6 +7841,12 @@ class AIAgent:
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
             return self._try_activate_fallback()  # skip invalid, try next
+        if fb_provider == "copilot-acp" and os.getenv("HERMES_ENABLE_COPILOT_ACP_FALLBACK", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            logging.warning(
+                "Skipping copilot-acp fallback because it is not explicitly verified/enabled; "
+                "set HERMES_ENABLE_COPILOT_ACP_FALLBACK=1 after validating the local ACP command."
+            )
+            return self._try_activate_fallback()  # try next in chain
 
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()
@@ -9537,11 +9543,20 @@ class AIAgent:
         its own inline invocation for backward-compatible display handling.
         """
         # Check plugin hooks for a block directive before executing anything.
+        # Per-turn System A / System B origin (delivery turn == skip_context_files
+        # and not load_soul_identity); see the sequential path for the rationale.
+        # Carried here too so the concurrent path is not a boundary bypass.
+        _is_delivery_turn = bool(
+            getattr(self, "skip_context_files", False)
+            and not getattr(self, "load_soul_identity", True)
+        )
+        _caller_origin = "system_b" if _is_delivery_turn else "system_a"
         block_message: Optional[str] = None
         try:
             from hermes_cli.plugins import get_pre_tool_call_block_message
             block_message = get_pre_tool_call_block_message(
                 function_name, function_args, task_id=effective_task_id or "",
+                caller_origin=_caller_origin,
             )
         except Exception:
             pass
@@ -9637,6 +9652,7 @@ class AIAgent:
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
+                caller_origin=_caller_origin,
             )
 
     @staticmethod
@@ -10052,11 +10068,26 @@ class AIAgent:
                 function_args = {}
 
             # Check plugin hooks for a block directive before executing.
+            #
+            # Per-turn caller origin for the System A / System B boundary: a
+            # delivery turn is built with skip_context_files=True AND
+            # load_soul_identity=False (the §4 replace_identity path) — the SAME
+            # pair this module already treats as "the delivery role, not P1"
+            # (see _resolve_*_role around the skip_context_files check). That is
+            # System B; everything else (the P1 coordinator, specialist
+            # gateways, CLI) is System A. We pass it to the guard so a delivery
+            # turn cannot reach into a specialist/lane.
+            _is_delivery_turn = bool(
+                getattr(self, "skip_context_files", False)
+                and not getattr(self, "load_soul_identity", True)
+            )
+            _caller_origin = "system_b" if _is_delivery_turn else "system_a"
             _block_msg: Optional[str] = None
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    caller_origin=_caller_origin,
                 )
             except Exception:
                 pass
@@ -10326,6 +10357,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        caller_origin=_caller_origin,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -10346,6 +10378,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        caller_origin=_caller_origin,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -13913,7 +13946,7 @@ class AIAgent:
                     logger.error(error_msg)
                 
                 logger.debug("Outer loop error in API call #%d", api_call_count, exc_info=True)
-                
+
                 # If an assistant message with tool_calls was already appended,
                 # the API expects a role="tool" result for every tool_call_id.
                 # Fill in error results for any that weren't answered yet.
