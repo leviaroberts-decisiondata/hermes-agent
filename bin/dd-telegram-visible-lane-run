@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+# dd-telegram-visible-lane-run — sanctioned VISIBLE (Telegram) DecisionData lane runner.
+#
+# Telegram-visible sibling of ~/.hermes/bin/dd-visible-lane-run (Slack-visible).
+# Use THIS when Levi's acceptance criterion is *Telegram* visibility. Do NOT
+# substitute the Slack wrapper for a Telegram ask.
+#
+# CONTRACT (updated 2026-05-29 per Levi): MD files NEVER go into Telegram.
+#   - The FULL handoff packet MD and FULL specialist result MD are attached to a
+#     WTS (Directus) task — the durable system of record — via dd-wts-attach
+#     (upload /files -> relate tasks_files -> fetch-back + SHA256 verify).
+#   - Telegram receives ONLY concise text: a concise "DD P1 -> Agent" message
+#     (root) and a concise threaded "Agent -> DD P1" reply, each carrying the
+#     WTS task link. No document/file is ever sent to Telegram.
+#
+# What it does (one readable thread in the lane bot's Telegram DM per run):
+#   1. Resolve the WTS task (ATTACH-ONLY — never creates one): explicit packet
+#      WTS id, else the lane's PMO-seeded standing "DD specialist lane log" task.
+#      If neither exists, post the visible handoff/result anyway but SKIP the WTS
+#      attach with a "no WTS task — ask PMO to create one" note.
+#   2. Attach the FULL handoff packet MD to the WTS task (SHA-verified),
+#      authenticating as the lane's own agent identity (per-agent attribution).
+#   3. Post a concise "DD P1 -> Agent" Telegram message (with WTS link) -> root.
+#   4. Run the specialist SYNCHRONOUSLY (silent) via ~/.hermes/bin/dd-lane-run.
+#      No Hermes notify_on_complete; no raw background notifications.
+#   5. Attach the FULL specialist result MD to the same WTS task (SHA-verified).
+#   6. Post a concise "Agent -> DD P1" Telegram reply (with WTS link), threaded
+#      to the root via reply_to_message_id.
+#   7. Print to stdout ONLY one concise normalized status line for P1 to relay.
+#
+# INVARIANT: the Telegram bot token (from the specialist gateway profile .env)
+# and the WTS/Directus token (the acting agent's per-agent token from
+# ~/.openclaw/dd-agent-wts.env, admin fallback from ~/.openclaw/directus.env) are
+# sourced server-side and used only for their HTTP calls. NEITHER is ever
+# printed, logged, put in argv, packets, or stdout, or relayed to P1/Levi-chat.
+#
+# Usage:
+#   dd-telegram-visible-lane-run --lane design --agent dd-design --packet <file>
+#   dd-telegram-visible-lane-run --lane qa --packet <file>   # agent defaults from config
+set -euo pipefail
+
+HERMES_HOME="$HOME/.hermes"
+HERMES_BIN="$HERMES_HOME/bin"
+LANE_RUN="$HERMES_BIN/dd-lane-run"
+REAPER="$HERMES_BIN/dd-lane-reaper"
+WTS_ATTACH="$HERMES_BIN/dd-wts-attach"
+TARGETS_JSON="$HERMES_HOME/dd-lanes/telegram-targets.json"
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: dd-telegram-visible-lane-run --lane <design|engineering|qa|pmo|architecture|product|knowledge|devops|engineering-2|engineering-3> [--agent <command>] --packet <path>
+Lanes/targets are defined in ~/.hermes/dd-lanes/telegram-targets.json.
+Full handoff/result MD is attached to a WTS task; Telegram gets concise text + WTS link only.
+Example: dd-telegram-visible-lane-run --lane design --packet ~/.hermes/dd-lanes/design/foo.md
+USAGE
+}
+
+lane=""; agent=""; packet=""; wts_task_arg=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --lane) lane="$2"; shift 2 ;;
+    --agent) agent="$2"; shift 2 ;;
+    --packet) packet="$2"; shift 2 ;;
+    --wts-task) wts_task_arg="$2"; shift 2 ;;   # active bound WTS task (Phase A / I3)
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
+  esac
+done
+[[ -n "$lane" ]]   || { echo "missing --lane" >&2; usage; exit 2; }
+[[ -n "$packet" ]] || { echo "missing --packet" >&2; usage; exit 2; }
+[[ -f "$packet" ]] || { echo "packet not found: $packet" >&2; exit 3; }
+[[ -x "$LANE_RUN" ]] || { echo "dd-lane-run not found/executable: $LANE_RUN" >&2; exit 5; }
+[[ -x "$WTS_ATTACH" ]] || { echo "dd-wts-attach not found/executable: $WTS_ATTACH" >&2; exit 5; }
+[[ -f "$TARGETS_JSON" ]] || { echo "telegram targets config not found: $TARGETS_JSON" >&2; exit 6; }
+
+# ── Resolve lane config from telegram-targets.json ──
+read_cfg() {
+  python3 - "$TARGETS_JSON" "$lane" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1])); lane = sys.argv[2]
+send = cfg.get("send", {}); wts = cfg.get("wts", {}); lanes = cfg.get("lanes", {})
+if lane not in lanes:
+    sys.stderr.write("unknown lane %r; known: %s\n" % (lane, ",".join(sorted(lanes)))); sys.exit(7)
+l = lanes[lane]
+print(l.get("profile",""))
+print(l.get("default_agent",""))
+print(l.get("bot_username",""))
+print(l.get("wts_log_task",""))
+print(send.get("profiles_dir",""))
+print(send.get("token_var","TELEGRAM_BOT_TOKEN"))
+print(send.get("chat_var","TELEGRAM_HOME_CHANNEL"))
+print(send.get("api_base","https://api.telegram.org"))
+print(wts.get("tracker_task_url","https://tracker.decisiondata.io/tasks/"))
+PY
+}
+cfg_out="$(read_cfg)" || exit $?
+{
+  IFS= read -r profile
+  IFS= read -r default_agent
+  IFS= read -r bot_username
+  IFS= read -r wts_log_task
+  IFS= read -r profiles_dir
+  IFS= read -r token_var
+  IFS= read -r chat_var
+  IFS= read -r api_base
+  IFS= read -r tracker_task_url
+} <<EOF
+$cfg_out
+EOF
+[[ -n "$profile" ]] || { echo "no profile for lane $lane" >&2; exit 7; }
+[[ -n "$agent" ]] || agent="$default_agent"
+[[ -n "$agent" ]] || { echo "no --agent and no default_agent for lane $lane" >&2; exit 2; }
+
+env_file="$profiles_dir/$profile/.env"
+[[ -f "$env_file" ]] || { echo "profile env not found: $env_file" >&2; exit 6; }
+
+# ── Resolve WTS task: explicit packet id, else lane standing log task. ──
+# ATTACH-ONLY contract: this wrapper NEVER creates a task. The packet should
+# carry an explicit WTS id (WTS:/WTS-reference:/wts_task: + uuid); failing that
+# we use the lane's pre-seeded standing 'DD specialist lane log' task. If NEITHER
+# exists, we still post the visible Telegram handoff/result but SKIP the WTS
+# attach and surface a "no WTS task — ask PMO to create one" note. No auto-create.
+# Accepts a packet line like: WTS: <uuid>  |  WTS/reference: <uuid>  |  wts_task: <uuid>
+packet_wts="$(grep -ioE '^[[:space:]]*(wts|wts/reference|wts_task|wts id|wts-id)[: ]+[0-9a-fA-F-]{36}' "$packet" \
+  | grep -ioE '[0-9a-fA-F-]{36}' | head -1 || true)"
+# Phase A / I3 precedence: --wts-task (the thread's ACTIVE bound task) > packet
+# WTS id > standing per-lane "lane log" bucket (LOUD last-resort, never silent) > none.
+if [[ -n "$wts_task_arg" ]]; then
+  wts_task="$wts_task_arg"; wts_source="active-bound-task"
+elif [[ -n "$packet_wts" ]]; then
+  wts_task="$packet_wts"; wts_source="packet"
+elif [[ -n "${DD_WTS_TASK_ID:-}" ]]; then
+  wts_task="$DD_WTS_TASK_ID"; wts_source="env-bound-task"
+else
+  # Do NOT fall back to the standing per-lane log task for routed P1 work.
+  # That fallback caused specialist requests/results to bind to stale historical
+  # lane buckets instead of the live task Levi is trying to review. Prefer a
+  # loud no-WTS status over attaching current work to the wrong task.
+  wts_task=""; wts_source="none"
+fi
+if [[ -n "$wts_task" ]]; then
+  wts_enabled=1
+  tracker_url="${tracker_task_url}${wts_task}"
+else
+  wts_enabled=0
+  tracker_url=""   # no task -> no durable record this run
+fi
+
+# ── Source the bot token + chat id (token NEVER printed; presence-checked) ──
+set -a; . "$env_file"; set +a
+bot_token="${!token_var:-}"
+chat_id="${!chat_var:-}"
+[[ -n "$bot_token" ]] || { echo "token var $token_var empty in profile $profile (presence check failed)" >&2; exit 8; }
+[[ -n "$chat_id" ]]   || { echo "chat var $chat_var empty in profile $profile" >&2; exit 9; }
+api_root="$api_base/bot$bot_token"   # token confined to this var; never echoed
+
+run_id="$(date +%Y%m%d-%H%M%S)-$$"
+title="$(grep -m1 '^# ' "$packet" | sed 's/^# *//' || true)"
+[[ -n "$title" ]] || title="$lane lane handoff"
+
+stage_dir="/tmp/dd-tg-visible-lane-${run_id}"
+mkdir -p "$stage_dir"
+cleanup() { rm -rf "$stage_dir"; }
+trap cleanup EXIT
+
+# ── Telegram Bot API: text-only (sendMessage). NO document send by contract. ──
+tg_send_message() { # $1=text $2=reply_to(optional)
+  python3 - "$api_root" "$chat_id" "$1" "${2:-}" <<'PY'
+import sys, urllib.request, urllib.parse, urllib.error
+api_root, chat, text, reply_to = sys.argv[1:5]
+data = {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}
+if reply_to: data["reply_to_message_id"] = reply_to
+body = urllib.parse.urlencode(data).encode()
+req = urllib.request.Request(api_root + "/sendMessage", data=body, method="POST")
+try:
+    print(urllib.request.urlopen(req, timeout=60).read().decode())
+except urllib.error.HTTPError as e:
+    print(e.read().decode())
+PY
+}
+tg_get() { python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("result",{}) if d.get("ok") else {}; print(r.get(sys.argv[1],"") if isinstance(r,dict) else "")' "$1"; }
+
+# attach_get KEY <output-of-dd-wts-attach>  -> echoes the value for KEY
+attach_get() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+
+register_pending_with_reaper() { # $1=result_file $2=run_code
+  local rf="$1" rc="$2"
+  [[ "$rc" -eq 75 ]] || return 0
+  [[ -x "$REAPER" ]] || { echo "warn: reaper not executable; pending lane not registered" >&2; return 0; }
+  local rd session_key origin wts_for_reaper
+  rd="$(sed -n 's/^run_dir:[[:space:]]*//p' "$rf" | head -1)"
+  [[ -n "$rd" && -d "$rd" ]] || { echo "warn: pending lane run_dir not found; pending lane not registered" >&2; return 0; }
+  session_key="${HERMES_ROUTE_KEY:-${HERMES_SESSION_KEY:-}}"
+  [[ -n "$session_key" ]] || { echo "warn: no HERMES_ROUTE_KEY/HERMES_SESSION_KEY; pending lane not registered" >&2; return 0; }
+  origin="$(python3 - "$session_key" <<'PY'
+import sys
+key = sys.argv[1]
+parts = key.split(":")
+if len(parts) < 5 or parts[0] != "agent" or parts[1] != "main":
+    sys.exit(1)
+platform, chat_type, chat_id = parts[2], parts[3], parts[4]
+thread = parts[5] if len(parts) > 5 and chat_type in ("dm", "thread") else ""
+print("\n".join([platform, chat_type, chat_id, thread]))
+PY
+)" || { echo "warn: route/session key not parseable for reaper registration" >&2; return 0; }
+  local platform origin_chat_type origin_chat_id origin_thread_id
+  {
+    IFS= read -r platform
+    IFS= read -r origin_chat_type
+    IFS= read -r origin_chat_id
+    IFS= read -r origin_thread_id
+  } <<EOF_ORIGIN
+$origin
+EOF_ORIGIN
+  [[ -n "$platform" && -n "$origin_chat_type" && -n "$origin_chat_id" ]] || { echo "warn: incomplete origin for reaper registration" >&2; return 0; }
+  wts_for_reaper="${wts_task:-${DD_WTS_TASK_ID:-}}"
+  set +e
+  "$REAPER" --register "$rd" "$session_key" "$platform" "$origin_chat_id" "$origin_chat_type" "$origin_thread_id" "" "$wts_for_reaper" >"$stage_dir/reaper_register.out" 2>"$stage_dir/reaper_register.err"
+  local reg_rc=$?
+  set -e
+  if [[ "$reg_rc" -eq 0 ]]; then
+    echo "reaper-registration=ok run_dir=$rd wts=${wts_for_reaper:-none}" > "$stage_dir/reaper_register.status"
+  else
+    echo "warn: reaper registration failed rc=$reg_rc; pending lane remains pollable" >&2
+  fi
+}
+
+# ── 1. Attach FULL handoff packet MD to WTS (durable record), as the lane agent.
+#       Skips cleanly (no failure, no create) when no WTS task is configured. ──
+handoff_stage="$stage_dir/handoff-${run_id}.md"
+cp "$packet" "$handoff_stage"
+hf_file_id=""; hf_identity=""
+if [[ "$wts_enabled" -eq 1 ]]; then
+  set +e
+  hf_out="$("$WTS_ATTACH" --task "$wts_task" --file "$handoff_stage" --name "handoff-${run_id}.md" --as-agent "$agent" 2>"$stage_dir/hf_attach.err")"
+  hf_rc=$?
+  set -e
+  hf_file_id="$(attach_get FILE_ID "$hf_out")"
+  hf_verify="$(attach_get VERIFY "$hf_out")"
+  hf_identity="$(attach_get IDENTITY "$hf_out")"
+  if [[ "$hf_rc" -ne 0 || "$hf_verify" != "ok" ]]; then
+    echo "FAILED to attach handoff packet to WTS task $wts_task (verify=$hf_verify rc=$hf_rc; token not shown)" >&2
+    sed -E 's/Bearer [^ ]+/Bearer <redacted>/g' "$stage_dir/hf_attach.err" >&2 || true
+    exit 11
+  fi
+fi
+
+# ── 2. Handoff ROOT Telegram message (concise) -> root mid. With a WTS task it
+#       carries the durable-record link; without one it says no record was kept. ──
+if [[ "$wts_enabled" -eq 1 ]]; then
+  root_wts_lines="Full handoff packet attached to WTS (durable record), not sent here.
+WTS task: ${tracker_url}
+file_id: ${hf_file_id}"
+else
+  root_wts_lines="NOTE: no WTS task referenced and no standing lane-log task configured for '${lane}' — no durable record kept this run. Ask PMO to create one."
+fi
+root_text="DD P1 -> ${agent} handoff (${lane} lane)
+Title: ${title}
+${root_wts_lines}
+The ${lane} specialist result will follow as a reply in this chat."
+root_resp="$(tg_send_message "$root_text")"
+root_mid="$(printf '%s' "$root_resp" | tg_get message_id)"
+if [[ -z "$root_mid" ]]; then
+  echo "FAILED to post handoff root to lane=$lane profile=$profile chat=$chat_id (Telegram error; token not shown)" >&2
+  exit 10
+fi
+
+# ── 3. Run specialist SYNCHRONOUSLY (silent) via dd-lane-run ──
+result_file="$stage_dir/result-${run_id}.md"
+err_file="$stage_dir/stderr-${run_id}.log"
+set +e
+"$LANE_RUN" --lane "$lane" --agent "$agent" --packet "$packet" >"$result_file" 2>"$err_file"
+run_code=$?
+set -e
+register_pending_with_reaper "$result_file" "$run_code"
+
+# ── Derive gate + 1-line summary from the result ──
+# P-D / G5 (honesty hardening): the REAL exit code is ground truth — a non-zero
+# (non-PENDING) exit is an UNCONDITIONAL FAIL and can never report green via a
+# self-declared `Gate:/Status:` line. The self-declared line may only REFINE a
+# zero-exit run. Mirrors dd-lane-run:mirror_terminal_result_once (P0b) and the
+# Slack wrapper.
+if [[ "$run_code" -ne 0 && "$run_code" -ne 75 ]]; then
+  gate="FAIL"
+else
+  gate="$(grep -m1 -ioE '^(gate|status)[: ]+[A-Za-z_-]+' "$result_file" | grep -ioE '[A-Za-z_-]+$' | tr '[:lower:]' '[:upper:]' || true)"
+  if [[ -z "$gate" ]]; then
+    if [[ "$run_code" -eq 0 ]]; then gate="PASS"; else gate="FAIL"; fi
+  fi
+fi
+oneline="$(grep -vE '^[[:space:]]*$' "$result_file" \
+  | grep -viE '^[[:space:]]*#*[[:space:]]*(gate|status)[: ]' \
+  | head -1 | sed -E 's/^#+ *//; s/^[[:space:]]+//; s/[[:space:]]+$//' | cut -c1-180 || true)"
+[[ -n "$oneline" ]] || oneline="(no result body beyond gate; exit $run_code)"
+
+# ── 4. Attach FULL specialist result MD to the same WTS task, as the lane agent.
+#       Skips cleanly when no WTS task is configured (no create). ──
+result_attach="$result_file"
+if [[ "$run_code" -ne 0 && -s "$err_file" ]]; then
+  result_attach="$stage_dir/result-full-${run_id}.md"
+  { cat "$result_file"; echo; echo "--- STDERR (exit $run_code) ---"; cat "$err_file"; } > "$result_attach"
+fi
+# P-D / G6: a result-attach failure must be VISIBLE on the reported status, not
+# just a stderr warn. (The handoff attach is already hard-fatal above — exit 11 —
+# because Telegram's contract is "MD never sent here, the WTS task IS the record";
+# but the result attach is fail-soft, so surface it.) attach_failed=1 makes the
+# status line + reply say the durable result record did NOT land, without failing
+# the whole run (the work + Telegram reply still exist).
+attach_failed=0
+rf_file_id=""; rf_verify=""; rf_rc=0; rf_identity=""
+if [[ "$wts_enabled" -eq 1 ]]; then
+  set +e
+  rf_out="$("$WTS_ATTACH" --task "$wts_task" --file "$result_attach" --name "result-${run_id}.md" --as-agent "$agent" 2>"$stage_dir/rf_attach.err")"
+  rf_rc=$?
+  set -e
+  rf_file_id="$(attach_get FILE_ID "$rf_out")"
+  rf_verify="$(attach_get VERIFY "$rf_out")"
+  rf_identity="$(attach_get IDENTITY "$rf_out")"
+  [[ "$rf_rc" -eq 0 && "$rf_verify" == "ok" ]] || attach_failed=1
+fi
+
+# ── 5. Result Telegram reply (concise), threaded to root. Carries the WTS link
+#       when a task exists; otherwise notes no durable record was kept. ──
+if [[ "$wts_enabled" -eq 1 && "$attach_failed" -eq 1 ]]; then
+  reply_wts_lines="WARN: result NOT attached to a durable WTS record (attach did not verify). The work exists, but the durable copy did not land — re-attach or check the tracker.
+WTS task: ${tracker_url}"
+elif [[ "$wts_enabled" -eq 1 ]]; then
+  reply_wts_lines="Full result attached to WTS (durable record), not sent here.
+WTS task: ${tracker_url}
+file_id: ${rf_file_id:-<attach-unverified>}"
+else
+  reply_wts_lines="NOTE: no WTS task — result not attached to a durable record. Ask PMO to create a task."
+fi
+reply_text="${agent} -> DD P1 result (${lane} lane)
+Gate: ${gate}
+${oneline}
+${reply_wts_lines}"
+reply_resp="$(tg_send_message "$reply_text" "$root_mid")"
+reply_mid="$(printf '%s' "$reply_resp" | tg_get message_id)"
+
+# ── 6. STDOUT: only the concise normalized status line P1 relays ──
+botref="${bot_username:+@$bot_username}"
+if [[ "$wts_enabled" -eq 1 && "$attach_failed" -eq 1 ]]; then
+  # P-D / G6: surface the attach failure on the status line P1 relays.
+  wts_status="wts=${wts_task}(${wts_source}) ATTACH-FAILED — result NOT attached to a durable WTS record (verify failed; work exists, durable copy did not land) ${tracker_url}"
+elif [[ "$wts_enabled" -eq 1 ]]; then
+  wts_status="wts=${wts_task}(${wts_source}) as=${rf_identity:-${hf_identity:-?}} files=${hf_file_id:-none},${rf_file_id:-none} ${tracker_url}"
+else
+  wts_status="wts=NONE — no WTS task; visible post only, NOT attached. Ask PMO to create one."
+fi
+echo "[${lane}] ${gate} | ${oneline} | telegram ${botref:-$profile} chat=${chat_id} root_mid=${root_mid} reply_mid=${reply_mid:-none} | ${wts_status}"
+
+# Surface delivery problems on stderr only (not relayed to Levi main chat).
+if [[ "$wts_enabled" -eq 1 ]]; then
+  [[ "$rf_rc" -eq 0 && "$rf_verify" == "ok" ]] || echo "warn: result attachment to WTS not verified (verify=${rf_verify:-none} rc=$rf_rc; token not shown)" >&2
+fi
+[[ -n "$reply_mid" ]] || echo "warn: result reply message not confirmed (token not shown)" >&2
+
+exit "$run_code"
