@@ -115,27 +115,40 @@ class TestG2LoudUnknownLane:
         )
         monkeypatch.setattr(r2l, "_TELEGRAM_TARGETS_JSON", lanes_dir / "telegram-targets.json")
         runner = fake_tree["wrapper"].parent / "dd-telegram-visible-lane-run"
+        tg_argv_log = fake_tree["argv_log"].parent / "telegram-argv.log"
         if runner_exists:
-            runner.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            runner.write_text(textwrap.dedent(f"""\
+                #!/usr/bin/env bash
+                printf '%s\\n' "$@" > "{tg_argv_log}"
+                lane=""
+                while [[ $# -gt 0 ]]; do
+                  case "$1" in --lane) lane="$2"; shift 2 ;; *) shift ;; esac
+                done
+                printf '[%s] PASS | telegram lane routed | @lane-bot mid=1 | wts=ok\\n' "$lane"
+                exit 0
+            """), encoding="utf-8")
             runner.chmod(0o755)
         monkeypatch.setattr(r2l, "_TELEGRAM_RUNNER", runner)
+        fake_tree["telegram_argv_log"] = tg_argv_log
         return runner
 
     def test_telegram_only_lane_names_runner_and_refuses_drop(self, fake_tree, monkeypatch):
         runner = self._with_telegram_targets(fake_tree, monkeypatch)
         out = r2l.route_to_lane(lane="pmo", goal="plan the work")
-        # Names the lane as REAL, gives the exact runner command, forbids dropping.
-        assert "real specialist lane" in out.lower()
-        assert "dd-telegram-visible-lane-run" in out
-        assert "--lane pmo" in out
-        assert "not" in out.lower() and "drop" in out.lower()
-        # Did NOT invoke the Slack wrapper.
-        assert not fake_tree["argv_log"].exists()
+        # Routes the real Telegram-only lane directly through the sanctioned
+        # Telegram wrapper, instead of telling P1 to hand-shell it.
+        assert "HANDOFF OK" in out
+        assert "[pmo] PASS" in out
+        assert "dd-telegram-visible-lane-run" not in out  # no manual shell hint
+        assert not fake_tree["argv_log"].exists()  # Did NOT invoke the Slack wrapper.
+        argv = fake_tree["telegram_argv_log"].read_text(encoding="utf-8").splitlines()
+        assert "--lane" in argv and argv[argv.index("--lane") + 1] == "pmo"
+        assert "--packet" in argv
 
     def test_telegram_only_lane_when_runner_unreachable_still_loud(self, fake_tree, monkeypatch):
         self._with_telegram_targets(fake_tree, monkeypatch, runner_exists=False)
         out = r2l.route_to_lane(lane="architecture", goal="review")
-        assert "real specialist lane" in out.lower()
+        assert "telegram-only specialist lane" in out.lower()
         # No silent drop even when the runner can't be reached from this surface.
         assert "not reachable" in out.lower() or "could not be reached" in out.lower()
         assert "drop" in out.lower()

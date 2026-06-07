@@ -269,49 +269,38 @@ def route_to_lane(
     if not lane:
         return tool_error("route_to_lane: 'lane' is required (e.g. qa, design, engineering).")
     known = _known_lanes()
+    all_lanes = _all_lanes()
+    telegram_only = [l for l in all_lanes if l not in known]
+    wrapper = _WRAPPER
+    transport = "Slack"
     if known and lane not in known:
-        # G2 (P5 review): a LOUD, actionable failure — never a silent drop.
-        # Distinguish two cases so P1 (and the human reading the turn) can act:
-        #   (a) the lane is a REAL specialist lane but not Slack-backed → it must
-        #       run on the Telegram transport; emit the exact runner command.
-        #   (b) the lane is not in any registry → a true typo/unknown lane.
-        # Real-flow bug this fixes: P1 hit "unknown lane 'pmo'" and, seeing only
-        # the 3 Slack lanes, abandoned the PMO step and folded it into
-        # engineering (session L22/L23). Naming the real lane + its runner makes
-        # dropping the step the obviously-wrong move instead of the easy one.
-        all_lanes = _all_lanes()
-        telegram_only = [l for l in all_lanes if l not in known]
-        runner_available = _TELEGRAM_RUNNER.exists() and os.access(_TELEGRAM_RUNNER, os.X_OK)
+        # P1-ORCH-1: real-but-Telegram-only lanes (pmo/product/architecture/devops/...)
+        # are first-class route_to_lane targets now. The old behavior returned an
+        # actionable shell command, but that still pushed P1 into hand-shelling; in
+        # practice it hit permission/context issues and, worse, the finished run was
+        # often reaped as an orphan with no caller session/wake metadata. Route them
+        # through the sanctioned Telegram wrapper here so we can pass WTS and register
+        # PENDING runs with the same reaper spine as Slack lanes.
         if lane in telegram_only:
-            runner_hint = (
-                f"Run it on the Telegram transport instead:\n"
-                f"    {_TELEGRAM_RUNNER} --lane {lane} --packet <packet.md> [--wts-task <id>]\n"
-                f"(First bind a WTS task with `dd-wts-bind` on a governance/Telegram "
-                f"turn, then pass its id as --wts-task so REQUEST+RESPONSE land on ONE "
-                f"task — see p1-specialists.md.)"
-            )
-            if not runner_available:
-                runner_hint = (
-                    f"The Telegram runner ({_TELEGRAM_RUNNER}) is NOT reachable from "
-                    f"this surface — do NOT silently drop this step; surface the blocker "
-                    f"to the user (the '{lane}' lane could not be reached)."
+            if not (_TELEGRAM_RUNNER.exists() and os.access(_TELEGRAM_RUNNER, os.X_OK)):
+                return tool_error(
+                    f"route_to_lane: lane '{lane}' is a REAL Telegram-only specialist "
+                    f"lane, but the Telegram runner ({_TELEGRAM_RUNNER}) is not "
+                    f"reachable/executable from this surface. Do NOT silently drop this "
+                    f"step; surface the blocker to the user."
                 )
+            wrapper = _TELEGRAM_RUNNER
+            transport = "Telegram"
+        else:
             return tool_error(
-                f"route_to_lane: lane '{lane}' is a REAL specialist lane but is NOT "
-                f"Slack-backed, so route_to_lane cannot reach it. This is NOT a reason "
-                f"to drop the step or fold it into another lane. {runner_hint}\n"
+                f"route_to_lane: unknown lane '{lane}' — it is not in ANY lane registry "
+                f"(typo?). Do NOT silently drop this step; pick a real lane or tell the "
+                f"user the requested lane does not exist.\n"
                 f"route_to_lane-able lanes (Slack): {', '.join(known)}.\n"
-                f"Telegram-only lanes: {', '.join(telegram_only) or '(none)'}."
+                f"Telegram-only lanes: {', '.join(telegram_only) or '(none)'}.",
             )
-        return tool_error(
-            f"route_to_lane: unknown lane '{lane}' — it is not in ANY lane registry "
-            f"(typo?). Do NOT silently drop this step; pick a real lane or tell the "
-            f"user the requested lane does not exist.\n"
-            f"route_to_lane-able lanes (Slack): {', '.join(known)}.\n"
-            f"All specialist lanes: {', '.join(all_lanes) or ', '.join(known)}."
-        )
 
-    # WS8 §4 / P-D §G7 (the active-task FEED): when the caller did not pass
+    # WS8 §4 / P-D §G7
     # wts_task, DEFAULT it to the thread's bound id carried into the turn from the
     # Slack anchor (dd-slack-service stamps X-DD-WTS-Task-Id → the gateway exposes
     # it as parent_agent._dd_wts_task_id). This means every handoff+result carries
@@ -340,8 +329,10 @@ def route_to_lane(
             return tool_error("route_to_lane: provide 'goal' (or an explicit 'packet' path).")
         packet_path = _write_packet(lane, goal, context, wts_task)
 
-    # I1: build the CORRECT invocation — flags, never positional.
-    cmd = [str(_WRAPPER), "--lane", lane, "--packet", str(packet_path)]
+    # I1: build the CORRECT invocation — flags, never positional. Slack-backed
+    # lanes use dd-visible-lane-run; Telegram-only lanes use
+    # dd-telegram-visible-lane-run, but both preserve the same WTS + reaper spine.
+    cmd = [str(wrapper), "--lane", lane, "--packet", str(packet_path)]
     if wts_task and wts_task.strip():
         cmd += ["--wts-task", wts_task.strip()]
 
