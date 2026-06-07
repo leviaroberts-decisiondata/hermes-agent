@@ -1636,6 +1636,78 @@ class TestCodexAdapterReasoningTranslation:
         assert "reasoning" not in captured
 
 
+class TestCodexAdapterNoneOutputRecovery:
+    """Regression coverage for OpenAI SDK/Codex streams whose final envelope has output=None."""
+
+    @staticmethod
+    def _adapter_with_stream(events, final):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        class _FakeStream:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def __iter__(self): return iter(events)
+            def get_final_response(self): return final
+
+        real_client = MagicMock()
+        real_client.responses.stream = lambda **kwargs: _FakeStream()
+        return _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
+
+    def test_backfills_none_final_output_from_output_item_done(self):
+        from types import SimpleNamespace
+
+        item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="recovered from item")],
+        )
+        events = [SimpleNamespace(type="response.output_item.done", item=item)]
+        final = SimpleNamespace(output=None, usage=None)
+        adapter = self._adapter_with_stream(events, final)
+
+        response = adapter.create(messages=[{"role": "user", "content": "hi"}])
+
+        assert response.choices[0].message.content == "recovered from item"
+        assert final.output == [item]
+
+    def test_synthesizes_none_final_output_from_text_deltas(self):
+        from types import SimpleNamespace
+
+        events = [
+            SimpleNamespace(type="response.output_text.delta", delta="hello "),
+            SimpleNamespace(type="response.output_text.delta", delta="world"),
+        ]
+        final = SimpleNamespace(output=None, usage=None)
+        adapter = self._adapter_with_stream(events, final)
+
+        response = adapter.create(messages=[{"role": "user", "content": "hi"}])
+
+        assert response.choices[0].message.content == "hello world"
+
+    def test_warns_when_none_final_output_has_no_recoverable_stream_content(self, caplog):
+        from types import SimpleNamespace
+
+        final = SimpleNamespace(output=None, usage=None)
+        adapter = self._adapter_with_stream([], final)
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            response = adapter.create(messages=[{"role": "user", "content": "hi"}])
+
+        assert response.choices[0].message.content is None
+        assert "final response had no output and no streamed text deltas" in caplog.text
+
+
+def test_openai_parse_response_none_output_patch_is_lazy_and_patches_streaming_reexport():
+    from agent import auxiliary_client
+
+    auxiliary_client._patch_openai_parse_response_none_output()
+
+    from openai.lib._parsing import _responses as parsing_responses
+    from openai.lib.streaming.responses import _responses as streaming_responses
+
+    assert getattr(parsing_responses, "_hermes_none_output_patched", False) is True
+    assert parsing_responses.parse_response is streaming_responses.parse_response
+    assert hasattr(parsing_responses.parse_response, "_hermes_original_parse_response")
+
 
 class TestVisionAutoSkipsKimiCoding:
     """_resolve_auto vision branch skips providers that have no vision on

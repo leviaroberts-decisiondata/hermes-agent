@@ -68,6 +68,7 @@ def _load_openai_cls() -> type:
     global _OPENAI_CLS_CACHE
     if _OPENAI_CLS_CACHE is None:
         from openai import OpenAI as _cls
+        _patch_openai_parse_response_none_output()
         _OPENAI_CLS_CACHE = _cls
     return _OPENAI_CLS_CACHE
 
@@ -99,6 +100,57 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
+
+
+# Monkey-patch openai SDK to tolerate `response.output = None` on the
+# `response.completed` SSE event. Codex's Responses backend occasionally returns
+# a completed envelope with output=None (especially on vision_analyze calls),
+# and openai>=2.32.0 iterates `response.output` unguarded in
+# openai.lib._parsing._responses.parse_response (line 61), raising
+# TypeError: 'NoneType' object is not iterable. That kills the stream before
+# our backfill at _CodexCompletionsAdapter.create() can recover from empty
+# output. Coerce None -> [] so parse_response succeeds and our existing
+# get_final_response() backfill path can synthesize content from streamed
+# deltas. Applied once per process; idempotent. Called from _load_openai_cls()
+# to preserve this module's lazy OpenAI import behavior.
+def _patch_openai_parse_response_none_output() -> None:
+    try:
+        from openai.lib._parsing import _responses as _openai_parsing_responses
+    except Exception as exc:  # SDK layout changed -> warn but do not crash
+        logger.warning(
+            "Could not apply openai parse_response None-output patch: %s", exc
+        )
+        return
+    if getattr(_openai_parsing_responses, "_hermes_none_output_patched", False):
+        return
+    _original_parse_response = _openai_parsing_responses.parse_response
+
+    def _patched_parse_response(*args, **kwargs):
+        response = kwargs.get("response")
+        if response is not None and getattr(response, "output", "MISSING") is None:
+            try:
+                response.output = []
+            except Exception:
+                logger.debug(
+                    "OpenAI parse_response None-output guard could not mutate response",
+                    exc_info=True,
+                )
+        return _original_parse_response(*args, **kwargs)
+
+    _patched_parse_response._hermes_original_parse_response = _original_parse_response  # type: ignore[attr-defined]
+    _openai_parsing_responses.parse_response = _patched_parse_response
+    # Also patch the symbol re-exported into the streaming module so the
+    # call site at streaming/responses/_responses.py:360 picks it up.
+    try:
+        from openai.lib.streaming.responses import _responses as _streaming_responses
+        _streaming_responses.parse_response = _patched_parse_response
+    except Exception:
+        logger.debug(
+            "Could not patch openai streaming parse_response re-export",
+            exc_info=True,
+        )
+    _openai_parsing_responses._hermes_none_output_patched = True
+    logger.info("Applied openai parse_response None-output guard for Codex Responses API")
 
 
 def _extract_url_query_params(url: str):
@@ -545,9 +597,12 @@ class _CodexCompletionsAdapter:
                         has_function_calls = True
                 final = stream.get_final_response()
 
-            # Backfill empty output from collected stream events
+            # Backfill empty or None output from collected stream events. The
+            # SDK patch above coerces `None` to [] before get_final_response(),
+            # but keep this guard local too so mocked/raw streams and future SDK
+            # layouts still recover instead of silently returning no content.
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+            if _output is None or (isinstance(_output, list) and not _output):
                 if collected_output_items:
                     final.output = list(collected_output_items)
                     logger.debug(
@@ -566,6 +621,11 @@ class _CodexCompletionsAdapter:
                     logger.debug(
                         "Codex auxiliary: synthesized from %d deltas (%d chars)",
                         len(collected_text_deltas), len(assembled),
+                    )
+                elif not has_function_calls:
+                    final.output = []
+                    logger.warning(
+                        "Codex auxiliary: final response had no output and no streamed text deltas; returning empty content"
                     )
 
             # Extract text and tool calls from the Responses output.
