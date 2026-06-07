@@ -2586,6 +2586,158 @@ class TestSessionIdHeader:
 
 
 # ---------------------------------------------------------------------------
+# V0 strict resume: a fabricated X-Hermes-Session-Id FAILS (default OFF)
+# ---------------------------------------------------------------------------
+class TestStrictResume:
+    """When strict_resume is enabled, resuming a session that does not exist
+    returns 404 instead of silently starting fresh. Default (off) is unchanged.
+    """
+
+    def _strict_adapter(self):
+        config = PlatformConfig(enabled=True, extra={"key": "sk-secret", "strict_resume": True})
+        return APIServerAdapter(config)
+
+    @pytest.mark.asyncio
+    async def test_default_off_unknown_session_starts_fresh(self, auth_adapter):
+        """Default (strict OFF): an unknown session id loads empty history and
+        proceeds with 200 — byte-identical to pre-V0 behavior."""
+        assert auth_adapter._strict_resume is False
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = None  # unknown session
+        mock_db.resolve_resume_session_id.return_value = "ghost"
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "OK", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "ghost", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_strict_on_unknown_session_returns_404(self):
+        """Strict ON: a fabricated session id is rejected with 404 and the agent
+        is never invoked."""
+        adapter = self._strict_adapter()
+        assert adapter._strict_resume is True
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = None  # fabricated id
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "fabricated-xyz", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                )
+            assert resp.status == 404
+            body = await resp.json()
+            assert "fabricated-xyz" in body["error"]["message"]
+            mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_strict_on_known_session_resumes(self):
+        """Strict ON: a real session still resumes (history loaded, 200)."""
+        adapter = self._strict_adapter()
+        db_history = [
+            {"role": "user", "content": "stored 1"},
+            {"role": "assistant", "content": "reply 1"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "real-session"}  # exists
+        mock_db.resolve_resume_session_id.return_value = "real-session"
+        mock_db.get_messages_as_conversation.return_value = db_history
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "OK", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "real-session", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Continue"}]},
+                )
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["conversation_history"] == db_history
+            assert resp.headers.get("X-Hermes-Session-Id") == "real-session"
+
+    @pytest.mark.asyncio
+    async def test_resume_reconstructs_tool_history_same_session(self):
+        """V0 acceptance (gateway half): resuming session X reconstructs the
+        prior TOOL history into the agent turn and echoes the SAME id back —
+        not a fresh api-<hash> session. This is what 'reconstructed tool history
+        present' means at the gateway boundary the dispatcher forwards through.
+        """
+        adapter = self._strict_adapter()
+        # A transcript that includes a tool call + tool result, exactly the shape
+        # get_messages_as_conversation reconstructs for a resumed agent.
+        tool_history = [
+            {"role": "user", "content": "what's 2+2"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "calc", "arguments": "{\"x\":\"2+2\"}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "tool_name": "calc", "content": "4"},
+            {"role": "assistant", "content": "4"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "real-X"}
+        mock_db.resolve_resume_session_id.return_value = "real-X"
+        mock_db.get_messages_as_conversation.return_value = tool_history
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "8", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "real-X", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent",
+                          "messages": [{"role": "user", "content": "now double it"}]},
+                )
+            assert resp.status == 200
+            ch = mock_run.call_args.kwargs["conversation_history"]
+            # Tool history is present and reconstructed verbatim (not from request body).
+            assert ch == tool_history
+            assert any(m["role"] == "tool" for m in ch), "tool history was not reconstructed"
+            assert any(m.get("tool_calls") for m in ch), "tool_calls were not reconstructed"
+            # Same session resumed — not a fresh derived api-<hash> id.
+            echoed = resp.headers.get("X-Hermes-Session-Id")
+            assert echoed == "real-X"
+            assert not echoed.startswith("api-")
+
+    @pytest.mark.asyncio
+    async def test_strict_db_error_allows_through(self):
+        """Strict ON but the existence check raises: do NOT 404 on infra trouble —
+        fall through to the best-effort load path (200, empty history)."""
+        adapter = self._strict_adapter()
+        mock_db = MagicMock()
+        mock_db.get_session.side_effect = Exception("db down")
+        mock_db.resolve_resume_session_id.return_value = "x"
+        mock_db.get_messages_as_conversation.return_value = []
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "OK", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "x", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                )
+            assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
 # Per-request + config reasoning_effort resolution (_create_agent precedence)
 # ---------------------------------------------------------------------------
 class TestReasoningEffortResolution:

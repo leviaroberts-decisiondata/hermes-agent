@@ -641,6 +641,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    caller_origin: str = "",
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -678,6 +679,7 @@ def handle_function_call(
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
+                    caller_origin=caller_origin or "",
                 )
             except Exception:
                 pass
@@ -721,10 +723,15 @@ def handle_function_call(
             # Prefer the caller-provided list so subagents can't overwrite
             # the parent's tool set via the process-global.
             sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
+            # Thread the per-turn caller origin into the sandbox so nested tool
+            # dispatches (the RPC loop re-enters handle_function_call) carry it
+            # to the guard — otherwise a System B execute_code could launder a
+            # nested dd-lane-run through with empty (=System A) origin.
             result = registry.dispatch(
                 function_name, function_args,
                 task_id=task_id,
                 enabled_tools=sandbox_enabled,
+                caller_origin=caller_origin or "",
             )
         else:
             result = registry.dispatch(

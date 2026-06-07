@@ -248,6 +248,18 @@ def _normalize_multimodal_content(content: Any) -> Any:
     return normalized_parts
 
 
+def _as_bool(value: Any) -> bool:
+    """Parse a config/env flag into a bool using the established truthy set.
+
+    Accepts the same tokens used elsewhere in this module (``1/true/yes/on``,
+    case-insensitive). Anything else — including None and the empty string —
+    is False, so an unset flag stays OFF.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _content_has_visible_payload(content: Any) -> bool:
     """True when content has any text or image attachment.  Used to reject empty turns."""
     if isinstance(content, str):
@@ -609,6 +621,14 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+        )
+        # V0 strict resume (default OFF): when enabled, an X-Hermes-Session-Id
+        # naming a session that does not exist is rejected with 404 instead of
+        # silently starting a fresh conversation. Off → byte-identical to today
+        # (a fabricated id loads empty history and proceeds). Opt-in via config
+        # `platforms.api_server.strict_resume` or env HERMES_STRICT_RESUME.
+        self._strict_resume: bool = _as_bool(
+            extra.get("strict_resume", os.getenv("HERMES_STRICT_RESUME", "")),
         )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -1081,6 +1101,33 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
+            # V0 strict resume (default OFF): reject a session id that does not
+            # exist instead of silently starting fresh. This is what makes the
+            # "a fabricated id FAILS" contract reachable for callers that resume
+            # through the dispatcher. Only enforced when self._strict_resume is
+            # set; otherwise behavior is unchanged (empty history → fresh turn).
+            # A DB error here is non-fatal: we fall through to the normal
+            # best-effort load path rather than 404'ing on infra trouble.
+            if self._strict_resume:
+                try:
+                    _db = self._ensure_session_db()
+                    if _db is not None and _db.get_session(session_id) is None:
+                        logger.info(
+                            "Strict resume: rejecting unknown session id %s", session_id
+                        )
+                        return web.json_response(
+                            _openai_error(
+                                f"Unknown session id: {session_id}. "
+                                "Strict resume is enabled and this session does not exist.",
+                                err_type="invalid_request_error",
+                            ),
+                            status=404,
+                        )
+                except Exception as e:  # pragma: no cover - infra failure path
+                    logger.warning(
+                        "Strict resume existence check failed for %s (allowing): %s",
+                        session_id, e,
+                    )
             try:
                 db = self._ensure_session_db()
                 if db is not None:

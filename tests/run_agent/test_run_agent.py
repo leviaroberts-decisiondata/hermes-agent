@@ -758,6 +758,10 @@ class TestInit:
                 base_url="https://openrouter.ai/api/v1",
                 quiet_mode=True,
                 skip_context_files=True,
+                # load_soul_identity=True so this is NOT a P2 delivery build —
+                # otherwise the System A/B boundary strips "terminal" (see
+                # test_delivery_identity.py). Here we only assert name population.
+                load_soul_identity=True,
                 skip_memory=True,
             )
             assert a.valid_tool_names == {"web_search", "terminal"}
