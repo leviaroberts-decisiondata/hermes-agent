@@ -2864,6 +2864,14 @@ class GatewayRunner:
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
 
+        # Start the lane-result ACTIVE WAKE drain (WTS 331b65f8). A detached lane
+        # run reaped by dd-lane-reaper enqueues a wake event onto a durable file
+        # queue; this drain injects it as a real internal MessageEvent so P1
+        # continues the workflow autonomously (separate from the passive transcript
+        # mirror). Flag-gated by DD_LANE_WAKE_ENABLED (default on) so it can be
+        # turned off without code changes.
+        asyncio.create_task(self._drain_lane_wake_queue())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -9310,6 +9318,109 @@ class GatewayRunner:
             await adapter.handle_message(synth_event)
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+
+    async def _drain_lane_wake_queue(self, interval: float = 5.0) -> None:
+        """Standing drain for the lane-result ACTIVE WAKE queue (WTS 331b65f8).
+
+        A detached specialist-lane run, once reaped by ``dd-lane-reaper`` (or
+        advanced by ``dd-chain-driver``), enqueues a small JSON wake event onto
+        ``$HERMES_HOME/dd-lanes/wake-queue/`` via ``gateway.lane_wake``. This task
+        consumes the queue and injects each event as a REAL internal
+        ``MessageEvent(internal=True)`` — the SAME proven wake path used by the
+        in-process background-process watcher (``_inject_watch_notification``) —
+        so P1 starts a continuation turn autonomously, with no user message.
+
+        This is the ACTIVE half of the bridge and is deliberately kept SEPARATE
+        from the passive transcript mirror (``gateway.mirror.mirror_to_session``),
+        which still fires unchanged on the producer side. Idempotency lives in
+        ``lane_wake`` (a durable per-key processed marker), so a reaper re-run or a
+        duplicate enqueue never double-wakes P1 → never double-dispatches QA or
+        double-closes. Flag-gated by ``DD_LANE_WAKE_ENABLED`` (default on); when
+        off, the drain idles without consuming so events are not silently dropped.
+        Fail-soft throughout: a drain error never kills the loop or the gateway.
+        """
+        try:
+            from gateway import lane_wake
+        except Exception as exc:
+            logger.warning("lane-wake drain unavailable (import failed): %s", exc)
+            return
+
+        await asyncio.sleep(45)  # initial delay — let adapters finish connecting
+        logger.info("Lane-wake drain started (interval=%.0fs)", interval)
+        while self._running:
+            try:
+                if not lane_wake.wake_enabled():
+                    # OFF switch: idle WITHOUT consuming, so flipping it back on
+                    # processes anything that queued while it was off.
+                    await asyncio.sleep(interval)
+                    continue
+                for event in lane_wake.list_pending_events():
+                    key = event.get("idempotency_key") or ""
+                    # Consumer-side idempotency: skip a key already injected.
+                    if key and lane_wake.already_processed(key):
+                        lane_wake.mark_processed(event, outcome="already-processed")
+                        continue
+                    source = self._build_process_event_source(event)
+                    if not source:
+                        logger.warning(
+                            "Lane-wake: dropping event with no routing metadata "
+                            "(run=%s wts=%s)",
+                            event.get("run_id"), event.get("wts_task"),
+                        )
+                        lane_wake.mark_processed(event, outcome="dropped-no-routing")
+                        continue
+                    platform_name = (
+                        source.platform.value
+                        if hasattr(source.platform, "value")
+                        else str(source.platform)
+                    )
+                    adapter = None
+                    for p, a in self.adapters.items():
+                        if p.value == platform_name:
+                            adapter = a
+                            break
+                    if not adapter:
+                        # No adapter for this platform on THIS gateway — leave the
+                        # event queued (do NOT mark processed); another gateway /
+                        # a later connect may own it. Avoid a hot loop on it.
+                        logger.debug(
+                            "Lane-wake: no adapter for platform=%s; leaving event queued",
+                            platform_name,
+                        )
+                        continue
+                    synth_text = event.get("prompt") or lane_wake.build_continuation_prompt(
+                        wts_task=event.get("wts_task"),
+                        lane=event.get("lane") or "lane",
+                        gate=event.get("gate") or "",
+                        run_dir=event.get("run_dir") or "",
+                        result_relation=event.get("result_relation"),
+                        result_file=event.get("result_file"),
+                        result_sha=event.get("result_sha"),
+                    )
+                    try:
+                        synth_event = MessageEvent(
+                            text=synth_text,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            internal=True,
+                        )
+                        logger.info(
+                            "Lane-wake: injecting continuation for %s chat=%s "
+                            "lane=%s gate=%s wts=%s run=%s",
+                            platform_name, source.chat_id,
+                            event.get("lane"), event.get("gate"),
+                            event.get("wts_task"), event.get("run_id"),
+                        )
+                        # Mark processed BEFORE injecting so a crash mid-turn cannot
+                        # cause a re-inject loop (at-most-once wake; the result is
+                        # already durable in WTS + the transcript mirror).
+                        lane_wake.mark_processed(event, outcome="injected")
+                        await adapter.handle_message(synth_event)
+                    except Exception as inj_exc:
+                        logger.error("Lane-wake injection error: %s", inj_exc)
+            except Exception as loop_exc:
+                logger.error("Lane-wake drain loop error: %s", loop_exc)
+            await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """

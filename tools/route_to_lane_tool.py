@@ -115,7 +115,7 @@ def _parse_session_origin(session_key: str) -> "dict | None":
     return None
 
 
-def _register_pending_with_reaper(out: str, parent_agent) -> str:
+def _register_pending_with_reaper(out: str, parent_agent, wts_task: Optional[str] = None) -> str:
     """P-C / B-1a: register a detached PENDING run with the openclaw reaper.
 
     The reaper (a standalone launchd agent) returns the lane's real closeout to
@@ -123,6 +123,15 @@ def _register_pending_with_reaper(out: str, parent_agent) -> str:
     it the run_dir (surfaced on the wrapper's PENDING status line as
     ``run_dir=<path>``) plus the caller's session routing (parsed from
     ``parent_agent._dd_session_key``) so it knows where to deliver the result.
+
+    We ALSO pass the resolved ``wts_task`` as the reaper's 8th --register arg so
+    the reaper attaches the FINAL detached stdout result to that WTS task on reap
+    (WTS 331b65f8 req 3/4). Without it the reaper registers wts_task=None and the
+    final result attach is skipped — leaving only the synchronous-path PENDING
+    placeholder on the task. The reaper's --register positional order is:
+    ``run_dir session_key platform chat_id chat_type [thread_id] [budget] [wts_task]``
+    so thread_id and budget MUST be present (even if empty/default) for wts_task
+    to land in the right slot.
 
     Best-effort and fail-soft: a registration failure NEVER changes the PENDING
     result the caller sees (the run still survives and is pollable). Returns a
@@ -150,17 +159,26 @@ def _register_pending_with_reaper(out: str, parent_agent) -> str:
         # We can still register the run for mirror-only return, but without a
         # caller session the re-inject (P1 reconciliation) cannot target a session.
         return "reaper-registration: skipped (no parseable caller session_key)"
+    # Positional order matters: thread_id (slot 6) and budget (slot 7) MUST be
+    # present so wts_task lands in slot 8. We pass an empty budget token ("") which
+    # the reaper coerces to its DEFAULT_BUDGET_SECS — the empty string is a valid
+    # "use default" sentinel, not a missing arg.
+    wts = (wts_task or "").strip()
     cmd = [
         str(_REAPER), "--register", run_dir, session_key,
         origin["platform"], origin["chat_id"], origin["chat_type"],
         origin.get("thread_id", "") or "",
+        "",          # budget → reaper default
+        wts,         # wts_task → reaper attaches the final result MD to it on reap
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except Exception as exc:
         return f"reaper-registration: FAILED to invoke ({type(exc).__name__})"
     if proc.returncode == 0:
-        return f"reaper-registration: OK (run will return its closeout to this session; run_dir={run_dir})"
+        wts_note = f"; wts_task={wts}" if wts else "; wts_task=none (no final WTS attach)"
+        return (f"reaper-registration: OK (run will return its closeout to this "
+                f"session; run_dir={run_dir}{wts_note})")
     return f"reaper-registration: FAILED (exit={proc.returncode})"
 
 
@@ -387,7 +405,9 @@ def route_to_lane(
     if code == _WRAPPER_PENDING_CODE:
         # P-C / B-1a: register the detached run with the reaper so its real
         # closeout returns to THIS session automatically (zero user follow-up).
-        reaper_note = _register_pending_with_reaper(out, parent_agent)
+        # Pass the resolved wts_task so the reaper attaches the FINAL result to the
+        # bound task on reap (WTS 331b65f8 req 3/4) — not just the sync PENDING.
+        reaper_note = _register_pending_with_reaper(out, parent_agent, wts_task)
         return tool_error(
             f"HANDOFF PENDING — the '{lane}' lane started and is still running "
             f"(detached). You do NOT need to poll: the result-return reaper will "

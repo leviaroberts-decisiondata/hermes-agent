@@ -1,0 +1,265 @@
+"""Tests for the lane-result ACTIVE WAKE bridge (WTS 331b65f8).
+
+Covers the two halves of the bridge plus the policy contract:
+  * emit side (gateway.lane_wake.emit_wake_event): enqueue, idempotency (writer +
+    consumer markers), flag gate, no-routing skip, atomic queue file.
+  * drain side dedupe logic (already_processed / mark_processed).
+  * the structured P1 continuation prompt FORBIDS unauthorized deploy/canary/
+    restart/push/merge (req 5).
+  * the CLI emit path used by the bash producers (dd-lane-reaper).
+
+These are pure-filesystem unit tests — no gateway process, no network. The drain
+*method* itself (GatewayRunner._drain_lane_wake_queue) is exercised at the unit
+level via its idempotency primitives; an end-to-end inject is proven by the live
+canary, not here (it needs a running gateway + adapter).
+"""
+
+import json
+import os
+import importlib
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture()
+def wake(tmp_path, monkeypatch):
+    """Fresh lane_wake bound to an isolated HERMES_HOME, wake ENABLED."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DD_LANE_WAKE_ENABLED", "1")
+    from gateway import lane_wake
+    importlib.reload(lane_wake)
+    return lane_wake
+
+
+def _mk_run_dir(tmp_path, run_id="20260606-141249-78059", body="[engineering] PASS | ok | done\n"):
+    rd = Path(tmp_path) / "dd-lanes" / "engineering" / "runs" / run_id
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "stdout.log").write_text(body, encoding="utf-8")
+    return rd
+
+
+def _emit(wake, rd, **over):
+    kw = dict(
+        run_dir=str(rd), lane="engineering", gate="PASS",
+        session_key="agent:main:telegram:dm:8737984752",
+        platform="telegram", chat_id="8737984752", chat_type="dm",
+        wts_task="331b65f8-39e1-4523-b52d-19fd4461fb52",
+    )
+    kw.update(over)
+    return wake.emit_wake_event(**kw)
+
+
+def test_emit_enqueues_one_event(wake, tmp_path):
+    rd = _mk_run_dir(tmp_path)
+    token = _emit(wake, rd)
+    assert token.startswith("emitted("), token
+    pending = wake.list_pending_events()
+    assert len(pending) == 1
+    ev = pending[0]
+    assert ev["schema"] == "lane-wake/1"
+    assert ev["lane"] == "engineering"
+    assert ev["gate"] == "PASS"
+    assert ev["wts_task"] == "331b65f8-39e1-4523-b52d-19fd4461fb52"
+    assert ev["platform"] == "telegram"
+    assert ev["chat_id"] == "8737984752"
+    # the prompt is precomputed and carries the continuation contract
+    assert "[LANE RESULT RETURNED — CONTINUE WORKFLOW]" in ev["prompt"]
+
+
+def test_emit_is_idempotent_writer_side(wake, tmp_path):
+    """A second emit for the SAME (run, wts, kind) is refused before drain runs."""
+    rd = _mk_run_dir(tmp_path)
+    t1 = _emit(wake, rd)
+    t2 = _emit(wake, rd)
+    assert t1.startswith("emitted(")
+    assert t2.startswith("skipped(dup:"), t2
+    assert len(wake.list_pending_events()) == 1
+
+
+def test_emit_refused_after_processed(wake, tmp_path):
+    """Once an event is marked processed (consumer side), re-emit is refused —
+    this is what stops a reaper re-run from double-waking P1."""
+    rd = _mk_run_dir(tmp_path)
+    _emit(wake, rd)
+    ev = wake.list_pending_events()[0]
+    wake.mark_processed(ev, outcome="injected")
+    # queue is now empty and the processed marker exists
+    assert wake.list_pending_events() == []
+    assert wake.already_processed(ev["idempotency_key"]) is True
+    # a duplicate reap tries to emit again → refused as already processed
+    t = _emit(wake, rd)
+    assert t.startswith("skipped(processed:"), t
+
+
+def test_distinct_runs_are_not_deduped(wake, tmp_path):
+    rd1 = _mk_run_dir(tmp_path, run_id="run-aaa")
+    rd2 = _mk_run_dir(tmp_path, run_id="run-bbb")
+    assert _emit(wake, rd1).startswith("emitted(")
+    assert _emit(wake, rd2).startswith("emitted(")
+    assert len(wake.list_pending_events()) == 2
+
+
+def test_flag_off_skips_emit(wake, tmp_path, monkeypatch):
+    monkeypatch.setenv("DD_LANE_WAKE_ENABLED", "0")
+    rd = _mk_run_dir(tmp_path)
+    t = _emit(wake, rd)
+    assert t == "skipped(disabled)"
+    assert wake.list_pending_events() == []
+
+
+def test_no_routing_skips(wake, tmp_path):
+    rd = _mk_run_dir(tmp_path)
+    t = _emit(wake, rd, session_key="", platform="", chat_id="")
+    assert t == "skipped(no-routing)"
+    assert wake.list_pending_events() == []
+
+
+def test_continuation_prompt_forbids_unauthorized_actions(wake):
+    p = wake.build_continuation_prompt(
+        wts_task="abc", lane="qa", gate="PASS",
+        run_dir="/x/runs/run-1", result_file="lane-result-run-1.md",
+    )
+    low = p.lower()
+    # governor framing + the explicit safety prohibitions (req 5)
+    assert "workflow governor" in low
+    for forbidden in ("slack canary", "deploy", "restart", "push", "merge"):
+        assert forbidden in low, f"missing prohibition: {forbidden}"
+    assert "do not" in low
+    # the three decision options must be present
+    assert "route the next lane" in low
+    assert "hold for authorization" in low
+    assert "final synthesis" in low
+
+
+def test_missing_wts_prompt_says_hold(wake):
+    p = wake.build_continuation_prompt(wts_task=None, lane="qa", gate="PASS", run_dir="/x/runs/r")
+    assert "WTS is unknown/missing" in p
+    assert "HOLD" in p
+
+
+def test_idempotency_key_is_stable(wake):
+    k1 = wake.make_idempotency_key(run_id="r1", wts_task="t1", kind="lane-result")
+    k2 = wake.make_idempotency_key(run_id="r1", wts_task="t1", kind="lane-result")
+    k3 = wake.make_idempotency_key(run_id="r1", wts_task="t2", kind="lane-result")
+    assert k1 == k2
+    assert k1 != k3
+    assert k1 == "lane-result:r1:t1:lane-result"
+
+
+def test_cli_emit_and_list(wake, tmp_path, capsys):
+    """The bash producers shell `python -m gateway.lane_wake --emit ...`; prove the
+    CLI enqueues and that --list prints the event without the prompt body."""
+    rd = _mk_run_dir(tmp_path)
+    rc = wake._main([
+        "--emit", "--run-dir", str(rd), "--lane", "engineering", "--gate", "PASS",
+        "--session-key", "agent:main:telegram:dm:8737984752",
+        "--platform", "telegram", "--chat-id", "8737984752", "--chat-type", "dm",
+        "--wts-task", "task-xyz",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "emitted(" in out
+    assert len(wake.list_pending_events()) == 1
+    # --list prints JSON without the (large) prompt field
+    rc2 = wake._main(["--list"])
+    assert rc2 == 0
+    listed = capsys.readouterr().out.strip().splitlines()
+    assert len(listed) == 1
+    row = json.loads(listed[0])
+    assert "prompt" not in row
+    assert row["wts_task"] == "task-xyz"
+
+
+@pytest.mark.asyncio
+async def test_gateway_drain_injects_internal_event_once(wake, tmp_path, monkeypatch):
+    """INTEGRATION: the REAL GatewayRunner._drain_lane_wake_queue, driven against a
+    queued wake event + a mock adapter, must inject exactly one internal=True
+    MessageEvent carrying the continuation prompt, mark the event processed, and
+    NOT re-inject on the next pass (consumer-side idempotency)."""
+    import asyncio
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent
+    from gateway.session import SessionSource
+
+    # Enqueue a real wake event for a telegram DM (P1's shape).
+    rd = _mk_run_dir(tmp_path)
+    assert _emit(wake, rd).startswith("emitted(")
+
+    captured = []
+
+    class _MockAdapter:
+        async def handle_message(self, event):
+            captured.append(event)
+
+    mock_adapter = _MockAdapter()
+
+    # A minimal stand-in for `self`: only the attributes the drain touches. We bind
+    # the REAL method to it so we exercise the production code, not a copy.
+    class _StubRunner:
+        def __init__(self):
+            self._running = True
+            self.adapters = {Platform.TELEGRAM: mock_adapter}
+            self._drain_lane_wake_queue = GatewayRunner._drain_lane_wake_queue.__get__(self)
+
+        def _build_process_event_source(self, evt):
+            # Mirror the production resolver's fallback (parse platform/chat from the
+            # event) without needing a real session_store.
+            return SessionSource(
+                platform=Platform(evt["platform"]),
+                chat_id=str(evt["chat_id"]),
+                chat_type=evt.get("chat_type") or "dm",
+                thread_id=evt.get("thread_id") or None,
+            )
+
+    runner = _StubRunner()
+
+    # Skip the 45s startup delay so the test is fast.
+    monkeypatch.setattr(asyncio, "sleep", _make_fake_sleep(runner))
+
+    await runner._drain_lane_wake_queue(interval=0.01)
+
+    # Exactly one injection, internal, with the continuation prompt + telegram source.
+    assert len(captured) == 1, f"expected one injection, got {len(captured)}"
+    ev = captured[0]
+    assert ev.internal is True
+    assert ev.source.platform == Platform.TELEGRAM
+    assert ev.source.chat_id == "8737984752"
+    assert "[LANE RESULT RETURNED — CONTINUE WORKFLOW]" in ev.text
+    assert "do not" in ev.text.lower()  # the safety prohibition is in the woke prompt
+
+    # The event is marked processed and removed from the queue → no re-wake.
+    assert wake.list_pending_events() == []
+
+
+def _make_fake_sleep(runner):
+    """An async sleep stub that stops the drain loop after its first real pass.
+
+    The drain does: sleep(45) [startup], then loop { work; sleep(interval) }. We let
+    the startup sleep pass through (no-op), let the first work pass run, then flip
+    _running=False on the next sleep so the while-loop exits deterministically.
+    """
+    state = {"calls": 0}
+
+    async def _fake_sleep(secs):
+        state["calls"] += 1
+        # calls: 1 = startup delay (no-op), 2 = end of first work pass → stop.
+        if state["calls"] >= 2:
+            runner._running = False
+        return None
+
+    return _fake_sleep
+
+
+def test_malformed_event_file_does_not_wedge_drain(wake, tmp_path):
+    rd = _mk_run_dir(tmp_path)
+    _emit(wake, rd)
+    # drop a garbage file into the queue
+    bad = wake.wake_queue_dir() / "garbage.json"
+    bad.write_text("{not json", encoding="utf-8")
+    pending = wake.list_pending_events()
+    # the good event still lists; the bad file was moved aside
+    assert len(pending) == 1
+    assert not bad.exists()
+    assert (wake.wake_queue_dir() / "garbage.json.bad").exists()

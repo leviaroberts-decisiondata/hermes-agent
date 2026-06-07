@@ -457,6 +457,49 @@ class TestPCReaperRegistration:
         # The caller-facing message tells P1 the reaper will return the result.
         assert "reaper-registration: OK" in out
 
+    def test_wts_task_threaded_into_reaper_register_slot8(self, fake_tree, fake_reaper, monkeypatch):
+        # WTS 331b65f8 req 3/4: an explicit wts_task must reach the reaper's 8th
+        # --register positional so the reaper attaches the FINAL detached result to
+        # that task on reap (not just the synchronous PENDING placeholder). The
+        # reaper order is: --register run_dir session_key platform chat_id chat_type
+        # thread_id budget wts_task. thread_id (slot 6) is empty for a DM and budget
+        # (slot 7) is the empty "use default" sentinel — both MUST be present so
+        # wts_task lands in slot 8.
+        WTS = "331b65f8-39e1-4523-b52d-19fd4461fb52"
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
+        out = r2l.route_to_lane(
+            lane="qa", goal="review", wts_task=WTS,
+            parent_agent=_FakeAgent(session_key=self.SK),
+        )
+        assert "HANDOFF PENDING" in out
+        argv = self._reaper_argv(fake_reaper)
+        # positional indices: 0 --register, 1 run_dir, 2 sk, 3 plat, 4 chat, 5 ctype,
+        # 6 thread_id (empty for DM), 7 budget (empty), 8 wts_task.
+        assert argv[0] == "--register"
+        assert len(argv) >= 9, f"reaper argv too short, wts_task not threaded: {argv}"
+        assert argv[6] == "", f"slot 6 (thread_id) should be empty for a DM: {argv!r}"
+        assert argv[7] == "", f"slot 7 (budget) should be the empty default sentinel: {argv!r}"
+        assert argv[8] == WTS, f"slot 8 must be the wts_task: {argv!r}"
+        # the caller-facing note reflects that the final WTS attach is wired
+        assert f"wts_task={WTS}" in out
+
+    def test_no_wts_task_register_marks_none_and_no_final_attach(self, fake_tree, fake_reaper, monkeypatch):
+        # No bound/explicit task → slot 8 is empty and the note says so honestly,
+        # so the absence of a durable final WTS attach is VISIBLE (not silent).
+        monkeypatch.setenv("FAKE_EXIT", "75")
+        monkeypatch.setenv("FAKE_STDOUT", self.PENDING_LINE)
+        out = r2l.route_to_lane(
+            lane="qa", goal="review",
+            parent_agent=_FakeAgent(session_key=self.SK),
+        )
+        argv = self._reaper_argv(fake_reaper)
+        assert argv[0] == "--register"
+        # slot 8 present but empty (no task)
+        assert len(argv) >= 9
+        assert argv[8] == ""
+        assert "wts_task=none" in out
+
     def test_pending_without_run_dir_segment_skips_registration(self, fake_tree, fake_reaper, monkeypatch):
         # Older wrapper / no run_dir on the line → registration is skipped, but
         # the PENDING result is still returned honestly (fail-soft).
