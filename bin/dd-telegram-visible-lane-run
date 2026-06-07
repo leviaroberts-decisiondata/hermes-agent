@@ -248,9 +248,9 @@ fi
 # ── 2. Handoff ROOT Telegram message (concise) -> root mid. With a WTS task it
 #       carries the durable-record link; without one it says no record was kept. ──
 if [[ "$wts_enabled" -eq 1 ]]; then
-  root_wts_lines="Full handoff packet attached to WTS (durable record), not sent here.
-WTS task: ${tracker_url}
-file_id: ${hf_file_id}"
+  root_wts_lines="WTS: ${tracker_url}
+Handoff file: ${hf_file_id}
+Record: full handoff packet is attached to WTS, not sent here."
 else
   root_wts_lines="NOTE: no WTS task referenced and no standing lane-log task configured for '${lane}' — no durable record kept this run. Ask PMO to create one."
 fi
@@ -322,12 +322,12 @@ fi
 # ── 5. Result Telegram reply (concise), threaded to root. Carries the WTS link
 #       when a task exists; otherwise notes no durable record was kept. ──
 if [[ "$wts_enabled" -eq 1 && "$attach_failed" -eq 1 ]]; then
-  reply_wts_lines="WARN: result NOT attached to a durable WTS record (attach did not verify). The work exists, but the durable copy did not land — re-attach or check the tracker.
-WTS task: ${tracker_url}"
+  reply_wts_lines="WARN: result NOT attached to WTS (attach did not verify). Work exists, durable copy did not land.
+WTS: ${tracker_url}"
 elif [[ "$wts_enabled" -eq 1 ]]; then
-  reply_wts_lines="Full result attached to WTS (durable record), not sent here.
-WTS task: ${tracker_url}
-file_id: ${rf_file_id:-<attach-unverified>}"
+  reply_wts_lines="WTS: ${tracker_url}
+Result file: ${rf_file_id:-<attach-unverified>}
+Record: full result is attached to WTS, not sent here."
 else
   reply_wts_lines="NOTE: no WTS task — result not attached to a durable record. Ask PMO to create a task."
 fi

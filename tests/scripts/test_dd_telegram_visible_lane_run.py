@@ -25,3 +25,11 @@ def test_telegram_visible_lane_run_registers_pending_runs_with_reaper():
     assert "register_pending_with_reaper" in text
     assert '"$REAPER" --register "$rd" "$session_key"' in text
     assert 'register_pending_with_reaper "$result_file" "$run_code"' in text
+
+
+def test_telegram_visible_lane_run_message_labels_are_reviewable():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "WTS: ${tracker_url}" in text
+    assert "Handoff file: ${hf_file_id}" in text
+    assert "Result file: ${rf_file_id:-<attach-unverified>}" in text
+    assert "WTS task: ${tracker_url}" not in text
