@@ -25,6 +25,12 @@ from hermes_cli.auth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_shared_auth_env(monkeypatch):
+    """Keep Codex auth tests pinned to their temp HERMES_HOME store by default."""
+    monkeypatch.delenv("HERMES_AUTH_STORE_PATH", raising=False)
+
+
 def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):
     """Write Codex tokens into the Hermes auth store."""
     hermes_home.mkdir(parents=True, exist_ok=True)

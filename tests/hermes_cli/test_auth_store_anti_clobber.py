@@ -16,6 +16,16 @@ from hermes_cli.auth import (
     write_credential_pool,
 )
 
+import pytest
+
+# Ensure tests are hermetic and do not pick up a system-wide shared auth store.
+# Some CI/dev environments set HERMES_AUTH_STORE_PATH to a shared file; that
+# makes tests environment-sensitive. Clear it for the test module so tests
+# can assert behavior against HERMES_HOME/auth.json reliably.
+@pytest.fixture(autouse=True)
+def _clear_shared_auth_env(monkeypatch):
+    monkeypatch.delenv("HERMES_AUTH_STORE_PATH", raising=False)
+
 
 def _populated_store():
     return {
