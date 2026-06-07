@@ -3434,6 +3434,17 @@ class TestCredentialPoolRecovery:
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
 
+    def test_extract_api_error_context_parses_quota_reset_delay(self, agent, monkeypatch):
+        monkeypatch.setattr("run_agent.time.time", lambda: 1000.0)
+        error = SimpleNamespace(
+            body={"error": {"message": "rate limited quotaResetDelay: 2500ms"}},
+            response=SimpleNamespace(headers={}),
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reset_at"] == 1002.5
+
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")
         captured = {}

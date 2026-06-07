@@ -760,7 +760,12 @@ def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
 
+def _codex_refresh_lock_path() -> Path:
+    return _auth_file_path().with_suffix(".codex-refresh.lock")
+
+
 _auth_lock_holder = threading.local()
+_codex_refresh_lock_holder = threading.local()
 
 @contextmanager
 def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
@@ -819,8 +824,72 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
                 except (OSError, IOError):
                     pass
 
+@contextmanager
+def _codex_refresh_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    """Cross-process mutex for single-use Codex refresh-token rotation.
+
+    This is intentionally separate from the auth-store lock. Callers must
+    acquire this lock *before* _auth_store_lock so pool refresh and direct
+    auth refresh paths cannot deadlock while serializing the actual OAuth
+    refresh request.
+    """
+    if getattr(_codex_refresh_lock_holder, "depth", 0) > 0:
+        _codex_refresh_lock_holder.depth += 1
+        try:
+            yield
+        finally:
+            _codex_refresh_lock_holder.depth -= 1
+        return
+
+    lock_path = _codex_refresh_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fcntl is None and msvcrt is None:
+        _codex_refresh_lock_holder.depth = 1
+        try:
+            yield
+        finally:
+            _codex_refresh_lock_holder.depth = 0
+        return
+
+    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+        lock_path.write_text(" ", encoding="utf-8")
+
+    with lock_path.open("r+" if msvcrt else "a+") as lock_file:
+        deadline = time.time() + max(1.0, timeout_seconds)
+        while True:
+            try:
+                if fcntl:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except (BlockingIOError, OSError, PermissionError):
+                if time.time() >= deadline:
+                    raise TimeoutError("Timed out waiting for Codex refresh lock")
+                time.sleep(0.05)
+
+        _codex_refresh_lock_holder.depth = 1
+        try:
+            yield
+        finally:
+            _codex_refresh_lock_holder.depth = 0
+            if fcntl:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
+
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    if getattr(_auth_lock_holder, "depth", 0) <= 0:
+        with _auth_store_lock():
+            return _load_auth_store(auth_file)
+
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -865,6 +934,13 @@ def _save_auth_store(
     *,
     allow_provider_clear: bool = False,
 ) -> Path:
+    if getattr(_auth_lock_holder, "depth", 0) <= 0:
+        with _auth_store_lock():
+            return _save_auth_store(
+                auth_store,
+                allow_provider_clear=allow_provider_clear,
+            )
+
     auth_file = _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2468,19 +2544,24 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
-            data = _read_codex_tokens(_lock=False)
-            tokens = dict(data["tokens"])
-            access_token = str(tokens.get("access_token", "") or "").strip()
-
-            should_refresh = bool(force_refresh)
-            if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
-
-            if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+        # The Codex refresh token is single-use/rotating. Serialize every
+        # refresh path — direct runtime resolution and credential-pool refresh
+        # — behind the same cross-process mutex, then re-read under the auth
+        # store lock so a losing process adopts the winner's freshly-persisted
+        # tokens instead of consuming a stale refresh token.
+        with _codex_refresh_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+            with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+                data = _read_codex_tokens(_lock=False)
+                tokens = dict(data["tokens"])
                 access_token = str(tokens.get("access_token", "") or "").strip()
+
+                should_refresh = bool(force_refresh)
+                if (not should_refresh) and refresh_if_expiring:
+                    should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+
+                if should_refresh:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                    access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")

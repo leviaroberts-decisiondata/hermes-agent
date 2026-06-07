@@ -9,6 +9,11 @@ import time
 import uuid
 import re
 from dataclasses import dataclass, fields, replace
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - Windows fallback path
+    fcntl = None
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -67,10 +72,12 @@ SUPPORTED_POOL_STRATEGIES = {
 }
 
 # Cooldown before retrying an exhausted credential.
-# 429 (rate-limited) and 402 (billing/quota) both cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
-EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
+# 429s get a short half-open cooldown unless provider-supplied reset_at / Retry-After
+# metadata says otherwise. Long local self-lockouts on a single transient Codex
+# 429 make the primary model look offline even after upstream recovers.
+EXHAUSTED_TTL_429_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+CODEX_REFRESH_LOCK_TIMEOUT_SECONDS = 10.0
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -670,40 +677,38 @@ class CredentialPool:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
                 # Cross-process refresh lock to avoid concurrent refresh races
-                # on single-use Codex refresh tokens.  Acquire a dedicated
+                # on single-use Codex refresh tokens. Acquire a dedicated
                 # refresh lock file beside the auth store, re-sync the entry
                 # from auth.json after acquiring the lock (so a concurrent
                 # winner's refresh is adopted), and only refresh if still
-                # necessary.  This prevents two processes from both consuming
-                # the same refresh token and leaving one exhausted/unparseable.
-                try:
-                    from hermes_cli.auth import _auth_file_path
-                    import fcntl
-                    refresh_lock_path = _auth_file_path().with_suffix('.refresh.lock')
-                    refresh_lock_path.parent.mkdir(parents=True, exist_ok=True)
-                    # Open/create the lock file and hold an exclusive lock
-                    with refresh_lock_path.open('a+') as rl:
-                        deadline = time.time() + 10.0
-                        while True:
-                            try:
-                                fcntl.flock(rl.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                                break
-                            except (BlockingIOError, OSError):
-                                if time.time() >= deadline:
-                                    # Fallback: if we can't grab the lock promptly,
-                                    # avoid blocking forever — treat as refresh failure
-                                    raise
-                                time.sleep(0.05)
+                # necessary. If the lock cannot be acquired, do NOT fall back
+                # to an unlocked refresh: Codex refresh tokens are single-use,
+                # and unlocked fallback is exactly the race that corrupts the
+                # shared store. The outer handler marks this entry exhausted so
+                # fallback providers/pool rotation can take over safely.
+                if fcntl is None:
+                    raise RuntimeError("Codex refresh lock requires fcntl on this platform")
+                from hermes_cli.auth import _auth_file_path
+                refresh_lock_path = _auth_file_path().with_suffix('.refresh.lock')
+                refresh_lock_path.parent.mkdir(parents=True, exist_ok=True)
+                with refresh_lock_path.open('a+') as rl:
+                    deadline = time.time() + CODEX_REFRESH_LOCK_TIMEOUT_SECONDS
+                    while True:
+                        try:
+                            fcntl.flock(rl.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except (BlockingIOError, OSError) as lock_exc:
+                            if time.time() >= deadline:
+                                raise TimeoutError("Timed out waiting for Codex refresh lock") from lock_exc
+                            time.sleep(0.05)
 
+                    try:
                         # Re-sync from auth.json: if another process already
                         # refreshed, adopt its tokens instead of re-refreshing.
                         synced = self._sync_codex_entry_from_auth_store(entry)
                         if synced is not entry:
                             entry = synced
-                        # If after sync the entry no longer needs refresh, use it
                         if not self._entry_needs_refresh(entry):
-                            # release lock implicitly on context exit
-                            refreshed = None
                             updated = replace(
                                 entry,
                                 last_status=STATUS_OK,
@@ -714,7 +719,6 @@ class CredentialPool:
                                 last_error_reset_at=None,
                             )
                         else:
-                            # proceed to refresh while still holding the lock
                             refreshed = auth_mod.refresh_codex_oauth_pure(
                                 entry.access_token,
                                 entry.refresh_token,
@@ -725,26 +729,11 @@ class CredentialPool:
                                 refresh_token=refreshed["refresh_token"],
                                 last_refresh=refreshed.get("last_refresh"),
                             )
-                        # lock is released when 'with' scope exits
-                except Exception as exc:
-                    # If lock machinery fails for any reason, fall back to the
-                    # original behavior (attempt refresh) but mark as exhausted on
-                    # failure so we don't silently consume tokens.
-                    logger.debug("Codex refresh lock failed or timed out: %s", exc)
-                    try:
-                        refreshed = auth_mod.refresh_codex_oauth_pure(
-                            entry.access_token,
-                            entry.refresh_token,
-                        )
-                        updated = replace(
-                            entry,
-                            access_token=refreshed["access_token"],
-                            refresh_token=refreshed["refresh_token"],
-                            last_refresh=refreshed.get("last_refresh"),
-                        )
-                    except Exception as refresh_exc:
-                        logger.debug("Codex refresh attempt after lock failure also failed: %s", refresh_exc)
-                        raise
+                    finally:
+                        try:
+                            fcntl.flock(rl.fileno(), fcntl.LOCK_UN)
+                        except OSError:
+                            pass
             elif self.provider == "nous":
                 synced = self._sync_nous_entry_from_auth_store(entry)
                 if synced is not entry:

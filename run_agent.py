@@ -4396,7 +4396,7 @@ class AIAgent:
         if "reset_at" not in context:
             message = context.get("message") or ""
             if isinstance(message, str):
-                delay_match = re.search(r"quotaResetDelay[:\s\"]+(\\d+(?:\\.\\d+)?)(ms|s)", message, re.IGNORECASE)
+                delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
                 if delay_match:
                     value = float(delay_match.group(1))
                     seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
@@ -7882,6 +7882,24 @@ class AIAgent:
                 fb_model = normalize_model_for_provider(fb_model, fb_provider)
             except Exception:
                 pass
+            if fb_provider in {"copilot", "copilot-acp"}:
+                try:
+                    from hermes_cli.models import provider_model_ids
+
+                    supported_models = {
+                        str(model_id).strip()
+                        for model_id in provider_model_ids(fb_provider)
+                        if str(model_id).strip()
+                    }
+                except Exception:
+                    supported_models = set()
+                if supported_models and fb_model not in supported_models:
+                    logging.warning(
+                        "Skipping fallback %s via %s: model is not in provider catalog",
+                        fb_model,
+                        fb_provider,
+                    )
+                    return self._try_activate_fallback()  # try next in chain
 
             # Determine api_mode from provider / base URL / model
             fb_api_mode = "chat_completions"

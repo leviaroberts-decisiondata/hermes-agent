@@ -9411,12 +9411,21 @@ class GatewayRunner:
                             event.get("lane"), event.get("gate"),
                             event.get("wts_task"), event.get("run_id"),
                         )
-                        # Mark processed BEFORE injecting so a crash mid-turn cannot
-                        # cause a re-inject loop (at-most-once wake; the result is
-                        # already durable in WTS + the transcript mirror).
-                        lane_wake.mark_processed(event, outcome="injected")
+                        # Atomically claim BEFORE injecting so a crash mid-turn cannot
+                        # cause a re-inject loop and parallel drains cannot both
+                        # inject the same lane result. The result is already durable
+                        # in WTS + the transcript mirror, so wake delivery is
+                        # intentionally at-most-once.
+                        if not lane_wake.claim_processed(event, outcome="claimed"):
+                            logger.info(
+                                "Lane-wake: skipping already-claimed event key=%s run=%s wts=%s",
+                                key, event.get("run_id"), event.get("wts_task"),
+                            )
+                            continue
                         await adapter.handle_message(synth_event)
+                        lane_wake.mark_processed(event, outcome="injected")
                     except Exception as inj_exc:
+                        lane_wake.mark_processed(event, outcome="injection-error")
                         logger.error("Lane-wake injection error: %s", inj_exc)
             except Exception as loop_exc:
                 logger.error("Lane-wake drain loop error: %s", loop_exc)

@@ -167,6 +167,18 @@ class TestI2HonestVerification:
         assert "HANDOFF OK" not in out
         assert "do not report this handoff as succeeded" in out.lower()
 
+    def test_failed_output_is_redacted_before_return(self, fake_tree, monkeypatch):
+        monkeypatch.setenv("FAKE_EXIT", "2")
+        monkeypatch.setenv("FAKE_STDOUT", "token=sk-live-secret1234567890")
+        monkeypatch.setenv("FAKE_STDERR", "Authorization: Bearer very-secret-token-1234567890")
+        monkeypatch.setattr(r2l, "redact_sensitive_text", lambda s: s.replace("sk-live-secret1234567890", "[REDACTED]").replace("very-secret-token-1234567890", "[REDACTED]"))
+
+        out = r2l.route_to_lane(lane="qa", goal="review")
+
+        assert "[REDACTED]" in out
+        assert "sk-live-secret1234567890" not in out
+        assert "very-secret-token-1234567890" not in out
+
     def test_failed_when_exit0_but_no_status_line(self, fake_tree, monkeypatch):
         # exit 0 but the lane never printed its normalized line → NOT success.
         monkeypatch.setenv("FAKE_EXIT", "0")

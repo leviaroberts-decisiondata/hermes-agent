@@ -1481,6 +1481,57 @@ def test_codex_exhausted_entry_recovers_via_auth_store_sync(tmp_path, monkeypatc
     assert available[0].last_error_reset_at is None
 
 
+def test_429_cooldown_is_short_half_open_window():
+    from agent.credential_pool import EXHAUSTED_TTL_429_SECONDS, EXHAUSTED_TTL_DEFAULT_SECONDS
+
+    assert EXHAUSTED_TTL_429_SECONDS == 5 * 60
+    assert EXHAUSTED_TTL_429_SECONDS < EXHAUSTED_TTL_DEFAULT_SECONDS
+
+
+def test_codex_refresh_lock_timeout_does_not_attempt_unlocked_refresh(tmp_path, monkeypatch):
+    """If the Codex refresh lock is busy, never consume a single-use refresh
+    token via an unlocked fallback refresh. The entry should be marked
+    exhausted so pool rotation/fallback can take over safely.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, _codex_auth_store("access-OLD", "refresh-OLD"))
+
+    import agent.credential_pool as cp
+
+    pool = cp.load_pool("openai-codex")
+    entry = pool.select()
+    assert entry is not None
+
+    refresh_called = False
+
+    def _refresh_unlocked(*args, **kwargs):
+        nonlocal refresh_called
+        refresh_called = True
+        raise AssertionError("unlocked Codex refresh must not be attempted")
+
+    class _BusyFcntl:
+        LOCK_EX = cp.fcntl.LOCK_EX
+        LOCK_NB = cp.fcntl.LOCK_NB
+        LOCK_UN = cp.fcntl.LOCK_UN
+
+        @staticmethod
+        def flock(*args, **kwargs):
+            raise BlockingIOError("busy")
+
+    monkeypatch.setattr(pool, "_entry_needs_refresh", lambda _entry: True)
+    monkeypatch.setattr(cp, "CODEX_REFRESH_LOCK_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(cp, "fcntl", _BusyFcntl)
+    monkeypatch.setattr(cp.auth_mod, "refresh_codex_oauth_pure", _refresh_unlocked)
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is None
+    assert refresh_called is False
+    reloaded = cp.load_pool("openai-codex")
+    current = reloaded._entries[0]
+    assert current.last_status == cp.STATUS_EXHAUSTED
+    assert current.last_error_code is None
+
 def test_codex_exhausted_entry_stays_stuck_without_auth_store_update(tmp_path, monkeypatch):
     """Regression guard: if auth.json tokens haven't changed, the exhausted
     entry must stay stuck behind its reset window — sync must not spuriously

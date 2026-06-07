@@ -33,6 +33,11 @@ from typing import Optional
 import re
 
 from tools.registry import registry, tool_error
+try:
+    from agent.redact import redact_sensitive_text
+except Exception:  # pragma: no cover - defensive import for minimal tool contexts
+    def redact_sensitive_text(text: str) -> str:
+        return text
 
 _HERMES_HOME = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
 # The wrapper + lane config live under the SHARED ~/.hermes (home-anchored),
@@ -352,8 +357,8 @@ def route_to_lane(
     except Exception as exc:
         return tool_error(f"route_to_lane: failed to invoke wrapper: {exc}")
 
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
+    out = redact_sensitive_text((proc.stdout or "").strip())
+    err = redact_sensitive_text((proc.stderr or "").strip())
     code = proc.returncode
 
     # I2 + P-D/G5: HONEST verification.

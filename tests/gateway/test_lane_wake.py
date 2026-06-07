@@ -92,6 +92,34 @@ def test_emit_refused_after_processed(wake, tmp_path):
     assert t.startswith("skipped(processed:"), t
 
 
+def test_claim_processed_is_atomic_consumer_side(wake, tmp_path):
+    """Only one drain consumer may claim a queued event for injection."""
+    rd = _mk_run_dir(tmp_path)
+    _emit(wake, rd)
+    ev = wake.list_pending_events()[0]
+
+    assert wake.claim_processed(ev, outcome="claimed") is True
+    assert wake.claim_processed(ev, outcome="claimed") is False
+    assert wake.already_processed(ev["idempotency_key"]) is True
+    marker = wake._processed_dir() / wake._safe_key_filename(ev["idempotency_key"])
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["outcome"] == "claimed"
+
+
+def test_mark_processed_updates_existing_claim(wake, tmp_path):
+    rd = _mk_run_dir(tmp_path)
+    _emit(wake, rd)
+    ev = wake.list_pending_events()[0]
+
+    assert wake.claim_processed(ev, outcome="claimed") is True
+    wake.mark_processed(ev, outcome="injected")
+
+    marker = wake._processed_dir() / wake._safe_key_filename(ev["idempotency_key"])
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["outcome"] == "injected"
+    assert wake.list_pending_events() == []
+
+
 def test_distinct_runs_are_not_deduped(wake, tmp_path):
     rd1 = _mk_run_dir(tmp_path, run_id="run-aaa")
     rd2 = _mk_run_dir(tmp_path, run_id="run-bbb")

@@ -267,36 +267,72 @@ def already_processed(idempotency_key: str) -> bool:
     return (_processed_dir() / _safe_key_filename(idempotency_key)).exists()
 
 
-def mark_processed(event: dict, *, outcome: str = "injected") -> None:
-    """Record that an event was consumed: write a durable processed marker, drop
-    the .enqueued marker, and remove the queue file. Idempotent and fail-soft."""
+def _processed_marker_payload(event: dict, *, outcome: str) -> str:
     key = event.get("idempotency_key") or ""
-    fname = _safe_key_filename(key) if key else None
-    try:
-        _processed_dir().mkdir(parents=True, exist_ok=True)
-        if fname:
-            (_processed_dir() / fname).write_text(
-                json.dumps(
-                    {
-                        "idempotency_key": key,
-                        "outcome": outcome,
-                        "run_id": event.get("run_id"),
-                        "wts_task": event.get("wts_task"),
-                        "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (_enqueued_dir() / fname).unlink(missing_ok=True)
-    except Exception:
-        pass
-    # Remove the queue file last (the processed marker is the source of truth).
+    return json.dumps(
+        {
+            "idempotency_key": key,
+            "outcome": outcome,
+            "run_id": event.get("run_id"),
+            "wts_task": event.get("wts_task"),
+            "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    )
+
+
+def remove_event_file(event: dict) -> None:
+    """Remove a queue file fail-soft; used by losing consumers too."""
     path = event.get("_path")
     if path:
         try:
             Path(path).unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def claim_processed(event: dict, *, outcome: str = "claimed") -> bool:
+    """Atomically claim an event's idempotency key for at-most-once injection.
+
+    Returns True only for the process that created the processed marker with
+    O_CREAT|O_EXCL. Losing consumers must skip injection.
+    """
+    key = event.get("idempotency_key") or ""
+    if not key:
+        return True
+    fname = _safe_key_filename(key)
+    marker = _processed_dir() / fname
+    try:
+        _processed_dir().mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_processed_marker_payload(event, outcome=outcome))
+        (_enqueued_dir() / fname).unlink(missing_ok=True)
+        return True
+    except FileExistsError:
+        remove_event_file(event)
+        return False
+    except Exception:
+        return False
+
+
+def mark_processed(event: dict, *, outcome: str = "injected") -> None:
+    """Record that an event was consumed: write/update a durable processed marker,
+    drop the .enqueued marker, and remove the queue file. Idempotent and fail-soft."""
+    key = event.get("idempotency_key") or ""
+    fname = _safe_key_filename(key) if key else None
+    try:
+        _processed_dir().mkdir(parents=True, exist_ok=True)
+        if fname:
+            marker = _processed_dir() / fname
+            if not marker.exists():
+                claim_processed(event, outcome=outcome)
+            else:
+                marker.write_text(_processed_marker_payload(event, outcome=outcome), encoding="utf-8")
+                (_enqueued_dir() / fname).unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Remove the queue file last (the processed marker is the source of truth).
+    remove_event_file(event)
 
 
 # ── tiny CLI so the bash producers (dd-lane-reaper / dd-chain-driver) can emit ──

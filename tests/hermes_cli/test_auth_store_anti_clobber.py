@@ -6,6 +6,7 @@ hermes_cli/auth.py.
 """
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_cli.auth import (
@@ -117,6 +118,33 @@ def test_save_allows_provider_to_provider_update(tmp_path, monkeypatch):
 
     after = _load_auth_store()
     assert set(after.get("providers", {}).keys()) == {"openai-codex", "copilot"}
+
+
+def test_auth_store_load_and_save_acquire_lock_when_called_directly(tmp_path, monkeypatch):
+    """Direct callers of _load/_save still get read/write consistency locks."""
+    import hermes_cli.auth as auth_mod
+
+    hermes_home = tmp_path / "hermes_test"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    calls = []
+
+    @contextmanager
+    def _counting_lock(*args, **kwargs):
+        depth = getattr(auth_mod._auth_lock_holder, "depth", 0)
+        auth_mod._auth_lock_holder.depth = depth + 1
+        calls.append("lock")
+        try:
+            yield
+        finally:
+            auth_mod._auth_lock_holder.depth = depth
+
+    monkeypatch.setattr(auth_mod, "_auth_store_lock", _counting_lock)
+
+    auth_mod._save_auth_store(_populated_store())
+    loaded = auth_mod._load_auth_store()
+
+    assert "openai-codex" in loaded.get("providers", {})
+    assert calls == ["lock", "lock"]
 
 
 def test_auth_store_path_env_override_keeps_home_state_separate(tmp_path, monkeypatch):
