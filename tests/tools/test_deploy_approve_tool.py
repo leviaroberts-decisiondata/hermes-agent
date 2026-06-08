@@ -66,6 +66,26 @@ class TestPolicyPreflight:
         assert out["ok"] is False
         assert "high-risk" in out["blockers"][-1]
 
+    def test_allows_high_risk_with_explicit_c4_review(self, monkeypatch):
+        monkeypatch.setenv("DD_DEPLOY_APPROVE_ENABLED", "1")
+        captured = {}
+        def fake_post(url, *, json_body=None, **kw):
+            captured["body"] = json_body
+            return _resp(200, {"status": "deployed", "id": "q1"})
+        with mock_patch.object(dat, "_fetch_entry", return_value=(_entry(files_changed=["app/middleware.ts"]), None)):
+            with mock_patch("gateway.capability_egress.post_with_capability", side_effect=fake_post):
+                out = json.loads(deploy_approve(
+                    "q1",
+                    release_note="r",
+                    rollback_note="rb",
+                    policy_checklist=_checklist(),
+                    c4_review_confirmed=True,
+                    c4_review_reason="Levi explicitly reviewed and approved this auth-adjacent deploy.",
+                ))
+        assert out["ok"] is True
+        assert captured["body"]["c4_review_confirmed"] is True
+        assert "Levi explicitly" in captured["body"]["c4_review_reason"]
+
 
 class TestApprovalPath:
     def test_posts_to_approve_with_capability_after_policy_pass(self, monkeypatch):
@@ -99,3 +119,65 @@ class TestApprovalPath:
         assert out["denied"] is True
         assert out["status_code"] == 403
         assert out["reason"] == "no_credential"
+
+
+
+class TestConflictGroupResolution:
+    def test_resolves_group_by_approving_one_and_rejecting_superseded(self, monkeypatch):
+        monkeypatch.setenv("DD_DEPLOY_APPROVE_ENABLED", "1")
+        target = _entry(
+            id="new-q",
+            service_name="slack-demo-manager",
+            target_commit="d5027a1e6b0d7a82c092a5a55f338c3872cc1b3d",
+            conflict_flag=True,
+            files_changed=["lib/slackCredentials.mjs"],
+            diff_summary="credential management change",
+        )
+        old = _entry(id="old-q", service_name="slack-demo-manager", target_commit="cfee82cb019f43955ec513359bf024a14df8db35")
+        captured = {}
+        def fake_post(url, *, json_body=None, **kw):
+            captured["url"] = url
+            captured["body"] = json_body
+            return _resp(200, {"status": "applied", "actions": [{"id": "new-q", "action": "deployed"}, {"id": "old-q", "action": "rejected"}]})
+        with mock_patch.object(dat, "_fetch_pending_entries_for_service", return_value=([target, old], None)):
+            with mock_patch("gateway.capability_egress.post_with_capability", side_effect=fake_post):
+                out = json.loads(dat.deploy_resolve_conflict_group(
+                    "slack-demo-manager",
+                    "new-q",
+                    expected_target_commit="d5027a1e6b0d7a82c092a5a55f338c3872cc1b3d",
+                    reject_entry_ids=["old-q"],
+                    resolution_reason="Levi approved superseding older SDM deploy queue items with the QA-passed target.",
+                    release_note="Deploy SDM Slack Connection Management",
+                    rollback_note="Revert to previous deployed SDM commit through deploy queue",
+                    policy_checklist=_checklist(),
+                    c4_review_confirmed=True,
+                    c4_review_reason="Levi approved credential-management deploy after QA PASS and queue-conflict review.",
+                ))
+        assert out["ok"] is True
+        assert captured["url"].endswith("/api/deploy-queue/group/slack-demo-manager/approve")
+        recs = captured["body"]["resolution"]["entry_recommendations"]
+        assert recs[0]["entry_id"] == "new-q"
+        assert recs[0]["action"] == "approve"
+        assert recs[1]["entry_id"] == "old-q"
+        assert recs[1]["action"] == "reject"
+
+    def test_refuses_group_when_pending_entry_left_unresolved(self, monkeypatch):
+        monkeypatch.setenv("DD_DEPLOY_APPROVE_ENABLED", "1")
+        target = _entry(id="new-q", service_name="slack-demo-manager", target_commit="d5027a1e6b0d7a82c092a5a55f338c3872cc1b3d", conflict_flag=True)
+        old1 = _entry(id="old-1", service_name="slack-demo-manager")
+        old2 = _entry(id="old-2", service_name="slack-demo-manager")
+        with mock_patch.object(dat, "_fetch_pending_entries_for_service", return_value=([target, old1, old2], None)):
+            out = json.loads(dat.deploy_resolve_conflict_group(
+                "slack-demo-manager",
+                "new-q",
+                expected_target_commit="d5027a1e6b0d7a82c092a5a55f338c3872cc1b3d",
+                reject_entry_ids=["old-1"],
+                resolution_reason="Levi approved superseding older SDM deploy queue items with the QA-passed target.",
+                release_note="Deploy SDM Slack Connection Management",
+                rollback_note="Revert to previous deployed SDM commit through deploy queue",
+                policy_checklist=_checklist(),
+                c4_review_confirmed=True,
+                c4_review_reason="Levi approved credential-management deploy after QA PASS and queue-conflict review.",
+            ))
+        assert out["ok"] is False
+        assert "unresolved pending entries" in " ".join(out["blockers"])
