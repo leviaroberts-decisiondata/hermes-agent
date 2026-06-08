@@ -175,7 +175,16 @@ def _validate_policy(entry: dict, *, expected_service_name: str, expected_target
     if not wts_task_id or not _UUID_RE.match(wts_task_id):
         blockers.append("queue item is missing a valid WTS task id")
     if entry.get("conflict_flag") is True:
-        blockers.append("queue item conflict_flag is true")
+        pending_entries, pending_err = _fetch_pending_entries_for_service(service)
+        if pending_err:
+            blockers.append("queue item conflict_flag is true and pending conflicts could not be rechecked: " + pending_err)
+        else:
+            pending_ids = {str(e.get("id")) for e in pending_entries if str(e.get("id"))}
+            other_pending = sorted(pending_ids - {str(entry.get("id"))})
+            if other_pending:
+                blockers.append("queue item conflict_flag is true with unresolved pending entries: " + ", ".join(other_pending))
+            else:
+                warnings.append("stale conflict_flag ignored: no other pending entries remain for service")
     if not target_commit or not _SHA_RE.match(target_commit):
         blockers.append("queue item is missing a valid target_commit")
     if expected_target_commit and target_commit.lower() != expected_target_commit.strip().lower():
@@ -397,8 +406,13 @@ def deploy_resolve_conflict_group(service_name: str, approve_entry_id: str, *, e
         return _json_response(False, denied=True, reason="reject_entry_not_pending",
                               missing_reject_entry_ids=missing_rejects)
 
+    target_for_policy = dict(target)
+    # Group resolution validates unresolved pending entries explicitly below;
+    # do not let the submit-time conflict_flag short-circuit the very tool whose
+    # purpose is to clear that conflict through the sanctioned group rail.
+    target_for_policy["conflict_flag"] = False
     ok, blockers, warnings = _validate_policy(
-        target,
+        target_for_policy,
         expected_service_name=service_name,
         expected_target_commit=expected_target_commit,
         release_note=release_note,

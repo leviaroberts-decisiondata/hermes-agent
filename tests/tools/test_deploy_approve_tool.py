@@ -86,6 +86,31 @@ class TestPolicyPreflight:
         assert captured["body"]["c4_review_confirmed"] is True
         assert "Levi explicitly" in captured["body"]["c4_review_reason"]
 
+    def test_allows_stale_conflict_flag_when_no_other_pending_entries_remain(self, monkeypatch):
+        monkeypatch.setenv("DD_DEPLOY_APPROVE_ENABLED", "1")
+        captured = {}
+        def fake_post(url, *, json_body=None, **kw):
+            captured["url"] = url
+            return _resp(200, {"status": "deployed", "id": "q1"})
+        stale = _entry(conflict_flag=True)
+        with mock_patch.object(dat, "_fetch_entry", return_value=(stale, None)):
+            with mock_patch.object(dat, "_fetch_pending_entries_for_service", return_value=([stale], None)):
+                with mock_patch("gateway.capability_egress.post_with_capability", side_effect=fake_post):
+                    out = json.loads(deploy_approve("queue-1", release_note="r", rollback_note="rb", policy_checklist=_checklist()))
+        assert out["ok"] is True
+        assert "stale conflict_flag ignored" in " ".join(out["warnings"])
+        assert captured["url"].endswith("/api/deploy-queue/queue-1/approve")
+
+    def test_blocks_conflict_flag_when_other_pending_entries_remain(self, monkeypatch):
+        monkeypatch.setenv("DD_DEPLOY_APPROVE_ENABLED", "1")
+        stale = _entry(conflict_flag=True)
+        old = _entry(id="old-q")
+        with mock_patch.object(dat, "_fetch_entry", return_value=(stale, None)):
+            with mock_patch.object(dat, "_fetch_pending_entries_for_service", return_value=([stale, old], None)):
+                out = json.loads(deploy_approve("queue-1", release_note="r", rollback_note="rb", policy_checklist=_checklist()))
+        assert out["ok"] is False
+        assert "unresolved pending entries" in " ".join(out["blockers"])
+
 
 class TestApprovalPath:
     def test_posts_to_approve_with_capability_after_policy_pass(self, monkeypatch):
