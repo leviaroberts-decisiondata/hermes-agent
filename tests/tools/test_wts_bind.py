@@ -111,3 +111,15 @@ class TestBindResults:
         argv = _argv(fake_binder)
         assert "--thread" in argv and argv[argv.index("--thread") + 1] == "th9"
         assert "--notes" in argv and argv[argv.index("--notes") + 1] == "ctx"
+
+    def test_force_new_passes_flag(self, fake_binder, monkeypatch):
+        monkeypatch.setenv("FAKE_STDOUT", "WTS_TASK_ID=t\nBOUND=created\nVERIFY=ok\nREUSE_DECISION=force_new")
+        out = wb.wts_bind(goal="new unit", chat="111", force_new=True, parent_agent=_Agent())
+        argv = _argv(fake_binder)
+        assert "--force-new" in argv
+        assert "REUSE_DECISION=force_new" in out
+
+    def test_resolve_only_and_force_new_conflict(self, fake_binder):
+        out = wb.wts_bind(goal=None, chat="111", resolve_only=True, force_new=True, parent_agent=_Agent())
+        assert "cannot be combined" in out
+        assert not fake_binder["argv_log"].exists()

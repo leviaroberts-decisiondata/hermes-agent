@@ -265,17 +265,40 @@ def _resolve_message(parent_agent) -> "str | None":
     return None
 
 
+_ACTIVE_STATUSES = {"active", "blocked"}
+
+
+def _rank_chain_rows(rows: list) -> list:
+    """Prefer current work over stale history for natural-key selectors.
+
+    A WTS task can legitimately have multiple historical request_chains rows when
+    an old umbrella task was reused. The status answer should reflect the newest
+    active/blocked chain first, then the most recently updated terminal row.
+    """
+    def _rank(r):
+        status = (r.get("status") or "").strip().lower()
+        active = 1 if status in _ACTIVE_STATUSES else 0
+        updated = r.get("updated_at") or ""
+        created = r.get("created_at") or ""
+        return (active, 1 if updated else 0, updated, created)
+    out = list(rows or [])
+    out.sort(key=_rank, reverse=True)
+    return out
+
+
 def _by_field(field: str, value: str) -> "list | None":
-    """Resolve the newest chain whose `field` column == value. Returns the row
-    list (len 0/1) on a 200, or None on a non-200 so the caller can distinguish a
-    clean miss from a read error. The field name is from a fixed allowlist below —
-    never interpolated from model input — so this cannot widen the query surface."""
+    """Resolve chains whose `field` column == value, ranked current/latest.
+
+    Returns a sorted row list on 200, or None on read error. The field name is
+    from a fixed allowlist below — never interpolated from model input.
+    """
     qf = urllib.parse.quote(value)
     code, resp = _api_get(
-        f"/items/request_chains?filter[{field}][_eq]={qf}&sort=-created_at&limit=1")
+        f"/items/request_chains?filter[{field}][_eq]={qf}"
+        f"&sort=-updated_at,-created_at&limit=20")
     if code != 200:
         return None
-    return (resp or {}).get("data") or []
+    return _rank_chain_rows((resp or {}).get("data") or [])
 
 
 # ── candidates listing (the no-resolve fallback) ─────────────────────────────
@@ -367,6 +390,11 @@ def _fmt_chain(chain: dict, events: list) -> str:
     # The CANONICAL chain key — the standardized, queryable identity for THIS
     # turn's chain. Surfaced explicitly so the next query (operator or grader) can
     # use `chain_status(chain_id=...)` against it directly, no anchor guessing.
+    if len(data) > 1:
+        lines.append(
+            f"  ⚠ selector:  matched {len(data)} chains; showing newest active/latest by updated_at. "
+            "Use chain_id= for an exact historical row."
+        )
     lines.append(f"  chain key:  {g('route_key')}  (canonical — query with chain_id=)")
     lines.append(f"  ask:        {title[:300]}")
     lines.append(f"  status:     {g('status')}")
@@ -495,11 +523,7 @@ def chain_status(
         explicit_wts = bool((wts_task or "").strip())
         wid = (wts_task or "").strip() or _resolve_wts_task(parent_agent)
         if wid:
-            qf = urllib.parse.quote(wid)
-            code, resp = _api_get(
-                f"/items/request_chains?filter[wts_task_id][_eq]={qf}"
-                f"&sort=-created_at&limit=1")
-            data = (resp or {}).get("data") if code == 200 else None
+            data = _by_field("wts_task_id", wid)
             if data:
                 return _answer_for(data, f"wts_task={wid}", parent_agent)
             if explicit_wts:
@@ -525,11 +549,7 @@ def chain_status(
         explicit_ch = bool((channel or "").strip())
         ch = (channel or "").strip() or _resolve_channel(parent_agent)
         if ch:
-            qf = urllib.parse.quote(ch)
-            code, resp = _api_get(
-                f"/items/request_chains?filter[source_channel_id][_eq]={qf}"
-                f"&sort=-created_at&limit=1")
-            data = (resp or {}).get("data") if code == 200 else None
+            data = _by_field("source_channel_id", ch)
             if data:
                 return _answer_for(data, f"channel={ch}", parent_agent)
             if explicit_ch:

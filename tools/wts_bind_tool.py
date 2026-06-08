@@ -63,6 +63,7 @@ def wts_bind(
     thread: "str | None" = None,
     notes: "str | None" = None,
     resolve_only: bool = False,
+    force_new: bool = False,
     parent_agent=None,
 ) -> str:
     """Resolve-or-create the turn's bound WTS task and return its id + tracker link.
@@ -83,12 +84,16 @@ def wts_bind(
             "explicitly, or this turn carries no parseable telegram routing key). "
             "Without it there is no thread to anchor the task to."
         )
+    if resolve_only and force_new:
+        return tool_error("wts_bind: resolve_only=true and force_new=true cannot be combined.")
     if not resolve_only and not (goal or "").strip():
         return tool_error("wts_bind: provide `goal` (the unit of work) unless resolve_only=true.")
 
     cmd = [str(_BINDER), "--chat", chat_id]
     if thread and str(thread).strip():
         cmd += ["--thread", str(thread).strip()]
+    if force_new:
+        cmd += ["--force-new"]
     if resolve_only:
         cmd += ["--resolve-only"]
     else:
@@ -156,6 +161,10 @@ WTS_BIND_SCHEMA = {
                 "type": "boolean",
                 "description": "If true, only resolve an existing bound task for this thread; do NOT create one. Returns BOUND=none when there is no live task.",
             },
+            "force_new": {
+                "type": "boolean",
+                "description": "If true, create a fresh WTS task for a new/unrelated work unit even if this chat/thread has an existing anchor. Do not combine with resolve_only.",
+            },
         },
         "required": [],
     },
@@ -172,6 +181,7 @@ registry.register(
         thread=args.get("thread"),
         notes=args.get("notes"),
         resolve_only=bool(args.get("resolve_only", False)),
+        force_new=bool(args.get("force_new", False)),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_wts_bind_requirements,
