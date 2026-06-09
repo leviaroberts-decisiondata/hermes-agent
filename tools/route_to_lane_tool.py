@@ -34,15 +34,29 @@ import re
 
 from tools.registry import registry, tool_error
 try:
+    from tools.engineering_pool_selector import select_engineering_lane
+except Exception:  # pragma: no cover - optional selector should not break lane routing
+    select_engineering_lane = None
+try:
     from agent.redact import redact_sensitive_text
 except Exception:  # pragma: no cover - defensive import for minimal tool contexts
     def redact_sensitive_text(text: str) -> str:
         return text
 
+def _decisiondata_shared_home() -> Path:
+    configured = os.getenv("DD_SHARED_HERMES_HOME")
+    if configured:
+        return Path(configured)
+    canonical = Path("/Users/openclaw/.hermes")
+    if canonical.exists():
+        return canonical
+    return Path.home() / ".hermes"
+
+
 _HERMES_HOME = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
-# The wrapper + lane config live under the SHARED ~/.hermes (home-anchored),
+# The wrapper + lane config live under the SHARED ~/.hermes (openclaw-anchored),
 # not a per-profile HERMES_HOME — mirror how the context tree resolves.
-_SHARED_HOME = Path.home() / ".hermes"
+_SHARED_HOME = _decisiondata_shared_home()
 _WRAPPER = _SHARED_HOME / "bin" / "dd-visible-lane-run"
 _CHANNELS_JSON = _SHARED_HOME / "dd-lanes" / "channels.json"
 _LANE_DIR = _SHARED_HOME / "dd-lanes"
@@ -176,8 +190,16 @@ def _register_pending_with_reaper(out: str, parent_agent, wts_task: Optional[str
         "",          # budget → reaper default
         wts,         # wts_task → reaper attaches the final result MD to it on reap
     ]
+    env = os.environ.copy()
+    # route_to_lane always targets the shared DecisionData lane home, even when
+    # the caller is a different Hermes home (for example Levi's .hermes-classic
+    # Telegram assistant). Without forcing HERMES_HOME here, dd-lane-reaper
+    # resolves its venv/registry under the caller's home and registration fails
+    # with misleading PENDING/FAILED states for Telegram-only lanes.
+    env["HERMES_HOME"] = str(_SHARED_HOME)
+    env.setdefault("DD_HERMES_AGENT_DIR", str(_SHARED_HOME / "hermes-agent"))
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
     except Exception as exc:
         return f"reaper-registration: FAILED to invoke ({type(exc).__name__})"
     if proc.returncode == 0:
@@ -258,6 +280,8 @@ def route_to_lane(
     context: Optional[str] = None,
     wts_task: Optional[str] = None,
     packet: Optional[str] = None,
+    preferred_lane: Optional[str] = None,
+    affinity_reason: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """Route a unit of work to a specialist lane via the sanctioned visible wrapper.
@@ -267,7 +291,28 @@ def route_to_lane(
     """
     lane = (lane or "").strip()
     if not lane:
-        return tool_error("route_to_lane: 'lane' is required (e.g. qa, design, engineering).")
+        return tool_error("route_to_lane: 'lane' is required (e.g. qa, design, engineering, engineering-pool).")
+    if lane in {"engineering-pool", "engineering_pool", "engineering-auto"}:
+        if select_engineering_lane is None:
+            return tool_error("route_to_lane: engineering pool selector is not available; pick an explicit engineering lane.")
+        selection = select_engineering_lane(preferred_lane=preferred_lane, affinity_reason=affinity_reason)
+        if not selection.selected_lane:
+            return tool_error(
+                "HANDOFF BLOCKED — engineering pool has no safe capacity. "
+                f"{selection.reason} Do NOT spawn duplicate recovery work; queue or ask P1/operator to decide."
+            )
+        assignment_reason = selection.reason
+        lane = selection.selected_lane
+        context_prefix = (
+            "## Engineering Pool Assignment\n"
+            f"Selected lane: {selection.selected_lane}\n"
+            f"Selected agent: {selection.selected_agent}\n"
+            f"Reason: {assignment_reason}\n"
+            "Policy: Eng1 idle -> engineering; Eng1 busy -> engineering-2; "
+            "Eng1+2 busy -> engineering-3; all busy -> no-capacity/queue. "
+            "Same-active-engineer reuse requires explicit affinity reason.\n"
+        )
+        context = f"{context_prefix}\n{context or ''}".strip()
     known = _known_lanes()
     all_lanes = _all_lanes()
     telegram_only = [l for l in all_lanes if l not in known]
@@ -337,6 +382,12 @@ def route_to_lane(
         cmd += ["--wts-task", wts_task.strip()]
 
     env = os.environ.copy()
+    # The visible lane wrappers are shared DecisionData infrastructure. Pin their
+    # home so a caller running from .hermes-classic (or any other HERMES_HOME)
+    # cannot make the wrapper create run dirs / resolve reaper Python / write
+    # registries under the wrong home.
+    env["HERMES_HOME"] = str(_SHARED_HOME)
+    env.setdefault("DD_HERMES_AGENT_DIR", str(_SHARED_HOME / "hermes-agent"))
     route_key = str(getattr(parent_agent, "_dd_route_key", "") or "").strip()
     session_key = str(getattr(parent_agent, "_dd_session_key", "") or "").strip()
     if route_key:
@@ -463,7 +514,7 @@ ROUTE_TO_LANE_SCHEMA = {
         "properties": {
             "lane": {
                 "type": "string",
-                "description": "Specialist lane to route to (e.g. 'qa', 'design', 'engineering'). Must be a lane defined in dd-lanes/channels.json.",
+                "description": "Specialist lane to route to (e.g. 'qa', 'design', 'engineering'). Use 'engineering-pool' to select engineering/engineering-2/engineering-3 by active capacity before dispatch.",
             },
             "goal": {
                 "type": "string",
@@ -480,6 +531,14 @@ ROUTE_TO_LANE_SCHEMA = {
             "packet": {
                 "type": "string",
                 "description": "Optional: path to a pre-written handoff packet .md. When given, goal/context are ignored and this file is sent verbatim.",
+            },
+            "preferred_lane": {
+                "type": "string",
+                "description": "Only with lane='engineering-pool': explicit engineering lane to reuse. If active, affinity_reason is required.",
+            },
+            "affinity_reason": {
+                "type": "string",
+                "description": "Only with lane='engineering-pool': dependency/file/surface/branch continuity reason allowing reuse of an active engineer.",
             },
         },
         "required": ["lane"],
@@ -498,6 +557,8 @@ registry.register(
         wts_task=args.get("wts_task"),
         packet=args.get("packet"),
         parent_agent=kw.get("parent_agent"),
+        preferred_lane=args.get("preferred_lane"),
+        affinity_reason=args.get("affinity_reason"),
     ),
     check_fn=check_route_to_lane_requirements,
     emoji="🛤️",

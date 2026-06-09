@@ -27,6 +27,17 @@ def test_telegram_visible_lane_run_registers_pending_runs_with_reaper():
     assert 'register_pending_with_reaper "$result_file" "$run_code"' in text
 
 
+def test_telegram_visible_lane_run_preserves_topic_thread_for_reaper_registration():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert 'thread = parts[5] if len(parts) > 5 else ""' in text
+
+
+def test_telegram_visible_lane_run_passes_wts_task_to_lane_run():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert '"$LANE_RUN" --lane "$lane" --agent "$agent" --packet "$packet" --wts-task "$wts_task"' in text
+    assert '"$LANE_RUN" --lane "$lane" --agent "$agent" --packet "$packet" >"$result_file"' in text
+
+
 def test_telegram_visible_lane_run_message_labels_are_reviewable():
     text = SCRIPT.read_text(encoding="utf-8")
     assert "WTS: ${tracker_url}" in text

@@ -199,7 +199,7 @@ parts = key.split(":")
 if len(parts) < 5 or parts[0] != "agent" or parts[1] != "main":
     sys.exit(1)
 platform, chat_type, chat_id = parts[2], parts[3], parts[4]
-thread = parts[5] if len(parts) > 5 and chat_type in ("dm", "thread") else ""
+thread = parts[5] if len(parts) > 5 else ""
 print("\n".join([platform, chat_type, chat_id, thread]))
 PY
 )" || { echo "warn: route/session key not parseable for reaper registration" >&2; return 0; }
@@ -269,7 +269,11 @@ fi
 result_file="$stage_dir/result-${run_id}.md"
 err_file="$stage_dir/stderr-${run_id}.log"
 set +e
-"$LANE_RUN" --lane "$lane" --agent "$agent" --packet "$packet" >"$result_file" 2>"$err_file"
+if [[ -n "$wts_task" ]]; then
+  "$LANE_RUN" --lane "$lane" --agent "$agent" --packet "$packet" --wts-task "$wts_task" >"$result_file" 2>"$err_file"
+else
+  "$LANE_RUN" --lane "$lane" --agent "$agent" --packet "$packet" >"$result_file" 2>"$err_file"
+fi
 run_code=$?
 set -e
 register_pending_with_reaper "$result_file" "$run_code"
