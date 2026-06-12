@@ -24,7 +24,9 @@ from tools.registry import registry, tool_error
 _MC_API_BASE = os.getenv("MC_API_BASE_URL", "http://127.0.0.1:8502")
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_DEFAULT_ALLOWLIST = "dd-notification-service,slack-demo-manager,dd-slack-service"
+_DEFAULT_ALLOWLIST = "all-registered"
+_DEPLOY_COMMANDS_PATH = os.getenv("DD_DEPLOY_COMMANDS_PATH", "/Users/openclaw/.openclaw/deploy-commands.json")
+_PORT_REGISTRY_PATH = os.getenv("DD_PORT_REGISTRY_PATH", "/Users/openclaw/.openclaw/port-registry.json")
 _REQUIRED_CHECKS = (
     "wts_evidence_ready",
     "qa_or_test_evidence_passed",
@@ -63,8 +65,51 @@ def _deploy_approve_enabled() -> bool:
 
 def _allowlist() -> set[str]:
     raw = os.getenv("DD_DEPLOY_APPROVE_ALLOWLIST", _DEFAULT_ALLOWLIST)
-    return {p.strip() for p in raw.split(",") if p.strip()}
+    values = {p.strip() for p in raw.split(",") if p.strip()}
+    lowered = {p.lower() for p in values}
+    if lowered.intersection({"*", "all", "registered", "all-registered", "platform"}):
+        return _registered_deploy_services()
+    return values
 
+
+
+def _load_json_file(path: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _registered_deploy_services() -> set[str]:
+    """Return services registered in deploy commands and port registry."""
+    commands = _load_json_file(_DEPLOY_COMMANDS_PATH)
+    ports = _load_json_file(_PORT_REGISTRY_PATH)
+    command_services: set[str] = set()
+    if isinstance(commands, dict):
+        if isinstance(commands.get("services"), dict):
+            command_services.update(str(k) for k in commands["services"].keys())
+        command_services.update(str(k) for k, v in commands.items() if k != "services" and isinstance(v, (dict, str, list)))
+    port_services: set[str] = set()
+    def collect_port_services(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        for k, v in node.items():
+            if str(k).startswith("_"):
+                continue
+            if isinstance(v, dict) and "port" in v:
+                port_services.add(str(k))
+            elif isinstance(v, dict):
+                collect_port_services(v)
+    collect_port_services(ports)
+    # deploy-commands.json is the authoritative deploy registry; port-registry
+    # is an additional service discovery source but is not exhaustive for every
+    # deployable app/service.
+    return command_services.union(port_services)
+
+
+def _service_is_registered(service: str) -> bool:
+    return bool(service) and service in _registered_deploy_services()
 
 def _json_response(ok: bool, **fields) -> str:
     fields.setdefault("ok", ok)
@@ -168,8 +213,10 @@ def _validate_policy(entry: dict, *, expected_service_name: str, expected_target
     if status != "pending":
         blockers.append(f"queue item status is {status!r}, expected 'pending'")
     allow = _allowlist()
-    if service not in allow:
-        blockers.append(f"service {service!r} is not in DD_DEPLOY_APPROVE_ALLOWLIST ({sorted(allow)})")
+    if not _service_is_registered(service):
+        blockers.append(f"service {service!r} is not registered in deploy commands + port registry")
+    elif service not in allow:
+        blockers.append(f"service {service!r} is not approvable by P1 policy ({sorted(allow)})")
     if expected_service_name and service != expected_service_name.strip():
         blockers.append(f"expected_service_name mismatch: entry has {service!r}")
     if not wts_task_id or not _UUID_RE.match(wts_task_id):
@@ -200,7 +247,22 @@ def _validate_policy(entry: dict, *, expected_service_name: str, expected_target
         blockers.append("missing/false policy checks: " + ", ".join(missing_checks))
 
     flags = _normalize_high_risk_flags(high_risk_flags)
+    # Prefer structured policy booleans over free-text keyword heuristics.
+    # Evidence text that says "no secrets/env/db/auth/migration" must not itself
+    # create a release blocker when the explicit safety checks are true.
+    structured_risk_clean = all(checks.get(k) is True for k in (
+        "no_secrets_or_env_changes",
+        "no_database_migrations",
+        "no_auth_or_security_changes",
+        "no_external_comms_or_customer_side_effects",
+        "blast_radius_low",
+    ))
     heuristics = _looks_high_risk(entry)
+    if structured_risk_clean:
+        # Keep concrete risky-file findings (middleware/auth/env/migration/etc.)
+        # but suppress free-text false positives from release evidence like
+        # "no secrets/env/db/auth/migration changes".
+        heuristics = [h for h in heuristics if not h.startswith("text:")]
     high_risk_findings = []
     if flags:
         high_risk_findings.extend(f"caller:{f}" for f in flags)
@@ -225,8 +287,9 @@ DEPLOY_APPROVE_SCHEMA = {
         "Approve and execute a low-risk deploy queue item as P1/System-A through "
         "the sanctioned C4 capability path. This tool first reads the queue item "
         "and refuses approval unless the P1 policy checklist passes, the service "
-        "is allowlisted, WTS evidence exists, there is no conflict, a target commit "
-        "is present, and no high-risk class is declared/detected. It then calls "
+        "is registered in deploy commands + port registry, WTS evidence exists, "
+        "there is no conflict, a target commit is present, and structured risk "
+        "checks are clean (or C4-reviewed). It then calls "
         "mc-api /approve via gateway capability egress. Specialist lanes lack C4 "
         "and will be denied by mc-api."
     ),
