@@ -291,3 +291,103 @@ def test_malformed_event_file_does_not_wedge_drain(wake, tmp_path):
     assert len(pending) == 1
     assert not bad.exists()
     assert (wake.wake_queue_dir() / "garbage.json.bad").exists()
+
+
+# ── The reaper↔gateway routing CONTRACT (Canary-3 TOCTOU wake-recovery) ──────────
+# The live defect: a scrubbed-meta lane run reaped via DISCOVERY has NO session_key,
+# so the gateway's _build_process_event_source must build the source from the event's
+# flat routing — and it REQUIRES the FULL TRIPLET platform + chat_type + chat_id
+# (gateway/run.py: `if not platform_name or not chat_type or not chat_id: return None`).
+# The prior reaper fix recovered platform + chat_id but NOT chat_type, so the gateway
+# returned None and logged "dropping event with no routing metadata". These tests pin
+# that contract against the REAL production resolver (not a stub) so the masking gap
+# in test_gateway_drain_injects_internal_event_once (which stubs the resolver and
+# defaults chat_type) cannot hide a regression again.
+
+class _ResolverHost:
+    """Minimal host carrying the REAL _build_process_event_source bound to it.
+
+    Only `session_store` is referenced, and ONLY when the event has a session_key.
+    The scrubbed-discovery path has none, so the resolver goes straight to the flat
+    platform/chat_type/chat_id triplet derivation we are exercising.
+    """
+
+    def __init__(self):
+        from gateway.run import GatewayRunner
+
+        class _EmptyStore:
+            _entries = {}
+
+            def _ensure_loaded(self):
+                return None
+
+        self.session_store = _EmptyStore()
+        self._build_process_event_source = (
+            GatewayRunner._build_process_event_source.__get__(self)
+        )
+
+
+def test_gateway_resolver_accepts_recovered_triplet():
+    """The REAL resolver builds a usable SessionSource from a scrubbed-discovery wake
+    event that carries the recovered platform + chat_type + chat_id (no session_key) —
+    i.e. the gateway would NOT drop it and WOULD inject the P1 continuation."""
+    from gateway.config import Platform
+
+    host = _ResolverHost()
+    # Exactly the event the fixed reaper now emits on the scrubbed-discovery path:
+    # session_key empty (scrubbed), platform/chat_type/chat_id recovered from
+    # origin_surface / origin_kind / mirror-status.
+    evt = {
+        "session_key": "",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "8737984752",
+        "thread_id": None,
+    }
+    source = host._build_process_event_source(evt)
+    assert source is not None, "gateway DROPPED a fully-recovered wake event"
+    assert source.platform == Platform.TELEGRAM
+    assert source.chat_id == "8737984752"
+    assert source.chat_type == "dm"
+
+
+def test_gateway_resolver_drops_event_missing_chat_type():
+    """NON-VACUITY for the contract: the SAME event WITHOUT chat_type (the pre-fix
+    reaper's emitted shape — platform + chat_id only, no session_key) is DROPPED by
+    the real resolver. This is precisely the live "dropping event with no routing
+    metadata" path; recovering chat_type is what moves it from this branch to accept."""
+    host = _ResolverHost()
+    evt_missing_ctype = {
+        "session_key": "",
+        "platform": "telegram",
+        "chat_type": "",       # <- the leg the prior fix left empty
+        "chat_id": "8737984752",
+        "thread_id": None,
+    }
+    assert host._build_process_event_source(evt_missing_ctype) is None, (
+        "resolver accepted a chat_type-less event — the contract this fix relies on "
+        "is not actually enforced, so the test would be vacuous"
+    )
+
+
+def test_reaper_emitted_event_carries_chat_type_to_gateway(wake, tmp_path):
+    """END-TO-END (emit → real resolver): an emit with the recovered chat_type writes
+    it into the queued event payload, and feeding THAT payload to the REAL gateway
+    resolver yields a usable source. Proves chat_type survives the emit→event→drain
+    contract, not just the function arg."""
+    rd = _mk_run_dir(tmp_path)
+    # Emit WITHOUT a session_key (scrubbed path) but WITH the recovered triplet.
+    token = wake.emit_wake_event(
+        run_dir=str(rd), lane="engineering", gate="PASS",
+        session_key="", platform="telegram", chat_id="8737984752", chat_type="dm",
+        wts_task="5f11ced1-a4f3-484c-9383-ce946940bc63",
+    )
+    assert token.startswith("emitted("), token
+    ev = wake.list_pending_events()[0]
+    assert ev["chat_type"] == "dm", "emitted event payload dropped chat_type"
+    # The queued payload must satisfy the real gateway resolver.
+    host = _ResolverHost()
+    source = host._build_process_event_source(ev)
+    assert source is not None, "gateway would DROP the reaper-emitted scrubbed-path event"
+    assert source.chat_type == "dm"
+    assert source.chat_id == "8737984752"
