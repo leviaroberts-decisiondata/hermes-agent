@@ -166,6 +166,49 @@ def test_missing_wts_prompt_says_hold(wake):
     assert "HOLD" in p
 
 
+def test_continuation_prompt_carries_structured_fields(wake):
+    """P1 orchestration repair Batch B: the continuation prompt P1 receives on wake
+    must carry the STRUCTURED fields it needs to govern without a user message —
+    lane, run id, WTS task, verdict/gate, and the result artifact path. (req:
+    'P1 continuation prompt includes structured fields'.)"""
+    p = wake.build_continuation_prompt(
+        wts_task="eaf06358-bccc-4986-bbd1-c0bb045106d9",
+        lane="engineering",
+        gate="PASS",
+        run_dir="/Users/openclaw/.hermes/dd-lanes/engineering/runs/20260616-010101-42",
+        result_file="/tmp/eng-result.md",
+        result_sha="deadbeefcafe0123456789",
+    )
+    assert "Lane: engineering" in p
+    assert "Run id: 20260616-010101-42" in p
+    assert "WTS: eaf06358-bccc-4986-bbd1-c0bb045106d9" in p
+    assert "Gate: PASS" in p
+    assert "/tmp/eng-result.md" in p
+    assert "deadbeefcafe" in p  # result sha (truncated) for cross-checking the artifact
+
+
+def test_engineering_pass_continuation_routes_to_qa_without_user_message(wake):
+    """Batch B regression — the named acceptance fixture: an Engineering PASS result
+    must produce a P1 continuation that, with NO intervening user/operator message,
+    instructs P1 (the governor) to route the NEXT lane (eng → QA) under policy.
+    The prompt is the autonomous-continuation contract; it explicitly tells P1 to act
+    now and not wait for a user message, and names route_to_lane as the next-lane
+    mechanism."""
+    p = wake.build_continuation_prompt(
+        wts_task="eaf06358-bccc-4986-bbd1-c0bb045106d9",
+        lane="engineering", gate="PASS",
+        run_dir="/x/runs/eng-run-1", result_file="/tmp/eng.md",
+    )
+    low = p.lower()
+    # Acts WITHOUT a user message (the whole point of the active wake).
+    assert "do not wait for a user message" in low or "do not go idle" in low
+    # eng PASS → QA is the worked example the contract names.
+    assert "engineering pass → qa" in low
+    assert "route_to_lane" in low
+    # And it remains a GOVERNOR turn, not a chat reply.
+    assert "workflow governor" in low
+
+
 def test_idempotency_key_is_stable(wake):
     k1 = wake.make_idempotency_key(run_id="r1", wts_task="t1", kind="lane-result")
     k2 = wake.make_idempotency_key(run_id="r1", wts_task="t1", kind="lane-result")
