@@ -114,7 +114,12 @@ def _get_subagent_approval_callback():
 # toolset to request explicitly — the correct mechanism for nested
 # delegation is role='orchestrator', which re-adds "delegation" in
 # _build_child_agent regardless of this exclusion.
-_EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "moa", "rl"})
+# "p1-dispatch" (route_to_lane/wts_bind/chain_status) is excluded alongside
+# "delegation" (2026-06-16 split): these tools were members of "delegation"
+# before the split, so excluding p1-dispatch preserves the prior behavior —
+# delegated sub-agents are not advertised/granted lane-dispatch capability
+# (separation of duties: only the parent P1 routes to lanes).
+_EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "p1-dispatch", "moa", "rl"})
 _SUBAGENT_TOOLSETS = sorted(
     name
     for name, defn in TOOLSETS.items()

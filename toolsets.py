@@ -188,8 +188,19 @@ TOOLSETS = {
     },
     
     "delegation": {
-        "description": "Spawn subagents with isolated context for complex subtasks; route work to specialist lanes; read chain status from the request_chains spine",
-        "tools": ["delegate_task", "route_to_lane", "wts_bind", "chain_status"],
+        "description": "Spawn subagents with isolated context for complex subtasks",
+        "tools": ["delegate_task"],
+        "includes": []
+    },
+
+    # P1 specialist-lane dispatch + chain-status read. Split out of "delegation"
+    # (2026-06-16) so a surface can keep the generic delegate_task tool while
+    # disabling the P1-only dispatch/chain tools — e.g. the personal advisor
+    # gateway sets agent.disabled_toolsets: [p1-dispatch]. Default-on like
+    # delegation was, so P1 (which disables nothing) is unaffected.
+    "p1-dispatch": {
+        "description": "Route work to specialist lanes and read chain status from the request_chains spine",
+        "tools": ["route_to_lane", "wts_bind", "chain_status"],
         "includes": []
     },
 
