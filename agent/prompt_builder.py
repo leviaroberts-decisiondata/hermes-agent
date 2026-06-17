@@ -1088,16 +1088,24 @@ def _load_cursorrules(cwd_path: Path) -> str:
 # so it is NOT resolved via HERMES_HOME (which points at a profile dir for
 # specialists). Override with DD_CONTEXT_TREE_ROOT (tests / relocation).
 _CONTEXT_TREE_AWARENESS_NODES = ["global", "operating-model", "platform"]
-# Per-node cap raised 6000 → 8500 (P5 review G1/G2): the composed operating-model
-# node (shared _core.md + the p1-specialists role view) is THE coordination
-# contract and legitimately the largest node — at 6000 it was truncating the
-# lane-registry / WTS-binding rules mid-section, which is exactly the awareness gap
-# the review found (P1 silently dropped lanes / skipped WTS binding). The other two
-# awareness nodes are tiny (global ~1.4k, platform ~0.9k), so the total stays far
-# under the 20000 total cap (≈10.8k for all three). Gateway-side only; the Slack
-# loader (dd-slack-service/src/context-tree.js) composes a different, smaller view
-# and is untouched.
-_CONTEXT_TREE_PER_NODE_CHAR_CAP = 8500
+# Per-node cap raised 6000 → 8500 (P5 review G1/G2), then 8500 → 16000
+# (2026-06-14 operating-model correction): the composed operating-model node
+# (shared _core.md + the audience role view) is THE coordination contract and
+# legitimately the largest node. At 8500 the p1-default view (composed ≈19.2k)
+# was being HARD-TRUNCATED at char 8500 — silently dropping the ENTIRE lane
+# registry, WTS-binding, and software-build-authority sections before they ever
+# reached the live P1 prompt. That is precisely why P1 overstepped (did port
+# reservation / registry register / a build / a release pin itself instead of
+# routing the Deploy/Ops lane) and then hung on the guard block: the rules that
+# say "route the lane, do not build it yourself; emit a clean HOLD on a blocked
+# boundary" were never delivered. p1-default is the ONLY view that exceeds 8500
+# (every other audience composes < 8500); raising the cap to 16800 affects only
+# the P1 node. The p1-default view is also trimmed so composed ≈16.7k < 16800,
+# and with the two tiny sibling nodes (global ~1.4k + platform ~0.9k) the 3-node
+# TOTAL stays ≈19.0k < the 20000 total cap (≈1k headroom). Gateway-side only; the
+# Slack loader (dd-slack-service/src/context-tree.js) composes a different, smaller
+# view and is untouched.
+_CONTEXT_TREE_PER_NODE_CHAR_CAP = 16800
 _CONTEXT_TREE_TOTAL_CHAR_CAP = 20000
 
 

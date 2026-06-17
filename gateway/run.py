@@ -9383,10 +9383,40 @@ class GatewayRunner:
                         # No adapter for this platform on THIS gateway — leave the
                         # event queued (do NOT mark processed); another gateway /
                         # a later connect may own it. Avoid a hot loop on it.
-                        logger.debug(
-                            "Lane-wake: no adapter for platform=%s; leaving event queued",
-                            platform_name,
-                        )
+                        #
+                        # Item 4b (2026-06-14): a wake with no adapter is a
+                        # VISIBILITY STALL — the operator's continuation never fires
+                        # and, at debug level, the stall was effectively silent. Log
+                        # it LOUDLY (warning) with the run/wts/lane so a routing gap
+                        # is operator-recoverable instead of invisibly queued. We
+                        # still leave the event queued (another gateway may own it) —
+                        # this only raises the signal, it does not change at-most-once
+                        # delivery. Bounded de-dup: only warn once per (key) so a
+                        # genuinely cross-gateway event does not spam the log each
+                        # drain tick.
+                        _stall_seen = getattr(self, "_lane_wake_stall_warned", None)
+                        if _stall_seen is None:
+                            _stall_seen = set()
+                            self._lane_wake_stall_warned = _stall_seen
+                        if key not in _stall_seen:
+                            _stall_seen.add(key)
+                            logger.warning(
+                                "Lane-wake STALL: no adapter for platform=%s on this "
+                                "gateway — continuation for lane=%s wts=%s run=%s is "
+                                "QUEUED but NOT delivered here; another gateway must "
+                                "own it or the operator continuation will not fire. "
+                                "Leaving event queued (at-most-once preserved).",
+                                platform_name,
+                                event.get("lane"),
+                                event.get("wts_task"),
+                                event.get("run_id"),
+                            )
+                        else:
+                            logger.debug(
+                                "Lane-wake: no adapter for platform=%s; event still "
+                                "queued (already warned)",
+                                platform_name,
+                            )
                         continue
                     synth_text = event.get("prompt") or lane_wake.build_continuation_prompt(
                         wts_task=event.get("wts_task"),
