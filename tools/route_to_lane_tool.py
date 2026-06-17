@@ -151,6 +151,341 @@ def _parse_status_gate(out: str, lane: str) -> "str | None":
     return None
 
 
+# ── Phase 3 (canary 72abe1ee 2026-06-17): exact-target verification contract ──
+#
+# When a caller (user → P1) names a URL/port/path as the acceptance surface, the
+# lane closeout cannot say done/live unless THAT exact target is verified. The
+# Slack/P1 canary on 2026-06-17 exposed two failure modes:
+#   1. Deploy Ops claimed `8641` aligned, but the user had asked for `8641` while
+#      the proof came from `8640` (canonical deploy target) — P1 wrongly accepted.
+#   2. Even when Deploy Ops returned a proof artifact for `8641`, the user's
+#      browser snapshot of `8641/settings` showed the regressed page — backend
+#      proof contradicted by browser DOM. P1 wrongly accepted on first pass.
+#
+# Contract: if the goal/context mention specific http(s):// URLs (or a bare
+# ``:port`` token), the lane result body must declare them VERIFIED — via lines
+# like ``Verified: <url>``, ``verified_target: <url>``, ``Browser: <url> ok``. If
+# none match, a clean PASS gate is downgraded to CHANGED-NOT-ACCEPTED ("blocked
+# on exact-target verification") so P1 surfaces the gap instead of claiming done.
+# A ``BROWSER-CONTRADICTS:`` (or ``Browser: ... DOES NOT MATCH``) line is the
+# stronger "browser evidence wins" signal and is reported as a hard contradiction.
+
+# Tokens callers use to declare an acceptance target inside the packet body. We
+# accept several spellings so an existing packet template that already names a
+# target ("Acceptance URL:", "Target:") still binds without rewording.
+_REQUESTED_TARGET_PREFIXES = (
+    "acceptance url",
+    "acceptance target",
+    "acceptance surface",
+    "requested target",
+    "requested acceptance",
+    "review surface",
+    "review url",
+    "target url",
+    "target",  # generic; matched last so the more specific tokens above win
+)
+
+# Tokens the lane result body uses to declare a target was actually verified.
+# ``Verified:``/``verified_target:``/``Browser: <url> ok``/``Live:`` etc.
+_VERIFIED_PREFIXES = (
+    "verified target",
+    "verified_target",
+    "verified",
+    "live",
+    "browser",
+)
+
+# Strong "browser DOM contradicts deploy proof" markers — terminal block on the
+# named target even if other proof rows look green.
+_CONTRADICTION_MARKERS = (
+    "browser-contradicts",
+    "browser contradicts",
+    "does not match",
+    "still regressed",
+    "still shows old",
+    "browser-mismatch",
+    "browser mismatch",
+)
+
+# A URL/port matcher tight enough to ignore prose. Captures:
+#   * full http(s)://… URLs (path optional)
+#   * bare host:port (with port 1024-65535 to avoid year/timestamp false-positives)
+_URL_RE = re.compile(
+    r"https?://[A-Za-z0-9.\-]+(?::\d{2,5})?(?:/[^\s<>`\"')]*)?",
+    re.IGNORECASE,
+)
+_HOST_PORT_RE = re.compile(
+    r"(?:^|[\s(,])(\d{1,3}(?:\.\d{1,3}){3}|[A-Za-z][A-Za-z0-9.\-]*):(\d{2,5})(?=/[^\s<>`\"')]*|[\s,)?]|$)",
+)
+
+
+def _normalize_target(token: str) -> str:
+    """Normalize a target string for set comparison.
+
+    Strips trailing punctuation, lowercases the host, drops a trailing slash from
+    the path, drops default ports (http=80, https=443). Bare host:port becomes
+    ``host:port`` (no scheme); URLs keep their scheme.
+    """
+    if not token:
+        return ""
+    t = token.strip().rstrip(".,;:)]>`'\"")
+    # Pull off a trailing path-only slash but keep paths like /settings.
+    if t.lower().startswith(("http://", "https://")):
+        # split scheme://host[:port][/path]
+        try:
+            scheme, rest = t.split("://", 1)
+        except ValueError:
+            return t.lower()
+        if "/" in rest:
+            host_port, path = rest.split("/", 1)
+            path = "/" + path
+        else:
+            host_port, path = rest, ""
+        host_port = host_port.lower()
+        # Drop default-port suffix so http://x:80/y == http://x/y.
+        if scheme.lower() == "http" and host_port.endswith(":80"):
+            host_port = host_port[: -len(":80")]
+        elif scheme.lower() == "https" and host_port.endswith(":443"):
+            host_port = host_port[: -len(":443")]
+        if path == "/":
+            path = ""
+        return f"{scheme.lower()}://{host_port}{path}"
+    # Bare host:port (or :port) — lowercase host.
+    return t.lower()
+
+
+def _extract_targets(text: str) -> list[str]:
+    """Pull URL-shaped tokens from a free-text blob, deduped, in source order.
+
+    Used to find user-named acceptance targets in the packet goal/context and to
+    find lane-declared verified targets in the result body. Quoted/parenthesized
+    forms are stripped; bare ``host:port`` segments are kept as-is so a request
+    naming ``:8641`` still produces a target token.
+    """
+    if not text:
+        return []
+    seen: dict[str, None] = {}  # ordered set
+    for m in _URL_RE.finditer(text):
+        n = _normalize_target(m.group(0))
+        if n:
+            seen.setdefault(n, None)
+    for m in _HOST_PORT_RE.finditer(text):
+        token = f"{m.group(1)}:{m.group(2)}"
+        n = _normalize_target(token)
+        # Avoid double-counting tokens already produced by _URL_RE (those will be
+        # ``http(s)://host:port…`` — strip the scheme to compare).
+        if n in seen:
+            continue
+        # Don't capture a bare host:port if any URL with the same host:port path
+        # is already present.
+        if any(s.endswith(f"://{n}") or f"://{n}/" in s for s in seen):
+            continue
+        seen.setdefault(n, None)
+    return list(seen.keys())
+
+
+def _parse_requested_targets(packet_text: str) -> list[str]:
+    """Find every URL/port/path the packet body explicitly names as an acceptance
+    target.
+
+    We look ONLY at lines that lead with an acceptance-token prefix (``Acceptance
+    URL:``, ``Target:``, …). A URL casually mentioned elsewhere in the goal is NOT
+    treated as a hard acceptance gate — only lines that read like a contract. This
+    avoids over-blocking on prose like "see http://example.com for context".
+    """
+    if not packet_text:
+        return []
+    out: list[str] = []
+    for raw_line in packet_text.splitlines():
+        line = raw_line.strip().lstrip("-*•").strip()
+        low = line.lower()
+        if not any(
+            low.startswith(p + ":") or low.startswith(p + " ") or low.startswith(p + "=")
+            for p in _REQUESTED_TARGET_PREFIXES
+        ):
+            continue
+        # Strip the prefix tag so we only extract from the value portion.
+        # e.g. "Acceptance URL: http://x:8641/settings" → "http://x:8641/settings"
+        body = line
+        for p in _REQUESTED_TARGET_PREFIXES:
+            if low.startswith(p + ":") or low.startswith(p + " ") or low.startswith(p + "="):
+                body = line[len(p):].lstrip(":= \t")
+                break
+        for t in _extract_targets(body):
+            if t not in out:
+                out.append(t)
+    return out
+
+
+def _parse_verified_targets(result_text: str) -> list[str]:
+    """Find every URL/port the lane result body declares VERIFIED.
+
+    Matches lines that lead with a verification token (``Verified:``, ``Browser:``,
+    …) AND positively assert success (the line contains a positive marker like
+    ``ok``, ``pass``, ``matches``, ``accepted``, OR has NO negative marker).
+    A line like ``Browser: http://x:8641/settings DOES NOT MATCH`` is NOT a
+    verification — it's a contradiction (caught separately).
+    """
+    if not result_text:
+        return []
+    out: list[str] = []
+    NEG = ("does not match", "regressed", "old ui", "fail", "fails", "blocked", "blocker", "mismatch")
+    POS = ("ok", "pass", "matches", "accepted", "verified", "live", "confirmed", "200")
+    for raw_line in result_text.splitlines():
+        line = raw_line.strip().lstrip("-*•#").strip()
+        low = line.lower()
+        if not any(
+            low.startswith(p + ":") or low.startswith(p + " ") or low.startswith(p + "=")
+            for p in _VERIFIED_PREFIXES
+        ):
+            continue
+        if any(neg in low for neg in NEG):
+            continue
+        if not any(pos in low for pos in POS):
+            # No explicit positive marker — accept only if the line is JUST the
+            # prefix + a URL (e.g. ``Verified: http://x:8641/settings``).
+            stripped = low
+            for p in _VERIFIED_PREFIXES:
+                if stripped.startswith(p):
+                    stripped = stripped[len(p):].lstrip(":= \t")
+                    break
+            # If only a URL/host:port remains, treat it as a positive verification.
+            urls = _extract_targets(stripped)
+            if not urls or urls[0] != stripped.split()[0].strip(".,;:)]>`'\"").lower() if stripped.split() else False:
+                continue
+        body = line
+        for p in _VERIFIED_PREFIXES:
+            if low.startswith(p + ":") or low.startswith(p + " ") or low.startswith(p + "="):
+                body = line[len(p):].lstrip(":= \t")
+                break
+        for t in _extract_targets(body):
+            if t not in out:
+                out.append(t)
+    return out
+
+
+def _has_browser_contradiction(result_text: str) -> bool:
+    """A loud "browser DOM contradicts the backend proof" marker in the result.
+
+    When present, the lane's gate cannot stand even if every other proof row says
+    PASS — the named target's actual surface still regressed.
+    """
+    if not result_text:
+        return False
+    low = result_text.lower()
+    return any(m in low for m in _CONTRADICTION_MARKERS)
+
+
+def _parse_targets_segment(out: str, lane: str) -> "dict | None":
+    """Parse a ``| targets=verified=URL+URL;contradicts=0|1`` segment from the
+    wrapper's single-line normalized status output (Phase 3).
+
+    The wrapper extracts verified targets + browser-contradiction state from the
+    lane's result body (which never crosses the wrapper boundary into stdout),
+    then surfaces them as a compact segment on its normalized status line. Returns
+    ``{"verified": [...], "contradicts": bool}`` when present, else None.
+    """
+    if not out:
+        return None
+    prefix = f"[{lane}]"
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith(prefix):
+            continue
+        # Find the `targets=` token inside the pipe-delimited line.
+        for seg in line.split("|"):
+            seg = seg.strip()
+            if not seg.lower().startswith("targets="):
+                continue
+            body = seg[len("targets="):]
+            verified: list[str] = []
+            contradicts = False
+            for kv in body.split(";"):
+                kv = kv.strip()
+                if kv.lower().startswith("verified="):
+                    raw = kv[len("verified="):]
+                    # `+` is the inner separator (won't collide with URL chars
+                    # the way `,` does).
+                    for item in raw.split("+"):
+                        item = item.strip()
+                        if not item:
+                            continue
+                        n = _normalize_target(item)
+                        if n and n not in verified:
+                            verified.append(n)
+                elif kv.lower().startswith("contradicts="):
+                    val = kv[len("contradicts="):].strip().lower()
+                    contradicts = val in ("1", "true", "yes")
+            return {"verified": verified, "contradicts": contradicts}
+        return None
+    return None
+
+
+def _target_match(requested: list[str], verified: list[str]) -> tuple[bool, list[str]]:
+    """Is every requested target covered by at least one verified target?
+
+    Returns (all_matched, missing). A requested target is covered when an entry in
+    ``verified`` has the same normalized value OR (for a bare ``host:port``
+    request) a verified URL contains that host:port.
+    """
+    if not requested:
+        return True, []
+    verified_set = set(verified)
+    missing: list[str] = []
+    for r in requested:
+        if r in verified_set:
+            continue
+        # ``host:port`` request matched by any verified ``http(s)://host:port…``
+        if not r.startswith(("http://", "https://")):
+            host_port = r
+            if any(
+                v.startswith(("http://", "https://"))
+                and (f"://{host_port}" in v or v.endswith(f"://{host_port}"))
+                for v in verified
+            ):
+                continue
+        missing.append(r)
+    return (not missing), missing
+
+
+def evaluate_exact_target_acceptance(
+    packet_text: str, result_text: str
+) -> dict:
+    """Phase 3 verdict: did the lane verify the EXACT targets the caller named?
+
+    Returns a dict with:
+      * requested_acceptance_targets: list of URLs/ports named in the packet
+      * verified_targets:             list of URLs/ports the result declared verified
+      * target_match:                 True iff every requested is covered
+      * browser_contradicts:          True iff the result body declares a browser
+                                      DOM contradiction (terminal block)
+      * status:                       "ok" (matched or no targets named),
+                                      "not_accepted_on_target" (missing targets),
+                                      "browser_contradiction" (terminal block)
+      * missing:                      list of requested targets with no verify
+    """
+    requested = _parse_requested_targets(packet_text or "")
+    verified = _parse_verified_targets(result_text or "")
+    contradicts = _has_browser_contradiction(result_text or "")
+    matched, missing = _target_match(requested, verified)
+    if contradicts:
+        status = "browser_contradiction"
+    elif not requested:
+        status = "ok"
+    elif matched:
+        status = "ok"
+    else:
+        status = "not_accepted_on_target"
+    return {
+        "requested_acceptance_targets": requested,
+        "verified_targets": verified,
+        "target_match": matched and not contradicts,
+        "browser_contradicts": contradicts,
+        "status": status,
+        "missing": missing,
+    }
+
+
 def _parse_session_origin(session_key: str) -> "dict | None":
     """Parse a gateway session_key into platform/chat_type/chat_id/thread.
 
@@ -502,6 +837,57 @@ def route_to_lane(
             f"{warn}"
         )
     if ran_ok:
+        # Phase 3 (canary 72abe1ee 2026-06-17): exact-target acceptance gate.
+        # If the packet names specific http(s) URLs or ``:port``s as acceptance
+        # targets and the lane result does NOT declare them verified, the OK
+        # status is DOWNGRADED to "changed but not accepted on target" — exactly
+        # the canary failure mode (8640 proof for an 8641 ask). A loud browser
+        # contradiction is a stronger terminal block ("browser evidence wins").
+        # The packet body is what carries the requested targets (packet_path is
+        # the file the caller built above). The wrapper boundary hides the lane's
+        # full result body from us, so the wrapper surfaces a compact
+        # ``| targets=verified=A+B;contradicts=0|1`` segment on its single-line
+        # normalized stdout, which we parse here. Falling back to scanning the
+        # raw stdout itself catches an in-band result body too (legacy callers).
+        packet_body = ""
+        try:
+            packet_body = Path(packet_path).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            packet_body = ""
+        seg = _parse_targets_segment(out, lane)
+        if seg is not None:
+            # The wrapper did its own scan — synthesize a result blob so the
+            # evaluator sees the same shape it would in the legacy path.
+            synth = "\n".join(f"Verified: {u}" for u in seg["verified"]) + (
+                "\nBrowser-contradicts: yes" if seg["contradicts"] else ""
+            )
+            verdict = evaluate_exact_target_acceptance(packet_body, synth)
+        else:
+            verdict = evaluate_exact_target_acceptance(packet_body, out)
+        if verdict["status"] == "browser_contradiction":
+            return tool_error(
+                f"HANDOFF NOT-ACCEPTED — the '{lane}' lane returned a clean gate, "
+                f"but the result body says the BROWSER DOM CONTRADICTS the backend "
+                f"proof on the named acceptance target(s). Browser evidence wins "
+                f"for user-facing UI acceptance — do NOT report this as done/live; "
+                f"surface the contradiction to the user.\n"
+                f"requested_acceptance_targets: {', '.join(verdict['requested_acceptance_targets']) or '(none parsed)'}\n"
+                f"verified_targets: {', '.join(verdict['verified_targets']) or '(none)'}\n"
+                f"{out}"
+            )
+        if verdict["status"] == "not_accepted_on_target":
+            return tool_error(
+                f"HANDOFF CHANGED-NOT-ACCEPTED — the '{lane}' lane returned a clean "
+                f"gate, but the result body did NOT verify the EXACT acceptance "
+                f"target(s) the caller named. Backend/canonical proof cannot "
+                f"substitute for the named review surface. Do NOT report this as "
+                f"done/live; report it as 'changed but blocked on exact-target "
+                f"verification' and surface the missing targets.\n"
+                f"requested_acceptance_targets: {', '.join(verdict['requested_acceptance_targets'])}\n"
+                f"verified_targets: {', '.join(verdict['verified_targets']) or '(none declared)'}\n"
+                f"missing: {', '.join(verdict['missing'])}\n"
+                f"{out}"
+            )
         # Surface any non-fatal delivery warnings (e.g. I3 bucket fallback) loudly.
         warn = ""
         if err:
@@ -509,9 +895,20 @@ def route_to_lane(
             warn_lines = [l for l in err.splitlines() if "warn" in l.lower() or "WARN" in l]
             if warn_lines:
                 warn = "\n[handoff warnings]\n" + "\n".join(warn_lines[:8])
+        # When the packet DID name acceptance targets and they were all matched,
+        # echo the match so the caller's closeout can quote them honestly.
+        target_note = ""
+        if verdict["requested_acceptance_targets"]:
+            target_note = (
+                "\n[exact-target verification]\n"
+                f"requested: {', '.join(verdict['requested_acceptance_targets'])}\n"
+                f"verified:  {', '.join(verdict['verified_targets'])}\n"
+                f"target_match: true"
+            )
         return (
             f"HANDOFF OK — routed to '{lane}' lane and the lane returned.\n"
             f"{out}"
+            f"{target_note}"
             f"{warn}"
         )
 

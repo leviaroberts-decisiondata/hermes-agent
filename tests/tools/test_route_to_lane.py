@@ -646,3 +646,229 @@ class TestPCReaperRegistration:
         assert "thread_id" not in grp
         assert r2l._parse_session_origin("garbage") is None
         assert r2l._parse_session_origin("") is None
+
+
+# ── Phase 3 (canary 72abe1ee 2026-06-17): exact-target verification contract ──
+#
+# If the packet names a URL/port/path (Acceptance URL: …), the lane closeout
+# cannot say HANDOFF OK unless that exact target is verified in the result body.
+# Backend / canonical proof cannot substitute for the named review surface.
+# Browser DOM contradiction wins over backend proof.
+class TestPhase3ExactTargetAcceptance:
+    """The packet → result verification contract.
+
+    Tests are split between (a) the pure helpers that parse targets out of free
+    text (no fake_tree needed) and (b) the route_to_lane integration that
+    downgrades HANDOFF OK to NOT-ACCEPTED when the packet's named target(s) are
+    not verified by the lane.
+    """
+
+    # ── Pure helpers: target extraction + verdict ──
+    def test_extract_targets_from_named_acceptance_url(self):
+        body = (
+            "## Goal\n"
+            "Fix the regressed Settings page.\n\n"
+            "Acceptance URL: http://100.94.241.120:8641/settings\n"
+            "Target: http://100.94.241.120:8641/ai\n"
+        )
+        got = r2l._parse_requested_targets(body)
+        assert "http://100.94.241.120:8641/settings" in got
+        assert "http://100.94.241.120:8641/ai" in got
+        # A casual URL in goal-prose (no acceptance-token prefix) is NOT a target.
+        assert "http://example.com/context" not in got
+
+    def test_extract_ignores_casual_url_in_prose(self):
+        # A "see http://x" mention without an acceptance-token line must NOT
+        # become a hard acceptance gate (would over-block prose handoffs).
+        body = (
+            "## Goal\n"
+            "See http://example.com/context for the design doc.\n"
+        )
+        assert r2l._parse_requested_targets(body) == []
+
+    def test_parse_verified_targets_from_result_body(self):
+        body = (
+            "Engineering result\n"
+            "Verified: http://100.94.241.120:8641/settings ok\n"
+            "Browser: http://100.94.241.120:8641/ai matches new UI\n"
+        )
+        got = r2l._parse_verified_targets(body)
+        assert "http://100.94.241.120:8641/settings" in got
+        assert "http://100.94.241.120:8641/ai" in got
+
+    def test_parse_verified_ignores_negative_browser_line(self):
+        body = (
+            "Browser: http://100.94.241.120:8641/settings DOES NOT MATCH expected UI\n"
+            "Verified: http://100.94.241.120:8640/settings ok\n"
+        )
+        got = r2l._parse_verified_targets(body)
+        # The contradicting line is NOT a verification.
+        assert "http://100.94.241.120:8641/settings" not in got
+        # The canonical 8640 IS verified, but for a different host:port.
+        assert "http://100.94.241.120:8640/settings" in got
+
+    def test_browser_contradiction_detected(self):
+        body = (
+            "All proof rows green.\n"
+            "Browser: 8641/settings DOES NOT MATCH the new UI — still shows old Settings.\n"
+        )
+        assert r2l._has_browser_contradiction(body) is True
+
+    def test_evaluate_canary_scenario_8640_proof_8641_request(self):
+        # The exact canary failure: user named :8641, Deploy Ops returned :8640
+        # proof. The verdict must be NOT accepted on target.
+        packet = (
+            "## Goal\nApp Starter Kit settings cleanup.\n\n"
+            "Acceptance URL: http://100.94.241.120:8641/settings\n"
+        )
+        result = (
+            "[deploy-ops] PASS | deploy aligned on canonical target\n"
+            "Verified: http://100.94.241.120:8640/settings ok\n"
+        )
+        v = r2l.evaluate_exact_target_acceptance(packet, result)
+        assert v["status"] == "not_accepted_on_target"
+        assert v["target_match"] is False
+        assert "http://100.94.241.120:8641/settings" in v["missing"]
+        assert "http://100.94.241.120:8641/settings" in v["requested_acceptance_targets"]
+
+    def test_evaluate_browser_contradicts_overrides_deploy_proof(self):
+        # Deploy Ops claims 8641 aligned, but browser DOM contradicts. The
+        # verdict must be browser_contradiction — never accepted.
+        packet = "Acceptance URL: http://100.94.241.120:8641/settings\n"
+        result = (
+            "[deploy-ops] PASS | deploy claims aligned on 8641\n"
+            "Verified: http://100.94.241.120:8641/settings ok\n"
+            "Browser: http://100.94.241.120:8641/settings DOES NOT MATCH — still old UI\n"
+        )
+        v = r2l.evaluate_exact_target_acceptance(packet, result)
+        assert v["status"] == "browser_contradiction"
+        assert v["browser_contradicts"] is True
+        assert v["target_match"] is False
+
+    def test_evaluate_browser_proof_on_exact_url_satisfies(self):
+        packet = "Acceptance URL: http://100.94.241.120:8641/settings\n"
+        result = (
+            "[deploy-ops] PASS | deploy aligned\n"
+            "Verified: http://100.94.241.120:8641/settings ok\n"
+            "Browser: http://100.94.241.120:8641/settings matches new UI\n"
+        )
+        v = r2l.evaluate_exact_target_acceptance(packet, result)
+        assert v["status"] == "ok"
+        assert v["target_match"] is True
+        assert v["missing"] == []
+
+    def test_evaluate_no_targets_named_is_ok(self):
+        # A handoff that does NOT name a specific acceptance URL must NOT be
+        # blocked by this gate — keep existing behaviour for non-UI work.
+        packet = "## Goal\nWrite a Markdown explainer.\n"
+        result = "[design] PASS | wrote the explainer\n"
+        v = r2l.evaluate_exact_target_acceptance(packet, result)
+        assert v["status"] == "ok"
+        assert v["target_match"] is True
+        assert v["requested_acceptance_targets"] == []
+
+    # ── route_to_lane integration: HANDOFF OK → NOT-ACCEPTED downgrade ──
+    def _drive_with_packet(self, fake_tree, monkeypatch, *, goal, result_stdout):
+        # Force route_to_lane to build a packet from `goal`, then have the fake
+        # wrapper print the canned `result_stdout` (which carries the lane's
+        # result body + the normalized status line).
+        monkeypatch.setenv("FAKE_EXIT", "0")
+        monkeypatch.setenv("FAKE_STDOUT", result_stdout)
+        return r2l.route_to_lane(lane="qa", goal=goal)
+
+    def test_handoff_8640_proof_for_8641_request_downgraded(self, fake_tree, monkeypatch):
+        # The canary: packet asks for :8641, wrapper returns clean PASS with the
+        # wrapper-side targets segment listing only :8640 as verified. HANDOFF OK
+        # must be DOWNGRADED to NOT-ACCEPTED so P1 cannot close it as done.
+        goal = (
+            "App Starter Kit settings cleanup.\n"
+            "Acceptance URL: http://100.94.241.120:8641/settings"
+        )
+        result_stdout = (
+            "[qa] PASS | deploy aligned on canonical target | #dd-lane-qa ts=1.1 | "
+            "targets=verified=http://100.94.241.120:8640/settings;contradicts=0"
+        )
+        out = self._drive_with_packet(
+            fake_tree, monkeypatch, goal=goal, result_stdout=result_stdout
+        )
+        assert "HANDOFF OK" not in out, out
+        assert "HANDOFF CHANGED-NOT-ACCEPTED" in out
+        assert "http://100.94.241.120:8641/settings" in out  # missing target named
+        assert "blocked on exact-target verification" in out.lower()
+
+    def test_handoff_browser_contradicts_blocks_done(self, fake_tree, monkeypatch):
+        goal = (
+            "Settings page regression fix.\n"
+            "Acceptance URL: http://100.94.241.120:8641/settings"
+        )
+        result_stdout = (
+            "[qa] PASS | deploy claims aligned on 8641 | #dd-lane-qa ts=2.2 | "
+            "targets=verified=http://100.94.241.120:8641/settings;contradicts=1"
+        )
+        out = self._drive_with_packet(
+            fake_tree, monkeypatch, goal=goal, result_stdout=result_stdout
+        )
+        assert "HANDOFF OK" not in out, out
+        assert "HANDOFF NOT-ACCEPTED" in out
+        assert "browser dom contradicts" in out.lower()
+
+    def test_handoff_named_target_and_matching_browser_proof_is_ok(self, fake_tree, monkeypatch):
+        goal = "Acceptance URL: http://100.94.241.120:8641/settings"
+        result_stdout = (
+            "[qa] PASS | aligned and verified | #dd-lane-qa ts=3.3 | "
+            "targets=verified=http://100.94.241.120:8641/settings;contradicts=0"
+        )
+        out = self._drive_with_packet(
+            fake_tree, monkeypatch, goal=goal, result_stdout=result_stdout
+        )
+        assert "HANDOFF OK" in out
+        # The echoed target-verification block tells P1 what was matched.
+        assert "exact-target verification" in out
+        assert "http://100.94.241.120:8641/settings" in out
+        assert "target_match: true" in out
+
+    def test_parse_targets_segment_extracts_verified_and_contradicts(self):
+        out = (
+            "[qa] PASS | aligned | #c ts=1 | "
+            "targets=verified=http://x:8641/settings+http://x:8641/ai;contradicts=0"
+        )
+        seg = r2l._parse_targets_segment(out, "qa")
+        assert seg is not None
+        assert "http://x:8641/settings" in seg["verified"]
+        assert "http://x:8641/ai" in seg["verified"]
+        assert seg["contradicts"] is False
+
+        out2 = (
+            "[qa] PASS | aligned | #c ts=1 | "
+            "targets=verified=http://x:8641/settings;contradicts=1"
+        )
+        seg2 = r2l._parse_targets_segment(out2, "qa")
+        assert seg2["contradicts"] is True
+
+        # No segment → None (legacy wrapper)
+        assert r2l._parse_targets_segment("[qa] PASS | x | #c ts=1", "qa") is None
+
+    def test_handoff_no_named_targets_unchanged(self, fake_tree, monkeypatch):
+        # Regression guard: a packet that names NO acceptance URL must NOT be
+        # blocked by the Phase 3 gate (otherwise design/research handoffs break).
+        goal = "Write a Markdown explainer for the project channel."
+        result_stdout = "[qa] PASS | wrote explainer | #dd-lane-qa ts=4.4"
+        out = self._drive_with_packet(
+            fake_tree, monkeypatch, goal=goal, result_stdout=result_stdout
+        )
+        assert "HANDOFF OK" in out
+        assert "CHANGED-NOT-ACCEPTED" not in out
+        assert "NOT-ACCEPTED" not in out
+
+    def test_bare_port_request_matched_by_full_url_proof(self):
+        # Levi's pattern: ask "verify the :8641 surface", proof line carries the
+        # full http://host:8641/ URL. They must reconcile.
+        packet = "Acceptance target: 100.94.241.120:8641/settings\n"
+        result = "Verified: http://100.94.241.120:8641/settings ok\n"
+        v = r2l.evaluate_exact_target_acceptance(packet, result)
+        assert v["status"] == "ok"
+
+    def test_normalize_drops_default_ports_and_trailing_slash(self):
+        assert r2l._normalize_target("HTTP://Example.com:80/") == "http://example.com"
+        assert r2l._normalize_target("https://Example.COM:443/foo") == "https://example.com/foo"
+        assert r2l._normalize_target("http://x:8641/settings.") == "http://x:8641/settings"
