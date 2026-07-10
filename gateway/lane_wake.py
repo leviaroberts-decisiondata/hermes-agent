@@ -99,6 +99,8 @@ def build_continuation_prompt(
     result_relation: Optional[str] = None,
     result_file: Optional[str] = None,
     result_sha: Optional[str] = None,
+    terminal_state: Optional[str] = None,
+    retry_disposition: Optional[str] = None,
 ) -> str:
     """The STRUCTURED INTERNAL continuation prompt P1 receives on wake (req 5).
 
@@ -114,7 +116,9 @@ def build_continuation_prompt(
         f"WTS: {wts_task or '(none — see safety note)'}\n"
         f"Lane: {lane}\n"
         f"Gate: {gate}\n"
-        f"Run dir: {run_dir}\n"
+        + (f"Terminal state: {terminal_state}\n" if terminal_state else "")
+        + (f"Retry disposition: {retry_disposition}\n" if retry_disposition else "")
+        + f"Run dir: {run_dir}\n"
         f"Run id: {run_id}\n"
         f"Result artifact: {art}"
         + (f"  (sha {result_sha[:12]})" if result_sha else "")
@@ -137,6 +141,15 @@ def build_continuation_prompt(
         "Surfacing a deploy-ready state and HOLDING is correct; taking the last "
         "mile is not. If WTS is unknown/missing, HOLD and surface that — do not "
         "best-effort continue."
+        + (
+            "\n\nRETRY POLICY (hard, WTS ac4bcb05): this execution ended "
+            f"{terminal_state}. Do NOT re-dispatch an IDENTICAL packet on the same "
+            "rail — the runner will refuse it (RETRY_BLOCKED). Either NARROW the "
+            "scope (smaller packet), promote to the durable/background rail "
+            "(dd-lane-run --background, collect with --poll), or HOLD and "
+            "escalate to the operator with the partial evidence."
+            if terminal_state in ("timed_out", "orphaned") else ""
+        )
     )
 
 
@@ -156,6 +169,8 @@ def emit_wake_event(
     result_file: Optional[str] = None,
     result_sha: Optional[str] = None,
     source_label: str = "dd-lane-reaper",
+    terminal_state: Optional[str] = None,
+    retry_disposition: Optional[str] = None,
 ) -> str:
     """Enqueue a single ACTIVE-WAKE event onto the durable file queue.
 
@@ -214,6 +229,8 @@ def emit_wake_event(
             "result_file": result_file or None,
             "result_sha": result_sha or None,
             "source_label": source_label,
+            "terminal_state": (terminal_state or "").strip() or None,
+            "retry_disposition": (retry_disposition or "").strip() or None,
             "enqueued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         event["prompt"] = build_continuation_prompt(
@@ -224,6 +241,8 @@ def emit_wake_event(
             result_relation=result_relation,
             result_file=result_file,
             result_sha=result_sha,
+            terminal_state=event["terminal_state"],
+            retry_disposition=event["retry_disposition"],
         )
 
         # Atomic write: tmp in the same dir, then os.replace.
@@ -356,6 +375,8 @@ def _main(argv: list[str]) -> int:
     ap.add_argument("--result-file", default="")
     ap.add_argument("--result-sha", default="")
     ap.add_argument("--source-label", default="dd-lane-reaper")
+    ap.add_argument("--terminal-state", default="", help="typed terminal state (terminal-state/1)")
+    ap.add_argument("--retry-disposition", default="", help="typed retry disposition (terminal-state/1)")
     ap.add_argument("--list", action="store_true", help="print pending events (no secrets)")
     args = ap.parse_args(argv)
 
@@ -380,6 +401,8 @@ def _main(argv: list[str]) -> int:
             result_file=args.result_file or None,
             result_sha=args.result_sha or None,
             source_label=args.source_label,
+            terminal_state=args.terminal_state or None,
+            retry_disposition=args.retry_disposition or None,
         )
         print(token)
         # Exit 0 on a clean emit/skip; 9 only on a real error (so bash can log it).
