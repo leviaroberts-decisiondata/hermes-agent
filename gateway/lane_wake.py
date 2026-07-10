@@ -46,6 +46,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 import hashlib
 import tempfile
@@ -55,6 +56,78 @@ from typing import Optional
 
 def hermes_home() -> Path:
     return Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+# ── GOVERNOR ADMISSION (WTS 319dc317, §4). Best-effort import of the ONE admission
+# authority from ~/.hermes/bin, mirroring the driver's discipline: a missing helper
+# NEVER breaks the wake. lane_wake is one of the two loops §4 names ("you wire
+# lane_wake here"). SHADOW-ONLY here: a wake for a failed lane still emits exactly
+# as today; the admission verdict is journaled + surfaced in the continuation prompt
+# so P1 sees the governor's would-stop, but the wake is NOT suppressed (enforce is a
+# separate Levi-gated decision on the P1 continuation path, not this emit).
+def _admission_bin_dir() -> str:
+    return str((hermes_home() / "bin"))
+
+
+try:
+    if _admission_bin_dir() not in sys.path:
+        sys.path.insert(0, _admission_bin_dir())
+    from dd_admission import admit_attempt as _admit_attempt  # noqa: E402
+    from dd_admission import normalize_failure_class as _admit_normalize  # noqa: E402
+    from dd_admission import convergence_fingerprint as _admit_fingerprint  # noqa: E402
+    _ADMISSION_AVAILABLE = True
+except Exception:
+    _ADMISSION_AVAILABLE = False
+
+    def _admit_attempt(*_a, **_k):  # type: ignore
+        return None
+
+    def _admit_normalize(_x):  # type: ignore
+        return "unknown"
+
+    def _admit_fingerprint(**_k):  # type: ignore
+        return ""
+
+
+# A wake carries a WORK-RETRY signal only for these terminal states / gates; a
+# clean PASS wake is a normal continuation, NOT a retry, and is not admitted.
+_RETRY_TERMINAL_STATES = frozenset({"timed_out", "orphaned", "recovery_required"})
+_RETRY_GATES = frozenset({"FAIL", "FAILED", "BLOCK", "BLOCKED", "ERROR", "STALLED",
+                          "NEEDS-YOU", "NEEDSYOU"})
+
+
+def _is_work_retry_wake(gate: str, terminal_state: Optional[str]) -> bool:
+    g = (gate or "").strip().upper()
+    ts = (terminal_state or "").strip().lower()
+    return ts in _RETRY_TERMINAL_STATES or g in _RETRY_GATES
+
+
+def shadow_admission_for_wake(*, wts_task: Optional[str], lane: str, gate: str,
+                              run_id: str, terminal_state: Optional[str],
+                              elapsed: Optional[int] = None) -> Optional[dict]:
+    """Consult the ONE admission authority for a wake that WOULD drive a work retry.
+    Returns the decision dict (also journaled) or None (not a retry wake / module
+    unavailable). SHADOW: the caller still emits the wake; it only records the
+    verdict + surfaces it. obligation_id == wts_task (the parent identity)."""
+    if not _ADMISSION_AVAILABLE:
+        return None
+    if not _is_work_retry_wake(gate, terminal_state):
+        return None
+    obligation = (wts_task or "").strip() or f"lane:{lane}"
+    fclass = _admit_normalize(terminal_state or gate or lane)
+    # stable root key so a relabel (timed_out↔orphaned on the same lane) shares
+    # one retry budget line.
+    rck = f"{obligation}:{lane}:{fclass}"
+    attempt_id = f"{obligation}:{lane}:{run_id or 'run'}"
+    fp = _admit_fingerprint(failure_class=fclass, target_surface=lane,
+                            acceptance_test=(gate or ""), root_cause_key=rck)
+    try:
+        dec = _admit_attempt(obligation, attempt_id, fclass, rck,
+                             delta=None, elapsed=elapsed,
+                             convergence=fp, mode="shadow", persist=True)
+        return dec.__dict__ if dec is not None else None
+    except Exception:
+        return None
 
 
 def wake_queue_dir() -> Path:
@@ -101,6 +174,7 @@ def build_continuation_prompt(
     result_sha: Optional[str] = None,
     terminal_state: Optional[str] = None,
     retry_disposition: Optional[str] = None,
+    gov_admission: Optional[dict] = None,
 ) -> str:
     """The STRUCTURED INTERNAL continuation prompt P1 receives on wake (req 5).
 
@@ -149,6 +223,18 @@ def build_continuation_prompt(
             "(dd-lane-run --background, collect with --poll), or HOLD and "
             "escalate to the operator with the partial evidence."
             if terminal_state in ("timed_out", "orphaned") else ""
+        )
+        + (
+            "\n\nGOVERNOR ADMISSION (§4, SHADOW — advisory this run): the mission "
+            f"governor's verdict for a retry here is **{gov_admission.get('verdict')}** "
+            f"(reason: {gov_admission.get('reason')}; root-cause retries used "
+            f"{gov_admission.get('class_retries_used')}, total {gov_admission.get('total_retries_used')}). "
+            + ("It WOULD STOP an automatic retry — prefer consolidating to a single "
+               "operator decision over re-dispatching. "
+               if gov_admission.get("would_stop") else
+               "It would admit a retry that carries a MEANINGFUL delta. ")
+            + "This is shadow guidance; enforcement is operator-gated."
+            if gov_admission else ""
         )
     )
 
@@ -211,6 +297,13 @@ def emit_wake_event(
         if (_enqueued_dir() / fname).exists() or (qdir / f"{fname}.json").exists():
             return f"skipped(dup:{key})"
 
+        # GOVERNOR ADMISSION (§4, SHADOW) — for a wake that would drive a work
+        # retry, record the would-stop verdict + surface it in the prompt. Does
+        # NOT suppress the wake (shadow); persist-before-dispatch is honored (the
+        # decision is journaled before the event is written).
+        gov = shadow_admission_for_wake(wts_task=wts_task, lane=lane, gate=gate,
+                                        run_id=run_id, terminal_state=terminal_state)
+
         event = {
             "schema": "lane-wake/1",
             "idempotency_key": key,
@@ -231,6 +324,13 @@ def emit_wake_event(
             "source_label": source_label,
             "terminal_state": (terminal_state or "").strip() or None,
             "retry_disposition": (retry_disposition or "").strip() or None,
+            # §4 shadow: the governor admission verdict for this (retry) wake, or
+            # None if this wake is not a work-retry. A projection/signal only.
+            "gov_admission": ({"verdict": gov.get("decision"), "reason": gov.get("reason"),
+                               "would_stop": gov.get("would_stop"),
+                               "class_retries_used": gov.get("class_retries_used"),
+                               "total_retries_used": gov.get("total_retries_used"),
+                               "mode": gov.get("mode")} if gov else None),
             "enqueued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         event["prompt"] = build_continuation_prompt(
@@ -243,6 +343,7 @@ def emit_wake_event(
             result_sha=result_sha,
             terminal_state=event["terminal_state"],
             retry_disposition=event["retry_disposition"],
+            gov_admission=event["gov_admission"],
         )
 
         # Atomic write: tmp in the same dir, then os.replace.
