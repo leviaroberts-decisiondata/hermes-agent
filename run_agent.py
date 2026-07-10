@@ -1308,6 +1308,19 @@ class AIAgent:
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+        # ── Execution deadline (WTS ac4bcb05) ──────────────────────────
+        # One absolute wall-clock contract for the whole run.  Sources:
+        # env (HERMES_DEADLINE_TS/HERMES_CLOSEOUT_TS — set by dd-lane-run
+        # for detached `hermes -z` specialists) or a direct attribute
+        # assignment by delegate_tool for in-process children.  None
+        # (gateway turns, plain CLI, short tasks) ⇒ zero behavior change.
+        try:
+            from agent.deadline import ExecutionDeadline as _ExecutionDeadline
+            self.execution_deadline = _ExecutionDeadline.from_env()
+        except Exception:
+            self.execution_deadline = None
+        self._closeout_active = False
+        self._deadline_expired = False
         self.tool_delay = tool_delay
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
@@ -4589,6 +4602,24 @@ class AIAgent:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
     
+    def _write_deadline_marker(self, name: str) -> None:
+        """Drop a deadline lifecycle marker into the supervising run_dir.
+
+        dd-lane-run exports DD_RUN_DIR into detached specialist children so
+        the daemon can classify partial-vs-completed from the markers
+        ("closeout-entered", "deadline-expired").  Best-effort: no run_dir
+        (gateway turns, plain CLI, delegate children) ⇒ no-op.
+        """
+        run_dir = os.environ.get("DD_RUN_DIR", "")
+        if not run_dir or not os.path.isdir(run_dir):
+            return
+        try:
+            from datetime import datetime, timezone
+            with open(os.path.join(run_dir, name), "w", encoding="utf-8") as fh:
+                fh.write(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+        except OSError:
+            pass
+
     def interrupt(self, message: str = None) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
@@ -6760,6 +6791,10 @@ class AIAgent:
         _stale_timeout = self._compute_non_stream_stale_timeout(
             api_kwargs.get("messages", [])
         )
+        # Cap the call to the run's remaining hard budget (WTS ac4bcb05
+        # AC3): a hung provider may never outlive the execution deadline.
+        if self.execution_deadline is not None:
+            _stale_timeout = self.execution_deadline.cap(_stale_timeout)
 
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
@@ -7669,6 +7704,11 @@ class AIAgent:
                 _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
+
+        # Cap the stream wait to the run's remaining hard budget (WTS
+        # ac4bcb05 AC3) — mirrors the non-streaming cap above.
+        if self.execution_deadline is not None:
+            _stream_stale_timeout = self.execution_deadline.cap(_stream_stale_timeout)
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
@@ -9519,6 +9559,47 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # ── Closeout fuse: no new tool calls once closeout begins ──────
+        # (WTS ac4bcb05 AC2.)  The remaining budget is reserved for
+        # synthesis + the terminal receipt; the model already received the
+        # CLOSEOUT_INSTRUCTION and must answer with text.  Every requested
+        # call gets an explicit refusal tool-result so the conversation
+        # stays well-formed for the final synthesis API call.
+        if self._closeout_active or (
+            self.execution_deadline is not None and self.execution_deadline.in_closeout()
+        ):
+            self._closeout_active = True
+            for tool_call in tool_calls:
+                messages.append({
+                    "role": "tool",
+                    "content": (
+                        "[CLOSEOUT ACTIVE — tool call refused] The execution "
+                        "budget is in its reserved closeout window; no new "
+                        "investigation may start. Produce your final or "
+                        "PARTIAL result now from the evidence already in "
+                        "this conversation."
+                    ),
+                    "tool_call_id": tool_call.id,
+                })
+            self._touch_activity("closeout: refused tool batch, awaiting synthesis")
+            return
+
+        # ── Per-call budget cap (WTS ac4bcb05 AC3) ─────────────────────
+        # A tool call may never outlive the run's remaining hard budget:
+        # clamp explicit timeout arguments (terminal, web, …) so a single
+        # blocking call cannot eat the closeout window.
+        if self.execution_deadline is not None:
+            _cap = self.execution_deadline.cap(float("inf"))
+            for tool_call in tool_calls:
+                try:
+                    _args = json.loads(tool_call.function.arguments or "{}")
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(_args, dict) and isinstance(_args.get("timeout"), (int, float)):
+                    if _args["timeout"] > _cap:
+                        _args["timeout"] = int(_cap)
+                        tool_call.function.arguments = json.dumps(_args)
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
@@ -11078,7 +11159,43 @@ class AIAgent:
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
                 break
-            
+
+            # ── Execution-deadline fuse (WTS ac4bcb05) ─────────────────
+            # Hard deadline: stop starting ANYTHING — the run is over and
+            # the supervisor classifies it timed_out; whatever content the
+            # conversation already holds is the partial evidence.
+            # Closeout fuse: once past the closeout point, inject the
+            # mandatory closeout instruction exactly once; tool calls are
+            # blocked from here on (_execute_tool_calls) so the remaining
+            # budget is reserved for synthesis + terminal receipt.
+            if self.execution_deadline is not None:
+                if self.execution_deadline.expired():
+                    self._deadline_expired = True
+                    _turn_exit_reason = "deadline_expired"
+                    self._write_deadline_marker("deadline-expired")
+                    logger.warning(
+                        "Execution deadline expired after %d API call(s); "
+                        "ending run with timed_out state (closeout_entered=%s)",
+                        api_call_count, self._closeout_active,
+                    )
+                    break
+                if self.execution_deadline.in_closeout() and not self._closeout_active:
+                    self._closeout_active = True
+                    self._write_deadline_marker("closeout-entered")
+                    from agent.deadline import CLOSEOUT_INSTRUCTION
+                    messages.append({"role": "user", "content": CLOSEOUT_INSTRUCTION})
+                    self._touch_activity("closeout fuse engaged — synthesis only")
+                    logger.info(
+                        "Closeout fuse engaged: %.0fs of hard budget remain; "
+                        "tool calls disabled, forcing final synthesis",
+                        max(0.0, self.execution_deadline.remaining()),
+                    )
+                    if not self.quiet_mode:
+                        self._safe_print(
+                            "\n⏳ Closeout fuse engaged — investigation stopped, "
+                            "producing final/partial result..."
+                        )
+
             api_call_count += 1
             self._api_call_count = api_call_count
             self._touch_activity(f"starting API call #{api_call_count}")
@@ -14108,6 +14225,22 @@ class AIAgent:
                 last_reasoning = msg["reasoning"]
                 break
 
+        # ── Deadline projection (WTS ac4bcb05) ─────────────────────────
+        # Classify the run against the execution-deadline contract so the
+        # supervisor (delegate_tool / dd-lane-run) can map it onto the
+        # typed terminal-state schema.  None ⇒ no deadline was configured.
+        deadline_state = None
+        if self.execution_deadline is not None:
+            if self._deadline_expired:
+                deadline_state = "timed_out"
+                completed = False
+            elif self._closeout_active:
+                # The fuse fired and we still produced output: a truthful
+                # PARTIAL — never presented as a full completion.
+                deadline_state = "partial" if final_response else "timed_out"
+            elif completed:
+                deadline_state = "completed"
+
         # Build result with interrupt info if applicable
         result = {
             "final_response": final_response,
@@ -14116,6 +14249,8 @@ class AIAgent:
             "api_calls": api_call_count,
             "completed": completed,
             "partial": False,  # True only when stopped due to invalid tool calls
+            "deadline_state": deadline_state,
+            "closeout_entered": self._closeout_active,
             "interrupted": interrupted,
             "response_previewed": getattr(self, "_response_was_previewed", False),
             "model": self.model,
