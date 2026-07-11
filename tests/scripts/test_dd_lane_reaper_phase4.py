@@ -269,27 +269,31 @@ def test_reap_run_classifies_ghost_as_stale_no_process(tmp_path):
     assert (rd / "exit_code").is_file(), "exit_code missing → idempotency would still block replacement"
 
 
-# ── 9) Replacement-safe: an idempotency-active sibling sees the ghost terminal ─
+# ── 9) Replacement-safe: a ghost terminal frees the scope for replacement ────
 def test_ghost_terminal_clears_idempotency_for_replacement(tmp_path):
-    """After mark_ghost_run, the lane-idempotency guard's _ddli_run_is_active
-    reports the ghost run as TERMINAL (exit_code present), so a new dispatch
-    with the same idem_key is NOT blocked. This is what the packet calls
-    "replacement no idempotency collision after terminal stale marking"."""
+    """After mark_ghost_run, the run is TERMINAL (exit_code present), so a new
+    dispatch for the same scope is NOT blocked. Contract holder updated (WTS
+    5e4d7283, design 2c §1): dd-lane-idempotency.sh was DELETED — the single-
+    owner LEASE (dd_lease.py) now owns this; its liveness verdict for a run
+    with an exit_code must be non-LIVE (OWNER_DEAD_WIP/OWNER_COMPLETED), which
+    is exactly what lets acquire() auto-release and a replacement dispatch
+    proceed. This is what the packet calls "replacement no idempotency
+    collision after terminal stale marking"."""
     rd = _mkrun(tmp_path, started_at_epoch=1, with_pid=None)
     (rd / "idem_key").write_text("KEY-XYZ\n", encoding="utf-8")
-    # Pre-mark: the active-check would still treat it as ACTIVE (no exit_code,
-    # past grace … wait, idempotency grace defaults to 900s). Be explicit: a
-    # mark_ghost_run stamp must produce an exit_code file so _ddli_run_is_active
-    # returns NOT-ACTIVE on the next check.
     proc = _bash_run(
         f'mark_ghost_run "{rd}" 600\n'
-        f'. /Users/openclaw/.hermes/bin/dd-lane-idempotency.sh\n'
-        f'state="$(_ddli_run_is_active "{rd}")"; echo "STATE=${{state:-terminal}}"',
+        f'verdict="$(python3 /Users/openclaw/.hermes/bin/dd_lease.py inspect '
+        f'--run-dir "{rd}" | python3 -c \'import json,sys; '
+        f'print(json.load(sys.stdin)["verdict"])\')"\n'
+        f'echo "VERDICT=$verdict"',
     )
     assert proc.returncode == 0, proc.stderr
-    # After ghost stamp, the run is TERMINAL (active-check echoes empty -> our
-    # `${state:-terminal}` default surfaces "terminal").
-    assert "STATE=terminal" in proc.stdout, proc.stdout
+    # exit_code exists → the ghost is terminal, never OWNER_LIVE: a same-scope
+    # replacement dispatch is admitted (lease acquire self-heals).
+    assert (rd / "exit_code").is_file(), proc.stdout
+    assert "VERDICT=OWNER_LIVE" not in proc.stdout, proc.stdout
+    assert "VERDICT=OWNER_" in proc.stdout, proc.stdout
 
 
 # ── 10) The ghost detector deliberately leaves heartbeating runs alone ───────
