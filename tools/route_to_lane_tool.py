@@ -125,10 +125,11 @@ _WRAPPER_LEASE_HELD_CODE = 78
 
 
 def _accepted_dispatch_on() -> bool:
-    """Slice 1 / G1 — immediate-accept dispatch flag. Read per-call so a canary
-    can flip it via env without re-importing the tool. Default OFF ⇒ the prior
-    error-shaped PENDING / generic FAILED behaviour is preserved verbatim."""
-    return os.environ.get("DD_LANE_ACCEPTED_DISPATCH") == "1"
+    """Slice 1 / G1 — immediate-accept dispatch flag. Read per-call so it can be
+    toggled via env without re-importing the tool. Default ON for the live burn-in
+    (set DD_LANE_ACCEPTED_DISPATCH=0 to fall back to the prior error-shaped PENDING /
+    generic FAILED without a revert). TRANSITIONAL — removed once the slice proves out."""
+    return os.environ.get("DD_LANE_ACCEPTED_DISPATCH", "1") != "0"
 
 
 def _build_accepted_envelope(lane: str, out: str, packet_path, reaper_note: str) -> str:
