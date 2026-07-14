@@ -118,6 +118,51 @@ _WRAPPER_PREFLIGHT_CODES = {2, 3, 5, 6, 7, 8, 10}
 # run survives and is collectable later via `dd-lane-run --poll <run_dir>`.
 # This is an HONEST PENDING — neither success nor hard failure.
 _WRAPPER_PENDING_CODE = 75
+# exit 78 (EX_LEASE_HELD) = the work scope already has a LIVE mutation owner; the
+# lane was REJECTED before it ran (single-owner lease). A clean rejection, not a
+# run failure — distinct from the generic non-zero FAILED (Slice 1 / G1).
+_WRAPPER_LEASE_HELD_CODE = 78
+
+
+def _accepted_dispatch_on() -> bool:
+    """Slice 1 / G1 — immediate-accept dispatch flag. Read per-call so a canary
+    can flip it via env without re-importing the tool. Default OFF ⇒ the prior
+    error-shaped PENDING / generic FAILED behaviour is preserved verbatim."""
+    return os.environ.get("DD_LANE_ACCEPTED_DISPATCH") == "1"
+
+
+def _build_accepted_envelope(lane: str, out: str, packet_path, reaper_note: str) -> str:
+    """A NORMAL (non-error) accepted envelope for a detached run (G1).
+
+    P1 receives ``state``/``run_id``/``lease`` immediately instead of blocking ~55s
+    for an error-shaped PENDING. The reaper (already registered) delivers the real
+    closeout as a later turn, so P1 must still NOT report this as completed. run_id
+    is the run_dir basename; lease is the single-owner scope stamped at dispatch.
+    """
+    m = re.search(r"run_dir=(\S+)", out or "")
+    run_dir = m.group(1).strip() if m else ""
+    run_id = os.path.basename(run_dir) if run_dir else "(pending)"
+    lease = ""
+    if run_dir:
+        try:
+            with open(os.path.join(run_dir, "lease"), "r", encoding="utf-8", errors="replace") as fh:
+                lease = fh.readline().strip()
+        except OSError:
+            lease = ""
+    return (
+        f"ACCEPTED — the '{lane}' lane was accepted and is running (detached).\n"
+        f"state: accepted\n"
+        f"run_id: {run_id}\n"
+        f"lease: {lease or '(scope lease stamped on run)'}\n"
+        f"The result-return reaper will deliver the lane's actual closeout "
+        f"(branch/SHA/tests/status OR the exact blocker) back into THIS conversation "
+        f"as a new turn when the run finishes, and mirror it to Telegram. Do NOT "
+        f"report this as completed yet; wait for that closeout — you may continue "
+        f"other work meanwhile.\n"
+        f"packet: {packet_path}\n"
+        f"{reaper_note}\n"
+        f"{out or '(no status line)'}"
+    )
 
 
 # P-D / G5: gate verdicts on the wrapper's normalized status line that mean the
@@ -920,6 +965,10 @@ def route_to_lane(
         # Pass the resolved wts_task so the reaper attaches the FINAL result to the
         # bound task on reap (WTS 331b65f8 req 3/4) — not just the sync PENDING.
         reaper_note = _register_pending_with_reaper(out, parent_agent, wts_task)
+        # Slice 1 / G1: return a NORMAL accepted envelope (run_id + lease + state)
+        # instead of an error-shaped PENDING. `pending` is not a failure.
+        if _accepted_dispatch_on():
+            return _build_accepted_envelope(lane, out, packet_path, reaper_note)
         return tool_error(
             f"HANDOFF PENDING — the '{lane}' lane started and is still running "
             f"(detached). You do NOT need to poll: the result-return reaper will "
@@ -930,6 +979,24 @@ def route_to_lane(
             f"packet: {packet_path}\n"
             f"{reaper_note}\n"
             f"{out or '(no status line)'}"
+        )
+
+    # LEASE_HELD — a clean single-owner rejection, distinct from a run failure
+    # (Slice 1 / G1). Surface the owner pointer instead of an opaque generic FAILED.
+    if _accepted_dispatch_on() and code == _WRAPPER_LEASE_HELD_CODE:
+        held = ""
+        for line in (out or "").splitlines():
+            if line.strip().startswith("LEASE_HELD"):
+                held = line.strip()
+                break
+        return tool_error(
+            f"REJECTED (lease held) — the '{lane}' lane was NOT started: the work "
+            f"scope already has a LIVE mutation owner (single-owner lease). This is "
+            f"a clean rejection, NOT a run failure and NOT a completed handoff. Poll "
+            f"or coordinate with the current owner, or request takeover once it is "
+            f"terminal.\n"
+            f"packet: {packet_path}\n"
+            f"{held or out or '(no lease detail)'}"
         )
 
     # FAILED — be explicit; the lane did NOT complete a real run.
