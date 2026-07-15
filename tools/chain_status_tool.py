@@ -379,7 +379,7 @@ def _fmt_candidates(cands: list, reason: str) -> str:
     return "\n".join(lines)
 
 
-def _fmt_chain(chain: dict, events: list) -> str:
+def _fmt_chain(chain: dict, events: list, match_count: int = 1) -> str:
     """Compose the canonical "where are we" answer from a request_chains row + its
     recent events. The five ownership fields lead (stage · owner · next · blocker ·
     ETA), then provenance + delivery + the last few lifecycle events."""
@@ -390,9 +390,12 @@ def _fmt_chain(chain: dict, events: list) -> str:
     # The CANONICAL chain key — the standardized, queryable identity for THIS
     # turn's chain. Surfaced explicitly so the next query (operator or grader) can
     # use `chain_status(chain_id=...)` against it directly, no anchor guessing.
-    if len(data) > 1:
+    # (`data` was referenced here without being in scope — the NameError that
+    # broke both of Levi's 2026-07-15 status asks; the count now arrives as a
+    # parameter from the caller that actually holds the match list.)
+    if match_count > 1:
         lines.append(
-            f"  ⚠ selector:  matched {len(data)} chains; showing newest active/latest by updated_at. "
+            f"  ⚠ selector:  matched {match_count} chains; showing newest active/latest by updated_at. "
             "Use chain_id= for an exact historical row."
         )
     lines.append(f"  chain key:  {g('route_key')}  (canonical — query with chain_id=)")
@@ -610,7 +613,7 @@ def _answer_for(data, scope_desc: str, parent_agent=None) -> str:
             "(read-only; JSON ledger remains authoritative):\n")
     if warning:
         head = warning + "\n\n" + head
-    return head + _fmt_chain(chain, events)
+    return head + _fmt_chain(chain, events, match_count=len(data))
 
 
 CHAIN_STATUS_SCHEMA = {

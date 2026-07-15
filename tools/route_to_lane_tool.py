@@ -140,7 +140,7 @@ def _build_accepted_envelope(lane: str, out: str, packet_path, reaper_note: str)
     closeout as a later turn, so P1 must still NOT report this as completed. run_id
     is the run_dir basename; lease is the single-owner scope stamped at dispatch.
     """
-    m = re.search(r"run_dir=(\S+)", out or "")
+    m = re.search(r"run_dir[=:]\s*(\S+)", out or "")
     run_dir = m.group(1).strip() if m else ""
     run_id = os.path.basename(run_dir) if run_dir else "(pending)"
     lease = ""
@@ -576,7 +576,7 @@ def _register_pending_with_reaper(out: str, parent_agent, wts_task: Optional[str
     """
     if not _REAPER.exists() or not os.access(_REAPER, os.X_OK):
         return "reaper-registration: skipped (reaper not installed)"
-    m = re.search(r"run_dir=(\S+)", out or "")
+    m = re.search(r"run_dir[=:]\s*(\S+)", out or "")
     if not m:
         return "reaper-registration: skipped (no run_dir on status line)"
     run_dir = m.group(1).strip()
