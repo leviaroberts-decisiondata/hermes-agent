@@ -720,6 +720,9 @@ def route_to_lane(
     packet: Optional[str] = None,
     preferred_lane: Optional[str] = None,
     affinity_reason: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    purpose: Optional[str] = None,
+    remediation_depth: Optional[int] = None,
     parent_agent=None,
 ) -> str:
     """Route a unit of work to a specialist lane via the sanctioned visible wrapper.
@@ -835,6 +838,18 @@ def route_to_lane(
         env.setdefault("HERMES_SESSION_KEY", session_key)
     if wts_task and wts_task.strip():
         env["DD_WTS_TASK_ID"] = wts_task.strip()
+    # Slice C/D (DD_MISSION_ROOT): mission-bound dispatches carry the mission
+    # through the wrapper into dd-lane-run (env fallback for --mission-id /
+    # --purpose / --remediation-depth), where the pre-dispatch transition
+    # validator enforces one-canonical-task / one-mutable-owner / read-only
+    # recovery / bounded remediation. A rejected transition returns typed
+    # MISSION_REJECTED (exit 76) with the reason — surface it, don't retry.
+    if mission_id and str(mission_id).strip():
+        env["DD_MISSION_ID"] = str(mission_id).strip()
+        if purpose and str(purpose).strip():
+            env["DD_MISSION_PURPOSE"] = str(purpose).strip()
+        if remediation_depth is not None:
+            env["DD_MISSION_DEPTH"] = str(int(remediation_depth))
 
     try:
         proc = subprocess.run(
@@ -1000,6 +1015,21 @@ def route_to_lane(
             f"{held or out or '(no lease detail)'}"
         )
 
+    # MISSION_REJECTED (Slice C/D) — the pre-dispatch transition validator refused
+    # this dispatch BEFORE any run/lease existed (exit 76). Typed so P1 fixes the
+    # transition instead of retrying into an opaque FAILED.
+    if code == 76 or "MISSION_REJECTED" in (out or ""):
+        return tool_error(
+            f"MISSION_REJECTED — the '{lane}' dispatch is an INVALID mission "
+            f"transition; nothing was dispatched (no run, no lease). Fix the "
+            f"transition per the reason below (adopt recorded provenance / related "
+            f"task + hold / wait for the active owner) — do NOT retry the same "
+            f"dispatch.\n"
+            f"packet: {packet_path}\n"
+            f"{out or '(no detail)'}\n"
+            f"{err[:800] or ''}"
+        )
+
     # FAILED — be explicit; the lane did NOT complete a real run.
     if code in _WRAPPER_PREFLIGHT_CODES:
         reason = "the wrapper rejected the call before the lane ran (arg/config error)"
@@ -1019,24 +1049,29 @@ def route_to_lane(
 ROUTE_TO_LANE_SCHEMA = {
     "name": "route_to_lane",
     "description": (
-        "Hand a unit of work to a DecisionData specialist LANE (e.g. qa, design, "
-        "engineering) and get its result back — the sanctioned, VISIBLE handoff. "
-        "Use this instead of running the work yourself or shelling the lane wrapper "
-        "by hand. It emits the correct wrapper invocation, runs the lane "
-        "synchronously, posts the visible handoff+result to the lane's Slack thread, "
-        "attaches BOTH the handoff (REQUEST) and the result (RESPONSE) to the ACTIVE "
-        "bound WTS task (precedence: wts_task arg > packet 'WTS:' line > the thread's "
-        "anchor-bound id auto-fed into the turn > none; there is NO per-lane bucket on "
-        "the Slack path), and returns an HONEST status — it reports FAILED if the lane "
-        "did not run. "
-        "NEVER tell the user a handoff succeeded unless this tool returns HANDOFF OK."
+        "Hand a unit of work to ANY DecisionData specialist LANE on EITHER transport "
+        "and get its result back — the sanctioned, VISIBLE handoff for ALL lanes. "
+        "Slack-backed: design, engineering (or 'engineering-pool'/-2/-3), qa. "
+        "Telegram-backed (equally first-class here): pmo, architecture, product, "
+        "knowledge, devops, deploy-ops, security. NEVER shell dd-visible-lane-run, "
+        "dd-telegram-visible-lane-run, or dd-lane-run by hand — this tool picks the "
+        "correct wrapper/transport, preserves the WTS + reaper result spine on both, "
+        "and hand-shelled runs lose caller/wake metadata and orphan their results. "
+        "It posts the visible handoff+result to the lane's channel, attaches BOTH the "
+        "handoff (REQUEST) and result (RESPONSE) to the ACTIVE bound WTS task "
+        "(precedence: wts_task arg > packet 'WTS:' line > the thread's anchor-bound id "
+        "> none), and returns a TYPED honest status: ACCEPTED(run_id/lease, detached; "
+        "closeout arrives as a later turn) · HANDOFF OK · HANDOFF FAILED(gate) · "
+        "REJECTED(lease held) · MISSION_REJECTED(invalid mission transition). "
+        "NEVER tell the user a handoff succeeded unless this tool returns HANDOFF OK, "
+        "and never report ACCEPTED as completed."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "lane": {
                 "type": "string",
-                "description": "Specialist lane to route to (e.g. 'qa', 'design', 'engineering'). Use 'engineering-pool' to select engineering/engineering-2/engineering-3 by active capacity before dispatch.",
+                "description": "Specialist lane to route to — any registered lane on either transport: design, engineering, engineering-2, engineering-3, qa (Slack); pmo, architecture, product, knowledge, devops, deploy-ops, security (Telegram, equally first-class). Use 'engineering-pool' to select engineering/engineering-2/engineering-3 by active capacity before dispatch.",
             },
             "goal": {
                 "type": "string",
@@ -1062,6 +1097,19 @@ ROUTE_TO_LANE_SCHEMA = {
                 "type": "string",
                 "description": "Only with lane='engineering-pool': dependency/file/surface/branch continuity reason allowing reuse of an active engineer.",
             },
+            "mission_id": {
+                "type": "string",
+                "description": "Mission root id (dd-mission) this dispatch belongs to. When set, the dispatch is validated as a mission transition (one canonical WTS task, one mutable owner per scope, read-only recovery, bounded remediation) and journaled. Set it on every dispatch of a multi-lane mission.",
+            },
+            "purpose": {
+                "type": "string",
+                "enum": ["implement", "verify", "deploy", "recover", "remediate"],
+                "description": "Only with mission_id: what this dispatch IS in the mission. 'recover' must be read-only (adopt recorded provenance — never rebuild); 'remediate' counts against the mission's max_remediation_depth.",
+            },
+            "remediation_depth": {
+                "type": "integer",
+                "description": "Only with mission_id + purpose='remediate': depth of this remediation (root work = 0, fixing a blocker in the root work = 1). Beyond the mission's max depth the dispatch is rejected — create a related task and hold.",
+            },
         },
         "required": ["lane"],
     },
@@ -1081,6 +1129,9 @@ registry.register(
         parent_agent=kw.get("parent_agent"),
         preferred_lane=args.get("preferred_lane"),
         affinity_reason=args.get("affinity_reason"),
+        mission_id=args.get("mission_id"),
+        purpose=args.get("purpose"),
+        remediation_depth=args.get("remediation_depth"),
     ),
     check_fn=check_route_to_lane_requirements,
     emoji="🛤️",
