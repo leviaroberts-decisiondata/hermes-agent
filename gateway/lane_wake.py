@@ -101,6 +101,7 @@ def build_continuation_prompt(
     result_sha: Optional[str] = None,
     terminal_state: Optional[str] = None,
     retry_disposition: Optional[str] = None,
+    closeout: Optional[str] = None,
 ) -> str:
     """The STRUCTURED INTERNAL continuation prompt P1 receives on wake (req 5).
 
@@ -149,7 +150,12 @@ def build_continuation_prompt(
             "(dd-lane-run --background, collect with --poll), or HOLD and "
             "escalate to the operator with the partial evidence."
             if terminal_state in ("timed_out", "orphaned") else ""
-        )
+        ) + (
+        (
+            "\n\n--- authoritative closeout (single source of truth; composed once by "
+            "the reaper — receipts + integrity flags included) ---\n" + closeout
+        ) if closeout else ""
+    )
     )
 
 
@@ -171,6 +177,7 @@ def emit_wake_event(
     source_label: str = "dd-lane-reaper",
     terminal_state: Optional[str] = None,
     retry_disposition: Optional[str] = None,
+    closeout: Optional[str] = None,
 ) -> str:
     """Enqueue a single ACTIVE-WAKE event onto the durable file queue.
 
@@ -233,6 +240,14 @@ def emit_wake_event(
             "retry_disposition": (retry_disposition or "").strip() or None,
             "enqueued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        # Exactly-once delivery (board 2026-07-15): the wake embeds the reaper's
+        # closeout so the injected turn IS the authoritative receipt — no second
+        # composition, no reinject double-delivery. Keep the tail (receipts +
+        # integrity flags live at the end) when truncating.
+        _co = (closeout or "").strip()
+        if _co and len(_co) > 8000:
+            _co = "…[head truncated]\n" + _co[-8000:]
+        event["closeout_embedded"] = bool(_co)
         event["prompt"] = build_continuation_prompt(
             wts_task=event["wts_task"],
             lane=lane,
@@ -243,6 +258,7 @@ def emit_wake_event(
             result_sha=result_sha,
             terminal_state=event["terminal_state"],
             retry_disposition=event["retry_disposition"],
+            closeout=_co or None,
         )
 
         # Atomic write: tmp in the same dir, then os.replace.
@@ -361,6 +377,7 @@ def _main(argv: list[str]) -> int:
 
     ap = argparse.ArgumentParser(prog="lane_wake", description="emit a lane-result wake event")
     ap.add_argument("--emit", action="store_true", help="enqueue a wake event")
+    ap.add_argument("--closeout-file", default="")
     ap.add_argument("--run-dir", default="")
     ap.add_argument("--lane", default="")
     ap.add_argument("--gate", default="")
@@ -386,7 +403,14 @@ def _main(argv: list[str]) -> int:
         return 0
 
     if args.emit:
+        _closeout = None
+        if args.closeout_file:
+            try:
+                _closeout = Path(args.closeout_file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                _closeout = None
         token = emit_wake_event(
+            closeout=_closeout,
             run_dir=args.run_dir,
             lane=args.lane,
             gate=args.gate,
