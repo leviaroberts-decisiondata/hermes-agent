@@ -351,8 +351,15 @@ def deploy_submit(
     from gateway import capability_egress
 
     url = f"{_MC_API_BASE}/api/deploy-queue/submit"
+    # Board finding 2026-07-15 (canary ae201016, WTS-null deploy row): the API
+    # reads the WTS link from the x-wts-task-id HEADER; the body field alone was
+    # silently dropped, the tool still reported "linked", and dedupe then reused
+    # the linkless row. Send BOTH (header authoritative, body belt) and verify
+    # by authoritative readback below — never claim linkage without proof.
+    _wts_headers = {"x-wts-task-id": resolved_wts} if resolved_wts else None
     try:
-        resp = capability_egress.post_with_capability(url, json_body=body)
+        resp = capability_egress.post_with_capability(
+            url, json_body=body, extra_headers=_wts_headers)
     except Exception as e:
         return tool_error(f"deploy-queue submit request failed: {type(e).__name__}: {e}")
 
@@ -418,6 +425,39 @@ def deploy_submit(
         out["conflict_details"] = payload["conflict_details"]
     if isinstance(payload, dict) and payload.get("depends_on"):
         out["depends_on"] = payload["depends_on"]
+
+    # ── AUTHORITATIVE READBACK (board finding: submit response ≠ row truth). ──
+    # Re-read the row and report what it ACTUALLY carries. A requested WTS link
+    # that did not persist is a typed WTS_LINK_MISMATCH — the agent must NOT
+    # report the deploy as tracker-linked, and dedupe reuse of such a row is a
+    # defect to surface, never to paper over.
+    if entry_id:
+        try:
+            import httpx as _httpx
+            with _httpx.Client(timeout=15.0) as _c:
+                _rb = _c.get(f"{_MC_API_BASE}/api/deploy-queue/{entry_id}")
+            _row = _rb.json() if _rb.status_code < 400 else None
+            if isinstance(_row, dict):
+                out["row_readback"] = {
+                    "status": _row.get("status"),
+                    "wts_task_id": _row.get("wts_task_id"),
+                    "target_commit": (str(_row.get("target_commit") or "")[:12] or None),
+                }
+                if resolved_wts:
+                    if str(_row.get("wts_task_id") or "").strip() == resolved_wts:
+                        out["wts_link"] = "verified"
+                    else:
+                        out["wts_link"] = "WTS_LINK_MISMATCH"
+                        out["message"] += (
+                            " ⚠ WTS_LINK_MISMATCH: authoritative readback shows the row's "
+                            f"wts_task_id={_row.get('wts_task_id')!r}, not the requested link. "
+                            "Do NOT report this deploy as tracker-linked; surface this defect "
+                            "and have Deploy Ops reconcile the row before approval."
+                        )
+            else:
+                out["wts_link"] = "unverified(readback-failed)"
+        except Exception:
+            out["wts_link"] = "unverified(readback-failed)"
 
     # W2-B2: STAMP the row id onto the active chain record so the chain driver's
     # queue-decision watch can poll it for the human's approve/reject and then
