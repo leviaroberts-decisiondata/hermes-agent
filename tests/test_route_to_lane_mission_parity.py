@@ -18,6 +18,8 @@ from types import SimpleNamespace
 
 import tools.route_to_lane_tool as rtl
 
+WTS = "aaaaaaaa-0000-0000-0000-000000000001"
+
 
 def _executable(path: Path) -> Path:
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -118,3 +120,35 @@ def test_mission_rejected_is_typed(monkeypatch, tmp_path):
     assert "do NOT retry" in result
     assert "REASON_CODE=over-depth" in result
     assert "HANDOFF FAILED" not in result
+
+
+def test_mission_auto_binding(monkeypatch, tmp_path):
+    """Lever 3: a mission root whose canonical task matches the bound WTS task is
+    auto-bound (env DD_MISSION_ID + lane-class default purpose) with no explicit
+    mission_id arg — canary #2's empty journal shape."""
+    import json as _json
+    fake_wrapper = _executable(tmp_path / "dd-visible-lane-run")
+    packet = tmp_path / "packet.md"
+    packet.write_text("# packet\n", encoding="utf-8")
+    mdir = tmp_path / "dd-lanes" / "missions" / "m-auto-1"
+    mdir.mkdir(parents=True)
+    (mdir / "root.json").write_text(_json.dumps({
+        "schema": "mission-root/1", "mission_id": "m-auto-1",
+        "wts_task": WTS, "created_at": "2026-07-16T00:00:00Z"}), encoding="utf-8")
+    monkeypatch.setattr(rtl, "_SHARED_HOME", tmp_path)
+    monkeypatch.setattr(rtl, "_WRAPPER", fake_wrapper)
+    monkeypatch.setattr(rtl, "_known_lanes", lambda: ["qa"])
+    monkeypatch.setattr(rtl, "_all_lanes", lambda: ["qa"])
+
+    captured = {}
+
+    def fake_run(cmd, capture_output, text, timeout, env=None):
+        captured["env"] = env
+        return subprocess.CompletedProcess(cmd, 0, stdout="[qa] PASS | ok", stderr="")
+
+    monkeypatch.setattr(rtl.subprocess, "run", fake_run)
+    out = rtl.route_to_lane(lane="qa", goal="g", packet=str(packet),
+                            wts_task=WTS, parent_agent=SimpleNamespace())
+    assert out.startswith("HANDOFF OK")
+    assert captured["env"]["DD_MISSION_ID"] == "m-auto-1"
+    assert captured["env"]["DD_MISSION_PURPOSE"] == "verify"

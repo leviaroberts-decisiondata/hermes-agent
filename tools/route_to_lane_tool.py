@@ -844,6 +844,36 @@ def route_to_lane(
     # validator enforces one-canonical-task / one-mutable-owner / read-only
     # recovery / bounded remediation. A rejected transition returns typed
     # MISSION_REJECTED (exit 76) with the reason — surface it, don't retry.
+    # Lever 3 (Levi 2026-07-16): mission AUTO-BINDING. Canary #2 created the
+    # mission root but never passed mission_id on dispatches, so the journal
+    # (budgets, wall-clock, asks) stayed empty. Mirror the WTS anchor-feed:
+    # when no explicit mission_id is given and a mission root exists whose
+    # canonical task matches the bound WTS task, bind it automatically with a
+    # lane-class default purpose. Explicit args always win; fail-soft.
+    if (not mission_id or not str(mission_id).strip()) and wts_task and str(wts_task).strip():
+        try:
+            _mroot = _SHARED_HOME / "dd-lanes" / "missions"
+            _best = None
+            for _md in (_mroot.iterdir() if _mroot.is_dir() else []):
+                try:
+                    _r = json.loads((_md / "root.json").read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                _mw = str(_r.get("wts_task") or "")
+                if _mw and (_mw == str(wts_task).strip()
+                            or _mw[:8] == str(wts_task).strip()[:8]):
+                    if not _best or (_r.get("created_at") or "") > (_best[1].get("created_at") or ""):
+                        _best = (_md.name, _r)
+            if _best:
+                mission_id = _best[0]
+                if not purpose:
+                    _lane_l = (lane or "").lower()
+                    purpose = ("verify" if _lane_l == "qa"
+                               else "deploy" if _lane_l in ("devops", "deploy-ops")
+                               else "recover" if _lane_l == "knowledge"
+                               else "implement")
+        except Exception:
+            pass
     if mission_id and str(mission_id).strip():
         env["DD_MISSION_ID"] = str(mission_id).strip()
         if purpose and str(purpose).strip():
