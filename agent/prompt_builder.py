@@ -1220,8 +1220,10 @@ def _signal_pin_mismatch(card_file: Path, root: Path, live_short_hash: str) -> b
 # core. Keys are the audience labels passed by each loader; values are the
 # role-view filename under operating-model/agent-roles/. Only WIRED audiences
 # appear here (dispatch/claude-code/openclaw are tree-side stubs, not composed).
+# "p1-specialists" was retired 2026-07-17 (WTS 2911977a): the WS4 resolver never
+# returns it, its card is status:superseded in the tree, and it must NOT be
+# composable — an audience absent here composes the shared core only.
 _OPERATING_MODEL_VIEW_BY_AUDIENCE = {
-    "p1-specialists": "p1-specialists",
     "slack-project-agent": "slack-project-agent",
     "p1-default": "p1-default",
 }

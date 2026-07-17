@@ -2,7 +2,7 @@
 
 The operating-model node is split into a shared `_core.md` (the inter-layer
 boundary, single source of truth) plus per-audience role views. Each wired
-loader (gateway = p1-specialists; dd-slack-service = slack-project-agent)
+loader (gateway coordinator = p1-default; dd-slack-service = slack-project-agent)
 composes `core + its own role view`. These tests prove:
 
   1. Composition is per-audience (each gets ITS role view, not the other's).
@@ -10,6 +10,8 @@ composes `core + its own role view`. These tests prove:
      enforcement backbone that makes desync structurally impossible. This is the
      guard that must stay green.
   3. No role view leaks another audience's role framing.
+  4. The retired "p1-specialists" audience (superseded 2026-07-17, WTS 2911977a)
+     composes the shared core only — no caller can silently land on its card.
 
 The shared-core extraction matches what both loaders embed verbatim (the
 post-frontmatter body of operating-model/_core.md), so a divergence in either
@@ -32,6 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # The live tree (home-anchored). Tests read it read-only.
 LIVE_TREE = Path.home() / ".hermes" / "context"
 SLACK_CT_JS = Path.home() / "apps" / "dd-slack-service" / "src" / "context-tree.js"
+
+# The current role-view headings (first line of each card body). If a card is
+# re-headed, update these in the same change — they are the leak markers.
+P1_HEADING = "Your role — P1 coordinator (System A)"
+SLACK_HEADING = "Your role — Slack project agent (System B, direct execution)"
 
 # Explicit opt-in for environments where the operating-model split tree is
 # LEGITIMATELY absent (e.g. a stripped container that ships no /context tree).
@@ -96,17 +103,17 @@ def _core_body(root: Path) -> str:
 
 @_skip_body
 class TestPerAudienceComposition:
-    def test_p1_gets_stewardship_view_not_slack(self):
-        body = compose_operating_model(LIVE_TREE, "p1-specialists")
+    def test_p1_gets_coordinator_view_not_slack(self):
+        body = compose_operating_model(LIVE_TREE, "p1-default")
         assert body is not None
-        assert "Your role — System expertise & maintenance (Layer 3)" in body
-        assert "Your role — Product execution (Layer 2)" not in body
+        assert P1_HEADING in body
+        assert SLACK_HEADING not in body
 
     def test_slack_gets_product_view_not_p1(self):
         body = compose_operating_model(LIVE_TREE, "slack-project-agent")
         assert body is not None
-        assert "Your role — Product execution (Layer 2)" in body
-        assert "Your role — System expertise & maintenance (Layer 3)" not in body
+        assert SLACK_HEADING in body
+        assert P1_HEADING not in body
 
     def test_unknown_audience_gets_core_only(self):
         body = compose_operating_model(LIVE_TREE, "no-such-audience")
@@ -115,9 +122,19 @@ class TestPerAudienceComposition:
         # Core present — pinned to a v1.3 marker (Deploy Queue realization gate).
         assert "Deploy Queue is the realization gate" in body
 
+    def test_retired_p1_specialists_audience_composes_core_only(self):
+        """The p1-specialists audience was superseded (2026-07-17, WTS 2911977a):
+        the WS4 resolver never returns it and its composer map entry is gone.
+        Even while a card file exists on disk, composing the retired audience
+        must yield the shared core only — no caller can silently land on it."""
+        body = compose_operating_model(LIVE_TREE, "p1-specialists")
+        assert body is not None
+        assert "Your role —" not in body
+        assert "Deploy Queue is the realization gate" in body
+
     def test_both_audiences_carry_shared_core(self):
         core = _core_body(LIVE_TREE)
-        p1 = compose_operating_model(LIVE_TREE, "p1-specialists")
+        p1 = compose_operating_model(LIVE_TREE, "p1-default")
         sl = compose_operating_model(LIVE_TREE, "slack-project-agent")
         assert core in p1
         assert core in sl
@@ -137,12 +154,12 @@ class TestByteIdenticalCoreGuard:
         return composed[:idx]
 
     def test_gateway_audiences_share_byte_identical_core(self):
-        p1 = compose_operating_model(LIVE_TREE, "p1-specialists")
+        p1 = compose_operating_model(LIVE_TREE, "p1-default")
         sl = compose_operating_model(LIVE_TREE, "slack-project-agent")
         core_from_p1 = self._core_prefix(p1)
         core_from_sl = self._core_prefix(sl)
         assert core_from_p1 == core_from_sl, (
-            "SHARED CORE DIVERGED between p1-specialists and slack-project-agent "
+            "SHARED CORE DIVERGED between p1-default and slack-project-agent "
             "composition — the operating-model cores are out of sync."
         )
         # And the shared prefix must equal the _core.md body verbatim.
@@ -156,7 +173,7 @@ class TestByteIdenticalCoreGuard:
         """Render the Slack loader's operating-model composition via node and
         assert its core block is byte-identical to the gateway's. This is the
         true cross-loader guard — neither loader can ship a divergent core."""
-        gw = compose_operating_model(LIVE_TREE, "p1-specialists")
+        gw = compose_operating_model(LIVE_TREE, "p1-default")
         gw_core = self._core_prefix(gw)
 
         node_script = (
@@ -184,13 +201,13 @@ class TestByteIdenticalCoreGuard:
 @_skip_body
 class TestComposedInjectionEndToEnd:
     def test_build_context_tree_prompt_composes_for_audience(self):
-        p1 = build_context_tree_prompt(root=LIVE_TREE, audience="p1-specialists")
+        p1 = build_context_tree_prompt(root=LIVE_TREE, audience="p1-default")
         sl = build_context_tree_prompt(root=LIVE_TREE, audience="slack-project-agent")
         # P1 prompt carries its own role view, not Slack's.
-        assert "System expertise & maintenance (Layer 3)" in p1
-        assert "Your role — Product execution (Layer 2)" not in p1
+        assert P1_HEADING in p1
+        assert SLACK_HEADING not in p1
         # Slack prompt carries Slack's view.
-        assert "Your role — Product execution (Layer 2)" in sl
+        assert SLACK_HEADING in sl
         # Both still carry the tree header + the shared core boundary (v1.3:
         # the Deploy Queue realization-gate invariant lives in the shared core).
         assert "DecisionData /context tree" in p1

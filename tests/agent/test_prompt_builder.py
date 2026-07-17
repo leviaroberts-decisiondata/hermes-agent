@@ -1147,7 +1147,6 @@ def _build_operating_tree(root, *, core_body=_CORE_BODY, pin=None,
     Layout:
       operating-model/_core.md                       (contract_version + content_hash)
       operating-model/agent-roles/p1-default.md
-      operating-model/agent-roles/p1-specialists.md
       operating-model/agent-roles/slack-project-agent.md
       operating-model/agent-roles/specialists/<slug>.md
       global/_node.md   platform/_node.md            (sibling awareness nodes)
@@ -1181,8 +1180,6 @@ def _build_operating_tree(root, *, core_body=_CORE_BODY, pin=None,
 
     _write_card(om / "agent-roles" / "p1-default.md",
                 audience="p1-default", heading="Coordinator (Layer 1)", pin=the_pin)
-    _write_card(om / "agent-roles" / "p1-specialists.md",
-                audience="p1-specialists", heading="System expertise (Layer 3)", pin=the_pin)
     _write_card(om / "agent-roles" / "slack-project-agent.md",
                 audience="slack-project-agent", heading="Product execution (Layer 2)", pin=the_pin)
     _write_card(om / "agent-roles" / "specialists" / f"{include_specialist}.md",
@@ -1206,7 +1203,6 @@ class TestOperatingContractComposerAudienceMatrix:
         _build_operating_tree(tmp_path)
         cases = {
             "p1-default": "Coordinator (Layer 1)",
-            "p1-specialists": "System expertise (Layer 3)",
             "slack-project-agent": "Product execution (Layer 2)",
             "qa-review": "Specialist qa-review",
         }
@@ -1224,7 +1220,7 @@ class TestOperatingContractComposerAudienceMatrix:
 
     def test_every_audience_carries_shared_core(self, tmp_path):
         _build_operating_tree(tmp_path)
-        for audience in ("p1-default", "p1-specialists", "slack-project-agent", "qa-review"):
+        for audience in ("p1-default", "slack-project-agent", "qa-review"):
             body = compose_operating_model(tmp_path, audience)
             assert "Deploy Queue is the realization gate" in body
 
@@ -1233,6 +1229,19 @@ class TestOperatingContractComposerAudienceMatrix:
         body = compose_operating_model(tmp_path, "no-such-audience")
         assert body is not None
         assert "Deploy Queue is the realization gate" in body
+        assert "# Your role —" not in body
+
+    def test_retired_p1_specialists_composes_core_only_even_with_stale_card(self, tmp_path):
+        """p1-specialists retired 2026-07-17 (WTS 2911977a): even when a stale
+        card file still exists on disk, the audience has no composer map entry —
+        it must compose the shared core only, never the stale card."""
+        pin = _build_operating_tree(tmp_path)
+        _write_card(tmp_path / "operating-model" / "agent-roles" / "p1-specialists.md",
+                    audience="p1-specialists", heading="System expertise (Layer 3)", pin=pin)
+        body = compose_operating_model(tmp_path, "p1-specialists")
+        assert body is not None
+        assert "Deploy Queue is the realization gate" in body
+        assert "System expertise (Layer 3)" not in body
         assert "# Your role —" not in body
 
     def test_security_and_video_review_are_lane_audiences(self, tmp_path):

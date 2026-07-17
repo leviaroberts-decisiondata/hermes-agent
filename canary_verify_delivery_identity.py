@@ -6,11 +6,13 @@ Proves, on the CANARY profile only (no prod restart, no prod flag flip, no Slack
 message sent), that the INC3 delivery-distinct-identity mechanism removes BOTH
 P1-family injections from a delivery turn's assembled system prompt:
   1. the SOUL identity slot #1   (removed by skip_context_files=True + load_soul_identity=False)
-  2. the p1-specialists tree role view (removed by the WS4 audience resolver)
+  2. the coordinator tree role view (p1-default; removed for delivery turns by the
+     WS4 audience resolver — the pre-WS4 hardcoded default composed the since-retired
+     p1-specialists view, superseded 2026-07-17, WTS 2911977a)
 
 It reproduces the gateway's own _build_system_prompt assembly the same way the q1
 verdict did, for two configurations:
-  * BASELINE  — current prod behavior (no flags): expect SOUL + p1-specialists present
+  * BASELINE  — current prod behavior (no flags): expect SOUL + coordinator view present
   * DELIVERY  — INC3 flags (replace_identity): expect NEITHER present, delivery role instead
 
 Acceptance (acc-b, the §6 identity assertion): the DELIVERY assembled prompt
@@ -25,13 +27,17 @@ SOUL_MARKERS = [
     "route ALL specialist-domain work",
     "coordinates and verifies",
 ]
-# Precise q1-verdict coordinator-ROLE markers — the p1-specialists role view text.
+# Precise coordinator-ROLE markers — the p1-default role view text (the heading is
+# unique to agent-roles/p1-default.md; verified absent from _core.md and the slack
+# view). The original q1-verdict marker ("P1 coordinates the specialist lanes") was
+# the since-retired p1-specialists card's 2026-06 copy and no longer exists in the
+# tree — it would scan NONE on the baseline and make the proof vacuous.
 # NOTE: "system-expertise layer" was rejected as a marker: it lives in the
 # audience-INDEPENDENT platform/_node.md (a neutral architecture description
 # present for every audience, including the healthy Slack canary), so it is a
 # false positive for the coordinator contract, not part of it.
 TREE_COORDINATOR_MARKERS = [
-    "P1 coordinates the specialist lanes",
+    "Your role — P1 coordinator (System A)",
 ]
 
 
@@ -105,7 +111,7 @@ def main() -> int:
     _probe = AIAgent(model="x", api_key="k", base_url="http://127.0.0.1:1",
                      quiet_mode=True, platform="api_server")
     tree_on = _probe._context_tree_injection_enabled()
-    tree_renders = bool(build_context_tree_prompt(audience="p1-specialists").strip())
+    tree_renders = bool(build_context_tree_prompt(audience="p1-default").strip())
     print(f"PRECONDITION: tree_injection enabled={tree_on}, tree renders content={tree_renders}")
     if not (tree_on and tree_renders):
         print("✗ PRECONDITION FAIL: tree injection off or empty — the 'no markers' result")
@@ -124,14 +130,14 @@ def main() -> int:
         return 2
     print("=" * 70)
 
-    # ORIGINAL PROD — the inversion as it exists on the live gateway TODAY: the
-    # tree audience is the hardcoded default 'p1-specialists' (the WS4 defect) and
-    # SOUL loads as slot #1. Proves the markers actually fire on the broken state.
+    # COORDINATOR VIEW — the view a non-delivery P1 turn composes (the WS4
+    # resolver returns p1-default; the pre-WS4 hardcoded 'p1-specialists' default
+    # is retired). Proves the markers actually fire on the coordinator state.
     from agent.prompt_builder import build_context_tree_prompt
-    orig_tree = build_context_tree_prompt(audience="p1-specialists")
+    orig_tree = build_context_tree_prompt(audience="p1-default")
     orig_tree_hits = _scan(orig_tree, TREE_COORDINATOR_MARKERS)
-    print(f"ORIGINAL PROD tree (audience=p1-specialists, the live default)")
-    print(f"  tree coordinator     : {orig_tree_hits or 'NONE'}   <- the second P1 injection today")
+    print(f"COORDINATOR tree (audience=p1-default, the resolver's coordinator view)")
+    print(f"  tree coordinator     : {orig_tree_hits or 'NONE'}   <- the P1 injection a delivery turn must NOT carry")
     print("=" * 70)
 
     # BASELINE — what a delivery turn embodies TODAY (the inversion).
