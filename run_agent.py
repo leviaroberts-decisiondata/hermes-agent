@@ -5180,7 +5180,21 @@ class AIAgent:
                 return "p1-default"
             # Unknown non-lane profile → p1-default (coordinator), NEVER the generic
             # p1-specialists. This is the WS4 §4.1 step-5 safe default.
-            logger.debug("audience resolver: unknown profile %r → p1-default fallback", profile)
+            #
+            # graduation P1a (WTS 2911977a): this fallback is now LOGGED at WARNING,
+            # not debug. An unknown profile falling back to the coordinator view is a
+            # real gap — the profile is either new (needs its own specialist card +
+            # a _LANE_PROFILE_AUDIENCES entry, as security-review/video-review just
+            # got) or misspelled — and it means the reader silently receives P1
+            # coordinator deploy-authority text it may not be entitled to. Surface it.
+            logger.warning(
+                "audience resolver: unknown non-lane profile %r → falling back to "
+                "p1-default (coordinator view). If this profile injects the tree it "
+                "should have its own specialists/<profile>.md card and be added to "
+                "_LANE_PROFILE_AUDIENCES; otherwise it silently carries coordinator "
+                "deploy-authority text.",
+                profile,
+            )
             return "p1-default"
         except Exception:
             logger.debug("audience resolver hard-failed → p1-default", exc_info=True)
@@ -5330,16 +5344,33 @@ class AIAgent:
         if self._context_tree_injection_enabled():
             try:
                 from agent.prompt_builder import build_context_tree_prompt
-                # WS4 S1-S3 — resolve the audience per caller instead of letting
-                # the default ("p1-specialists") stand in for every profile. This
-                # removes the second P1-family injection (the coordinator role
-                # view) from specialist + delivery turns. Fail-soft: errors fall
-                # back to the safe coordinator default inside the resolver.
-                _ctx_tree = build_context_tree_prompt(audience=self._resolve_context_audience())
+                # WS4 S1-S3 — resolve the audience per caller (the vestigial
+                # "p1-specialists" default is gone; audience is now required).
+                # This keeps the second P1-family injection (the coordinator role
+                # view) out of specialist + delivery turns. The resolver itself is
+                # fail-soft (any error → the safe p1-default coordinator view).
+                _audience = self._resolve_context_audience()
+                _ctx_tree = build_context_tree_prompt(audience=_audience)
                 if _ctx_tree:
                     prompt_parts.append(_ctx_tree)
+                else:
+                    # Injection is ENABLED for this profile but the tree rendered
+                    # empty — a real gap (missing/broken /context tree), not a
+                    # no-op. Do not let it pass silently.
+                    logger.warning(
+                        "context-tree injection enabled but rendered EMPTY "
+                        "(audience=%r) — this turn carries NO operating contract "
+                        "from the /context tree.", _audience,
+                    )
             except Exception:
-                logger.debug("context-tree injection skipped (error)", exc_info=True)
+                # graduation P1a (WTS 2911977a): an opted-in profile silently
+                # losing its operating contract is worth a WARNING, not a debug
+                # line that never surfaces. Still fail-soft — the turn proceeds.
+                logger.warning(
+                    "context-tree injection FAILED (enabled profile) — this turn "
+                    "carries NO operating contract from the /context tree.",
+                    exc_info=True,
+                )
 
         # WS2 §3 — collision-awareness advisory block. PASSIVE, ADVISORY-by-default:
         # a "## Active Work" block injected at this same WS4 seam so an agent SEES

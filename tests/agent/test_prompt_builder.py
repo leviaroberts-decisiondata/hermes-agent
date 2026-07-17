@@ -1088,4 +1088,290 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 
 
+# =========================================================================
+# Operating-contract composer (graduation P1a / WTS 2911977a)
+#
+# Self-contained fixture-tree tests (no dependence on the live ~/.hermes tree):
+#   * audience matrix → each audience composes ITS OWN role view
+#   * over-cap truncation emits the explicit CONTRACT_TRUNCATION_MARKER (loud,
+#     not the old silent "[...node truncated...]" tail)
+#   * a missing core / missing role view FAILS LOUD (logged, never silent)
+#   * the injected block carries the version line
+#     "DecisionData operating contract v2.0 (core sha256:...)"
+#   * pin validation catches a deliberately-wrong composes_against_core pin
+# =========================================================================
+
+from agent.prompt_builder import (
+    compose_operating_model,
+    build_context_tree_prompt,
+    _load_context_tree_node,
+    _operating_contract_version_line,
+    _signal_pin_mismatch,
+    _short_core_hash,
+    _resolve_view_card,
+    _read_node_body,
+    CONTRACT_TRUNCATION_MARKER,
+)
+import agent.prompt_builder as _pb
+
+
+_CORE_BODY = (
+    "# Operating Model — Shared Core\n\n"
+    "The Deploy Queue is the realization gate for the entire platform.\n"
+    "This is the shared boundary fact every audience must carry.\n"
+)
+
+
+def _write_card(path, *, audience, heading, pin, last_updated="2026-07-16",
+                status="active", body_extra=""):
+    """Write a role-view card with frontmatter (pin) + a distinctive body heading."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fm = [
+        "---",
+        f"node_name:            operating-model/agent-roles/{audience}",
+        "scope:                operating-model",
+        f"status:               {status}",
+        f"last_updated:         {last_updated}",
+    ]
+    if pin is not None:
+        fm.append(f'composes_against_core: "{pin}"')
+    fm.append("---")
+    body = f"# Your role — {heading}\n\n{heading} role contract.{body_extra}\n"
+    path.write_text("\n".join(fm) + "\n" + body, encoding="utf-8")
+
+
+def _build_operating_tree(root, *, core_body=_CORE_BODY, pin=None,
+                          include_specialist="qa-review"):
+    """Materialize a minimal but realistic /context tree under *root*.
+
+    Layout:
+      operating-model/_core.md                       (contract_version + content_hash)
+      operating-model/agent-roles/p1-default.md
+      operating-model/agent-roles/p1-specialists.md
+      operating-model/agent-roles/slack-project-agent.md
+      operating-model/agent-roles/specialists/<slug>.md
+      global/_node.md   platform/_node.md            (sibling awareness nodes)
+    Returns the live short core hash the cards should pin.
+
+    The live hash is computed from the core body EXACTLY as the composer sees it
+    (frontmatter-stripped via _read_node_body, i.e. .strip()ed), so the fixture's
+    content_hash + card pins match what compose_operating_model recomputes.
+    """
+    om = root / "operating-model"
+    om.mkdir(parents=True, exist_ok=True)
+    # Write the core with a placeholder hash first, then read it back the way the
+    # composer does to derive the canonical live hash, then rewrite with it.
+    def _write_core(hash_val):
+        core = (
+            "---\n"
+            "node_name:            operating-model/_core\n"
+            "status:               active\n"
+            'contract_version:     "v2.0"\n'
+            f'content_hash:         "{hash_val}"\n'
+            "last_updated:         2026-07-16\n"
+            "---\n"
+            + core_body
+        )
+        (om / "_core.md").write_text(core, encoding="utf-8")
+
+    _write_core("sha256:pending")
+    live_hash = _short_core_hash(_read_node_body(om / "_core.md", root))
+    _write_core(live_hash)
+    the_pin = live_hash if pin is None else pin
+
+    _write_card(om / "agent-roles" / "p1-default.md",
+                audience="p1-default", heading="Coordinator (Layer 1)", pin=the_pin)
+    _write_card(om / "agent-roles" / "p1-specialists.md",
+                audience="p1-specialists", heading="System expertise (Layer 3)", pin=the_pin)
+    _write_card(om / "agent-roles" / "slack-project-agent.md",
+                audience="slack-project-agent", heading="Product execution (Layer 2)", pin=the_pin)
+    _write_card(om / "agent-roles" / "specialists" / f"{include_specialist}.md",
+                audience=f"specialists/{include_specialist}",
+                heading=f"Specialist {include_specialist}", pin=the_pin)
+
+    for sib in ("global", "platform"):
+        d = root / sib
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "_node.md").write_text(
+            f"---\nnode_name: {sib}\n---\n# {sib}\n{sib} awareness summary.\n",
+            encoding="utf-8",
+        )
+    return live_hash
+
+
+class TestOperatingContractComposerAudienceMatrix:
+    """audience matrix → expected view (each audience gets ITS OWN role view)."""
+
+    def test_each_audience_composes_its_own_view(self, tmp_path):
+        _build_operating_tree(tmp_path)
+        cases = {
+            "p1-default": "Coordinator (Layer 1)",
+            "p1-specialists": "System expertise (Layer 3)",
+            "slack-project-agent": "Product execution (Layer 2)",
+            "qa-review": "Specialist qa-review",
+        }
+        composed = {a: compose_operating_model(tmp_path, a) for a in cases}
+        for audience, own in cases.items():
+            body = composed[audience]
+            assert body is not None, f"{audience} composed nothing"
+            assert own in body, f"{audience} missing its own view {own!r}"
+            # And it must NOT carry another audience's role framing.
+            for other_a, other_heading in cases.items():
+                if other_a != audience:
+                    assert other_heading not in body, (
+                        f"{audience} leaked {other_a}'s view {other_heading!r}"
+                    )
+
+    def test_every_audience_carries_shared_core(self, tmp_path):
+        _build_operating_tree(tmp_path)
+        for audience in ("p1-default", "p1-specialists", "slack-project-agent", "qa-review"):
+            body = compose_operating_model(tmp_path, audience)
+            assert "Deploy Queue is the realization gate" in body
+
+    def test_unknown_audience_gets_core_only(self, tmp_path):
+        _build_operating_tree(tmp_path)
+        body = compose_operating_model(tmp_path, "no-such-audience")
+        assert body is not None
+        assert "Deploy Queue is the realization gate" in body
+        assert "# Your role —" not in body
+
+    def test_security_and_video_review_are_lane_audiences(self, tmp_path):
+        # graduation P1a G4: both resolve to a specialist view card path, not the
+        # coordinator view. (No leak into p1-default.)
+        for audience in ("security-review", "video-review"):
+            card = _resolve_view_card(tmp_path, audience)
+            assert card is not None
+            assert card.parent.name == "specialists"
+            assert card.name == f"{audience}.md"
+
+
+class TestOperatingContractTruncationIsLoud:
+    """Over-cap truncation emits the explicit marker AND logs — never silent."""
+
+    def test_over_cap_node_emits_marker_and_warns(self, tmp_path, caplog, monkeypatch):
+        # A core body larger than a deliberately tiny per-node cap.
+        big_core = "# Core\n\n" + ("X" * 5000) + "\nDeploy Queue is the realization gate.\n"
+        _build_operating_tree(tmp_path, core_body=big_core)
+        monkeypatch.setattr(_pb, "_CONTEXT_TREE_PER_NODE_CHAR_CAP", 200)
+        with caplog.at_level(logging.WARNING):
+            node = _load_context_tree_node("operating-model", tmp_path, audience="p1-default")
+        assert node is not None
+        assert node.endswith(CONTRACT_TRUNCATION_MARKER)
+        assert len(node) <= 200 + len(CONTRACT_TRUNCATION_MARKER) + 1
+        # LOUD: a warning naming the node + the incompleteness was logged.
+        assert any("OVER per-node cap" in r.message for r in caplog.records)
+        # And the marker text itself must NOT be the old silent "[...truncated...]".
+        assert "[...node truncated" not in node
+
+    def test_total_cap_overflow_appends_marker_section(self, tmp_path, caplog, monkeypatch):
+        _build_operating_tree(tmp_path)
+        # Force the TOTAL cap low enough that later nodes are dropped.
+        monkeypatch.setattr(_pb, "_CONTEXT_TREE_TOTAL_CHAR_CAP", 120)
+        with caplog.at_level(logging.WARNING):
+            block = build_context_tree_prompt(root=tmp_path, audience="p1-default")
+        assert CONTRACT_TRUNCATION_MARKER in block
+        assert any("TOTAL cap" in r.message for r in caplog.records)
+
+
+class TestOperatingContractFailsLoud:
+    """Missing core / missing role view is logged, never silently swallowed."""
+
+    def test_missing_core_returns_none_and_logs_error(self, tmp_path, caplog):
+        (tmp_path / "operating-model").mkdir(parents=True)
+        # No _core.md written.
+        with caplog.at_level(logging.ERROR):
+            body = compose_operating_model(tmp_path, "p1-default")
+        assert body is None
+        assert any("core UNREADABLE" in r.message for r in caplog.records)
+
+    def test_missing_role_view_composes_core_only_and_warns(self, tmp_path, caplog):
+        om = tmp_path / "operating-model"
+        om.mkdir(parents=True)
+        (om / "_core.md").write_text(
+            "---\nstatus: active\n---\n" + _CORE_BODY, encoding="utf-8"
+        )
+        # p1-default is a wired audience but its view card is absent.
+        with caplog.at_level(logging.WARNING):
+            body = compose_operating_model(tmp_path, "p1-default")
+        assert body is not None
+        assert "Deploy Queue is the realization gate" in body
+        assert "# Your role —" not in body
+        assert any("role view for audience" in r.message and "FAILED to load" in r.message
+                   for r in caplog.records)
+
+    def test_empty_node_logs_and_is_absent(self, tmp_path, caplog):
+        # A tree whose operating-model core is missing AND no legacy _node.md →
+        # the node loads empty and is logged, not silently dropped.
+        (tmp_path / "operating-model").mkdir(parents=True)
+        with caplog.at_level(logging.WARNING):
+            node = _load_context_tree_node("operating-model", tmp_path, audience="p1-default")
+        assert node is None
+        assert any("loaded EMPTY" in r.message for r in caplog.records)
+
+
+class TestOperatingContractVersionLine:
+    """The injected block carries the real version line (not the 2026-06-02 prose)."""
+
+    def test_version_line_format(self, tmp_path):
+        live = _build_operating_tree(tmp_path)
+        line = _operating_contract_version_line(tmp_path, "p1-default")
+        assert line == (
+            f"DecisionData operating contract v2.0 (core {live}) — "
+            f"role view p1-default@2026-07-16"
+        )
+
+    def test_version_line_in_injected_block(self, tmp_path):
+        live = _build_operating_tree(tmp_path)
+        block = build_context_tree_prompt(root=tmp_path, audience="p1-default")
+        assert f"DecisionData operating contract v2.0 (core {live})" in block
+        # The old hardcoded prose is GONE.
+        assert "injection active" not in block
+        assert "since 2026-06-02" not in block
+
+    def test_unknown_audience_version_line_is_core_only(self, tmp_path):
+        _build_operating_tree(tmp_path)
+        line = _operating_contract_version_line(tmp_path, "no-such-audience")
+        assert "core-only (no role view)" in line
+
+
+class TestOperatingContractPinValidation:
+    """Pin validation catches a deliberately-wrong composes_against_core pin."""
+
+    def test_correct_pin_passes(self, tmp_path):
+        live = _build_operating_tree(tmp_path)  # cards pinned to the live hash
+        card = tmp_path / "operating-model" / "agent-roles" / "p1-default.md"
+        assert _signal_pin_mismatch(card, tmp_path, live) is True
+
+    def test_wrong_pin_is_caught_and_logged(self, tmp_path, caplog):
+        live = _build_operating_tree(tmp_path, pin="sha256:deadbeefdeadbeef")
+        card = tmp_path / "operating-model" / "agent-roles" / "p1-default.md"
+        with caplog.at_level(logging.WARNING):
+            ok = _signal_pin_mismatch(card, tmp_path, live)
+        assert ok is False
+        assert any("pin MISMATCH" in r.message for r in caplog.records)
+
+    def test_wrong_pin_still_composes_never_hard_fails(self, tmp_path, caplog):
+        # A drifted pin SIGNALS (logs) but must never blank the prompt.
+        _build_operating_tree(tmp_path, pin="sha256:deadbeefdeadbeef")
+        with caplog.at_level(logging.WARNING):
+            body = compose_operating_model(tmp_path, "p1-default")
+        assert body is not None
+        assert "Coordinator (Layer 1)" in body          # view still composed
+        assert "Deploy Queue is the realization gate" in body
+        assert any("pin MISMATCH" in r.message for r in caplog.records)
+
+    def test_unpinned_card_is_not_a_mismatch(self, tmp_path):
+        # A card that declares no pin is not enforced by the composer signal
+        # (the out-of-band validator flags missing pins; the composer does not
+        # block on them).
+        _build_operating_tree(tmp_path)
+        om = tmp_path / "operating-model"
+        _write_card(om / "agent-roles" / "p1-default.md",
+                    audience="p1-default", heading="Coordinator (Layer 1)", pin=None)
+        live = _short_core_hash(_read_node_body(om / "_core.md", tmp_path))
+        card = om / "agent-roles" / "p1-default.md"
+        assert _signal_pin_mismatch(card, tmp_path, live) is True
+
+
+
 

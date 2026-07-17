@@ -54,9 +54,14 @@ def test_compose_falls_soft_to_core_when_view_missing(tree):
     assert "P1 coordinates" not in body
 
 
-def test_lane_profile_set_has_ten_lanes():
-    assert len(_LANE_PROFILE_AUDIENCES) == 10
+def test_lane_profile_set_has_twelve_lanes():
+    # graduation P1a (WTS 2911977a): security-review + video-review added to the
+    # lane audience set (both set tree_injection:true and previously fell back
+    # SILENTLY to the p1-default coordinator view — a deploy-authority leak).
+    assert len(_LANE_PROFILE_AUDIENCES) == 12
     assert "dd-design" in _LANE_PROFILE_AUDIENCES
+    assert "security-review" in _LANE_PROFILE_AUDIENCES
+    assert "video-review" in _LANE_PROFILE_AUDIENCES
     assert "default" not in _LANE_PROFILE_AUDIENCES  # default → p1-default, not a lane
 
 

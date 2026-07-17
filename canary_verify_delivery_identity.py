@@ -40,6 +40,35 @@ def _scan(text: str, markers: list[str]) -> list[str]:
     return [m for m in markers if m.lower() in low]
 
 
+def _role_mirror_in_parity() -> tuple:
+    """graduation P1a (WTS 2911977a) — run bin/dd-role-mirror --check.
+
+    The delivery-identity proof composes specialist role views; if a specialist
+    card and its profile SOUL have drifted, the view the canary reasons about is
+    not the identity the live profile actually carries. Assert parity as a
+    precondition. Returns (ok: bool, detail: str). A missing tool or unexpected
+    error is reported but treated as non-fatal here (ok=True) — the canary must
+    not be blocked by tooling absence, only by an observed DRIFT (exit 1).
+    """
+    import subprocess
+    hermes = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    tool = os.path.join(hermes, "bin", "dd-role-mirror")
+    if not os.path.exists(tool):
+        return True, f"dd-role-mirror not found at {tool} (skipped)"
+    try:
+        proc = subprocess.run(
+            [tool, "--check", "--hermes", hermes, "--quiet"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as exc:  # tooling failure — do not block the canary
+        return True, f"dd-role-mirror check errored ({exc}) — skipped"
+    if proc.returncode == 0:
+        return True, "all specialist card ⇄ SOUL mirrors in parity"
+    if proc.returncode == 1:
+        return False, "role-mirror DRIFT: " + (proc.stderr.strip() or "see dd-role-mirror --check")
+    return True, f"dd-role-mirror check inconclusive (rc={proc.returncode}) — skipped"
+
+
 def build_prompt(*, replace_identity: bool, platform: str) -> str:
     """Assemble the system prompt as _create_agent → _build_system_prompt would."""
     from run_agent import AIAgent
@@ -81,6 +110,17 @@ def main() -> int:
     if not (tree_on and tree_renders):
         print("✗ PRECONDITION FAIL: tree injection off or empty — the 'no markers' result")
         print("  would be vacuous. Cannot assert acc-b. (Enable context.tree_injection.)")
+        return 2
+
+    # graduation P1a (WTS 2911977a) — role-mirror parity precondition. The proof
+    # reasons about composed specialist role views; a card ⇄ SOUL drift means the
+    # canary is checking a view the live profile does not actually carry.
+    mirror_ok, mirror_detail = _role_mirror_in_parity()
+    print(f"PRECONDITION: role-mirror parity — {mirror_detail}")
+    if not mirror_ok:
+        print("✗ PRECONDITION FAIL: specialist card ⇄ profile SOUL drift. The composed")
+        print("  role view does not match the live profile identity. Run")
+        print("  bin/dd-role-mirror --regen to reconcile, then re-run this canary.")
         return 2
     print("=" * 70)
 

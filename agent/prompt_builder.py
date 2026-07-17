@@ -4,6 +4,7 @@ All functions are stateless. AIAgent._build_system_prompt() calls these to
 assemble pieces, then combines them with memory and ephemeral prompts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -1130,6 +1131,91 @@ def _strip_frontmatter(raw: str) -> str:
     return text[after + 1:].strip()
 
 
+# ── Contract version identity (graduation P1a / WTS 2911977a) ─────────────────
+# The operating contract now carries an explicit, validatable version. The
+# shared _core.md frontmatter declares `contract_version` and a `content_hash`
+# that pins the sha256 of the frontmatter-stripped core BODY (the exact bytes
+# _read_node_body injects). Each role card declares `composes_against_core` with
+# the same value. dd-context-validate enforces the match out-of-band and can
+# hard-fail; the COMPOSER only ever *signals* on mismatch (logs), never hard-
+# fails delivery — a drifted pin must not blank a live prompt.
+_CONTRACT_VERSION_FALLBACK = "v2.0"          # used if _core.md omits the field
+_CORE_HASH_PREFIX = "sha256:"
+_CORE_HASH_SHORT_LEN = 16                     # hex chars kept in the short pin
+
+
+def _short_core_hash(core_body: str) -> str:
+    """The canonical short core hash: 'sha256:<16hex>' of the stripped core body."""
+    digest = hashlib.sha256((core_body or "").encode("utf-8")).hexdigest()
+    return f"{_CORE_HASH_PREFIX}{digest[:_CORE_HASH_SHORT_LEN]}"
+
+
+def _read_core_frontmatter(root: Path) -> dict:
+    """Return the parsed frontmatter dict of operating-model/_core.md ({} on any error)."""
+    core_file = (root / "operating-model" / "_core.md").resolve()
+    if not str(core_file).startswith(str(root.resolve()) + os.sep):
+        return {}
+    try:
+        raw = core_file.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+    fm, _body = parse_frontmatter(raw)
+    return fm if isinstance(fm, dict) else {}
+
+
+def _core_version_and_hash(root: Path, core_body: Optional[str]) -> tuple:
+    """Return (contract_version, short_core_hash) for the live core.
+
+    contract_version comes from _core.md frontmatter (falling back to the
+    module constant); the hash is ALWAYS recomputed from the injected body so
+    the header can never advertise a stale pin. Returns (fallback, "") when the
+    core body is unavailable.
+    """
+    fm = _read_core_frontmatter(root)
+    version = str(fm.get("contract_version") or _CONTRACT_VERSION_FALLBACK).strip()
+    short = _short_core_hash(core_body) if core_body else ""
+    return version, short
+
+
+def _read_card_frontmatter(card_file: Path, root: Path) -> dict:
+    """Frontmatter dict of a role card, guarded to stay inside root ({} on error)."""
+    resolved = card_file.resolve()
+    if not str(resolved).startswith(str(root.resolve()) + os.sep):
+        return {}
+    try:
+        raw = resolved.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+    fm, _body = parse_frontmatter(raw)
+    return fm if isinstance(fm, dict) else {}
+
+
+def _signal_pin_mismatch(card_file: Path, root: Path, live_short_hash: str) -> bool:
+    """Log-only pin check for a composed role card.
+
+    Compares the card's `composes_against_core` pin to the live short core hash.
+    Returns True when they match (or the card declares no pin — nothing to
+    enforce), False on a real mismatch, which is LOGGED at WARNING. This never
+    raises and never blocks composition: the validator (bin/dd-context-validate)
+    is the enforcement gate; the composer only surfaces a signal.
+    """
+    if not live_short_hash:
+        return True
+    fm = _read_card_frontmatter(card_file, root)
+    pin = fm.get("composes_against_core")
+    if not pin:
+        return True  # unpinned card — nothing to validate here
+    if str(pin).strip() == live_short_hash:
+        return True
+    logger.warning(
+        "operating-contract pin MISMATCH: card %s pins composes_against_core=%r "
+        "but live core hash is %s — role view may be composed against a core it "
+        "was not written for. Run bin/dd-context-validate.",
+        card_file.name, str(pin).strip(), live_short_hash,
+    )
+    return False
+
+
 # Per-audience role views the operating-model node composes with the shared
 # core. Keys are the audience labels passed by each loader; values are the
 # role-view filename under operating-model/agent-roles/. Only WIRED audiences
@@ -1140,12 +1226,19 @@ _OPERATING_MODEL_VIEW_BY_AUDIENCE = {
     "p1-default": "p1-default",
 }
 
-# WS4 §4.1 — the 10 lane profiles whose own role view lives under
+# WS4 §4.1 — the lane profiles whose own role view lives under
 # agent-roles/specialists/<profile>.md. When the audience is one of these, the
 # loader composes that specialist view (not the generic coordinator view).
+#
+# graduation P1a (WTS 2911977a): security-review and video-review are ADDED. Both
+# profiles set tree_injection:true but were absent here, so the audience resolver
+# silently gave them the p1-default coordinator view (deploy-authority text they
+# must NOT carry — a boundary leak). Their thin review-scoped cards now live at
+# agent-roles/specialists/{security-review,video-review}.md.
 _LANE_PROFILE_AUDIENCES = frozenset({
     "dd-design", "dd-engineer-1", "dd-engineer-2", "dd-engineer-3", "qa-review",
     "dd-pmo", "architect-standards", "product-os", "knowledge-context", "devops-release",
+    "security-review", "video-review",
 })
 
 
@@ -1162,6 +1255,23 @@ def _read_node_body(node_file: Path, root: Path) -> Optional[str]:
     return body or None
 
 
+def _resolve_view_card(root: Path, audience: str) -> Optional[Path]:
+    """Return the filesystem path of the role-view card for *audience*, or None.
+
+    A known lane profile composes its OWN specialist view
+    (agent-roles/specialists/<audience>.md); the three coordinator-family
+    audiences map through _OPERATING_MODEL_VIEW_BY_AUDIENCE to
+    agent-roles/<slug>.md. An unwired audience has no view card (core only).
+    Path resolution only — existence is checked by the reader.
+    """
+    if audience in _LANE_PROFILE_AUDIENCES:
+        return root / "operating-model" / "agent-roles" / "specialists" / f"{audience}.md"
+    view_slug = _OPERATING_MODEL_VIEW_BY_AUDIENCE.get(audience)
+    if view_slug:
+        return root / "operating-model" / "agent-roles" / f"{view_slug}.md"
+    return None
+
+
 def compose_operating_model(root: Path, audience: str) -> Optional[str]:
     """Compose the operating-model payload = shared _core.md + the audience role view.
 
@@ -1169,84 +1279,189 @@ def compose_operating_model(root: Path, audience: str) -> Optional[str]:
     the role view describes only the reader's own role. Returns the composed
     body, or the core alone if the audience has no wired view, or None if the
     core is unreadable (caller falls back to the legacy _node.md).
+
+    graduation P1a (WTS 2911977a): fail-loud. An unreadable/empty core is LOGGED
+    at ERROR (it used to return None silently — the caller then fell back to the
+    legacy node with no signal). A wired audience whose view card fails to load
+    is LOGGED at WARNING (core-only composition is a degraded contract, not a
+    normal path). A pin mismatch between the view card and the live core is
+    SIGNALLED (logged) but never blocks — see _signal_pin_mismatch.
     """
     core = _read_node_body(root / "operating-model" / "_core.md", root)
     if not core:
-        return None
-    view = None
-    # WS4 §4.1 — a known lane profile composes its OWN specialist view, not the
-    # generic coordinator view. This is the fix for the audience mis-assembly:
-    # every specialist resolves to agent-roles/specialists/<profile>.md.
-    if audience in _LANE_PROFILE_AUDIENCES:
-        view = _read_node_body(
-            root / "operating-model" / "agent-roles" / "specialists" / f"{audience}.md", root
+        logger.error(
+            "operating-model core UNREADABLE at %s — composing NOTHING; caller "
+            "falls back to legacy _node.md. The shared operating contract is NOT "
+            "being delivered this turn.",
+            (root / "operating-model" / "_core.md"),
         )
-    if view is None:
-        view_slug = _OPERATING_MODEL_VIEW_BY_AUDIENCE.get(audience)
-        if view_slug:
-            view = _read_node_body(
-                root / "operating-model" / "agent-roles" / f"{view_slug}.md", root
+        return None
+    live_hash = _short_core_hash(core)
+    view = None
+    view_card = _resolve_view_card(root, audience)
+    if view_card is not None:
+        # Signal (log-only) if the card's pin disagrees with the live core, then
+        # compose regardless — a drifted pin must never blank a live prompt.
+        _signal_pin_mismatch(view_card, root, live_hash)
+        view = _read_node_body(view_card, root)
+        if view is None:
+            logger.warning(
+                "operating-model role view for audience %r FAILED to load "
+                "(%s) — composing CORE ONLY. The reader gets the shared boundary "
+                "but NOT its role-specific contract.",
+                audience, view_card,
             )
     return f"{core}\n\n{view}" if view else core
 
 
-def _load_context_tree_node(slug: str, root: Path, audience: str = "p1-specialists") -> Optional[str]:
+# graduation P1a (WTS 2911977a): the explicit, machine-greppable marker that
+# replaces the old silent "[...node truncated...]" tail. Its presence in a live
+# prompt means the operating contract this turn is INCOMPLETE — the reader must
+# not treat the truncated node as authoritative, and telemetry can detect it.
+CONTRACT_TRUNCATION_MARKER = "[CONTRACT TRUNCATED — incomplete, do not treat as authoritative]"
+
+
+def _load_context_tree_node(slug: str, root: Path, audience: str) -> Optional[str]:
     """Load one awareness node's summary body by fixed slug. None on any failure.
 
     For the ``operating-model`` slug, compose the shared core + the audience's
     role view (alignment-by-construction split). Other slugs load their _node.md.
+
+    graduation P1a (WTS 2911977a):
+      * ``audience`` is now REQUIRED (the vestigial "p1-specialists" default is
+        gone — every caller must state the audience it is composing for).
+      * Over-cap truncation is FAIL-LOUD: the body is cut and the explicit
+        CONTRACT_TRUNCATION_MARKER is appended (not the old silent tail), and a
+        WARNING is logged with the node, audience, and dropped-char count.
+      * A node that loads empty is LOGGED (a missing operating-model core or a
+        blank node must never pass silently).
     """
     if slug not in _CONTEXT_TREE_AWARENESS_NODES:
         return None
     if slug == "operating-model":
         body = compose_operating_model(root, audience)
         if body is None:
-            # Fall back to the legacy single _node.md if core is missing.
+            # Fall back to the legacy single _node.md if core is missing. The
+            # ERROR was already logged inside compose_operating_model.
             body = _read_node_body(root / slug / "_node.md", root)
+            if body:
+                logger.warning(
+                    "operating-model composed empty; using legacy %s/_node.md "
+                    "fallback (audience=%r).", slug, audience,
+                )
     else:
         body = _read_node_body(root / slug / "_node.md", root)
     if not body:
+        logger.warning(
+            "context-tree node %r loaded EMPTY (audience=%r) — it will be absent "
+            "from the injected prompt.", slug, audience,
+        )
         return None
     if len(body) > _CONTEXT_TREE_PER_NODE_CHAR_CAP:
-        return body[:_CONTEXT_TREE_PER_NODE_CHAR_CAP] + (
-            f"\n[...node truncated to {_CONTEXT_TREE_PER_NODE_CHAR_CAP} chars...]"
+        dropped = len(body) - _CONTEXT_TREE_PER_NODE_CHAR_CAP
+        logger.warning(
+            "context-tree node %r OVER per-node cap (audience=%r): %d chars, cap "
+            "%d — TRUNCATING and dropping %d chars. Injecting %s. The operating "
+            "contract delivered this turn is INCOMPLETE.",
+            slug, audience, len(body), _CONTEXT_TREE_PER_NODE_CHAR_CAP,
+            dropped, CONTRACT_TRUNCATION_MARKER,
         )
+        return body[:_CONTEXT_TREE_PER_NODE_CHAR_CAP] + f"\n{CONTRACT_TRUNCATION_MARKER}"
     return body
 
 
-def build_context_tree_prompt(root: Optional[Path] = None, audience: str = "p1-specialists") -> str:
+def _operating_contract_version_line(tree_root: Path, audience: str) -> str:
+    """Build the single operating-contract version header line (graduation P1a).
+
+    Format:
+      DecisionData operating contract v2.0 (core <shorthash>) — role view <card>@<date>
+
+    Replaces the old hardcoded "injection active since 2026-06-02" prose with a
+    real, self-describing version stamp: the contract version + the live short
+    core hash + which role view was composed and when it was last updated.
+    Always returns a usable line; unknown/missing pieces degrade to explicit
+    placeholders (never an empty or misleading stamp).
+    """
+    core = _read_node_body(tree_root / "operating-model" / "_core.md", tree_root)
+    version, short = _core_version_and_hash(tree_root, core)
+    core_part = short or "unavailable"
+    # Which role-view card was composed, and its last_updated stamp.
+    card = _resolve_view_card(tree_root, audience)
+    if card is None:
+        view_part = "core-only (no role view)"
+    else:
+        fm = _read_card_frontmatter(card, tree_root)
+        date = str(fm.get("last_updated") or "undated").strip()
+        view_part = f"{card.stem}@{date}"
+    return (
+        f"DecisionData operating contract {version} (core {core_part}) — "
+        f"role view {view_part}"
+    )
+
+
+def build_context_tree_prompt(root: Optional[Path] = None, *, audience: str) -> str:
     """Render the DecisionData /context tree awareness block for a turn.
 
     Mirrors the Slack canary loader (awareness _node.md summaries only, no
     detail/ walk), capped and fail-soft. Returns "" when nothing loads, so the
     system prompt is unchanged on a missing/broken tree. The block is explicitly
     LOWER precedence than the live turn and never overrides the requested output.
+
+    graduation P1a (WTS 2911977a):
+      * ``audience`` is a REQUIRED keyword-only arg (the vestigial
+        "p1-specialists" default is gone). ``root`` stays optional — pass None
+        (the default) to use the live tree.
+      * The header carries a real version line (see
+        _operating_contract_version_line) instead of the hardcoded
+        "injection active since 2026-06-02" prose.
+      * When a node is DROPPED because it would breach the total cap, that is now
+        LOUD: a WARNING is logged and an explicit CONTRACT_TRUNCATION_MARKER
+        section is appended so the reader sees the contract is incomplete.
     """
     tree_root = root or _context_tree_root()
     sections = []
     loaded = []
+    dropped_slugs = []
     total = 0
     for slug in _CONTEXT_TREE_AWARENESS_NODES:
         body = _load_context_tree_node(slug, tree_root, audience=audience)
         if not body:
             continue
         if total + len(body) > _CONTEXT_TREE_TOTAL_CHAR_CAP:
-            break
+            dropped_slugs.append(slug)
+            continue
         sections.append(f"### context: {slug}\n{body}")
         loaded.append(slug)
         total += len(body)
     if not sections:
         return ""
+    if dropped_slugs:
+        logger.warning(
+            "context-tree TOTAL cap %d exceeded (audience=%r): loaded %s (%d "
+            "chars), DROPPED %s. Injecting %s. The operating contract delivered "
+            "this turn is INCOMPLETE.",
+            _CONTEXT_TREE_TOTAL_CHAR_CAP, audience, loaded, total, dropped_slugs,
+            CONTRACT_TRUNCATION_MARKER,
+        )
+        sections.append(
+            f"### context: (dropped {', '.join(dropped_slugs)})\n"
+            f"{CONTRACT_TRUNCATION_MARKER}"
+        )
+    version_line = _operating_contract_version_line(tree_root, audience)
     header = "\n".join([
         "--- DecisionData /context tree (awareness; background system + operating context) ---",
-        "You ARE operating live on the DecisionData /context tree right now (injection active",
-        "since 2026-06-02): the summaries below are loaded into this very turn, and your live",
-        "working focus is in your MEMORY notes. These are durable, git-versioned awareness",
-        "summaries from the shared /context tree. They are LOWER precedence than the current",
-        "request — they set operating defaults and system awareness, and must never override the",
-        "requested output for this turn. If a summary disagrees with its named source, the source wins.",
+        version_line,
+        "You ARE operating live on the DecisionData /context tree right now: the summaries below",
+        "are loaded into this very turn, and your live working focus is in your MEMORY notes.",
+        "These are durable, git-versioned awareness summaries from the shared /context tree. They",
+        "are LOWER precedence than the current request — they set operating defaults and system",
+        "awareness, and must never override the requested output for this turn. If a summary",
+        "disagrees with its named source, the source wins.",
     ])
-    logger.debug("context-tree injected nodes: %s (%d chars)", loaded, total)
+    logger.debug(
+        "context-tree injected nodes: %s (%d chars); %s",
+        loaded, total, version_line,
+    )
     return f"{header}\n\n" + "\n\n".join(sections)
 
 
