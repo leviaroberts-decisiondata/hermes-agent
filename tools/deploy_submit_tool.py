@@ -348,6 +348,63 @@ def deploy_submit(
     if sid and str(sid).strip():
         body["agent_session_id"] = str(sid).strip()
 
+    # ── Admission-time chain-binding check (deploy-friction batch #3) ─────────
+    # A submit inheriting/overriding a wts_task_id that CONTRADICTS the live chain's
+    # established binding on this route_key would silently link the deploy row to the
+    # WRONG tracker task — a drift the bind path (dd-chain-driver --set-wts) already
+    # refuses, but the deploy-submit path did not. It is caught only later at
+    # parity-audit, never at admission; WTS_LINK_MISMATCH cannot catch it (that only
+    # proves the row persisted what was REQUESTED, not that the request was consistent
+    # with the chain). Ask the chain driver (authoritative for bindings) for a verdict
+    # and refuse BEFORE the row is created. FAIL-OPEN: only a confirmed `contradiction`
+    # blocks; no chain / no established binding / any error proceeds. Kill-switch
+    # DD_CHAIN_BINDING_ADMISSION = enforce | shadow | off (default enforce).
+    _binding_mode = (os.getenv("DD_CHAIN_BINDING_ADMISSION", "enforce").strip().lower()
+                     or "enforce")
+    if _binding_mode != "off" and resolved_wts:
+        _route_key = str(getattr(parent_agent, "_dd_route_key", "") or "").strip()
+        if _route_key:
+            try:
+                import subprocess as _sp
+                _helper = _SHARED_HERMES_BIN / "dd-chain-driver"
+                _verdict, _vrow = "no-binding", {}
+                if _helper.exists():
+                    _cp = _sp.run(
+                        [sys.executable, str(_helper), "--check-binding",
+                         "--wts", resolved_wts, "--route-key", _route_key],
+                        capture_output=True, text=True, timeout=20,
+                    )
+                    if _cp.returncode == 0 and _cp.stdout.strip():
+                        _vrow = json.loads(_cp.stdout.strip().splitlines()[-1])
+                        _verdict = _vrow.get("verdict", "no-binding")
+                if _verdict == "contradiction":
+                    _bw = _vrow.get("bound_wts")
+                    if _binding_mode == "shadow":
+                        _LOG.warning(
+                            "deploy_submit.binding_mismatch_shadow %s",
+                            {"route_key": _route_key, "bound_wts": _bw,
+                             "requested_wts": resolved_wts})
+                    else:  # enforce
+                        return json.dumps({
+                            "ok": False,
+                            "denied": True,
+                            "reason": "CHAIN_BINDING_MISMATCH",
+                            "bound_wts_task_id": _bw,
+                            "requested_wts_task_id": resolved_wts,
+                            "route_key": _route_key,
+                            "message": (
+                                "CHAIN_BINDING_MISMATCH: this turn's chain (route "
+                                f"{_route_key}) is already bound to WTS task {_bw!r}, but "
+                                f"the submit carries wts_task_id={resolved_wts!r}. "
+                                "Submitting would link the deploy to the wrong tracker "
+                                "task. Re-submit with the chain's bound task (omit "
+                                "wts_task_id to inherit it), or reconcile the chain "
+                                "binding first."
+                            ),
+                        })
+            except Exception:
+                pass  # fail-open: never let the admission check block a legit submit
+
     from gateway import capability_egress
 
     url = f"{_MC_API_BASE}/api/deploy-queue/submit"
