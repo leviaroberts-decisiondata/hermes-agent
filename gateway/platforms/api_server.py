@@ -1167,6 +1167,16 @@ class APIServerAdapter(BasePlatformAdapter):
         _dd_run_id = (request.headers.get("X-DD-Run-Id") or "").strip()
         _dd_parent_run_id = (request.headers.get("X-DD-Parent-Run-Id") or "").strip() or None
         _dd_wts_task_id = (request.headers.get("X-DD-WTS-Task-Id") or "").strip() or None
+        # WTS 5c2ee467 — bind the per-turn canonical WTS task into the request's
+        # task-local context so it propagates (via _run_agent's copy_context) into
+        # the terminal tool's subprocess env as DD_TURN_WTS_TASK, letting
+        # `dd-delivery ship` inherit the exact task. Per-request isolated; never
+        # process-global. Empty header clears it for this context.
+        try:
+            from gateway.session_context import set_session_wts_task
+            set_session_wts_task(_dd_wts_task_id or "")
+        except Exception:
+            pass
         # WS1 §4 — delivery-distinct identity. When the dispatcher marks this a
         # delivery turn, build the agent with skip_context_files=True +
         # load_soul_identity=False so the P1 coordinator SOUL is NOT slot #1.

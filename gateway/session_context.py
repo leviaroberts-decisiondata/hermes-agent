@@ -113,6 +113,16 @@ def set_session_vars(
     return tokens
 
 
+def set_session_wts_task(wts_task_id: str) -> None:
+    """Set ONLY the per-turn WTS task contextvar (WTS 5c2ee467). Used by the
+    api_server /v1/chat/completions path, which reads X-DD-WTS-Task-Id but does not
+    call set_session_vars — it runs the agent under contextvars.copy_context(), so a
+    value set here in the request handler propagates into the agent loop and into the
+    terminal tool's _make_run_env (surfaced as DD_TURN_WTS_TASK). Task-local ⇒
+    per-request isolated. Setting '' explicitly clears it for this context."""
+    _SESSION_WTS_TASK_ID.set(wts_task_id or "")
+
+
 def clear_session_vars(tokens: list) -> None:
     """Mark session context variables as explicitly cleared.
 
