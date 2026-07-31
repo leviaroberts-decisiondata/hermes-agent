@@ -43,9 +43,34 @@ _CONTEXT_THREAT_PATTERNS = [
     (r'<!--[^>]*(?:ignore|override|system|secret|hidden)[^>]*-->', "html_comment_injection"),
     (r'<\s*div\s+style\s*=\s*["\'][\s\S]*?display\s*:\s*none', "hidden_div"),
     (r'translate\s+.*\s+into\s+.*\s+and\s+(execute|run|eval)', "translate_execute"),
-    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
     (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass)', "read_secrets"),
 ]
+
+# exfil_curl is adjudicated per-line rather than by bare regex (fleet-repair
+# 00.5, WTS 7e1d32e9): ops docs legitimately show `curl -H "… $TOKEN"` against
+# internal services, and the old pattern blocked a real project context file
+# 104 times on exactly that. The exfil signature is a secret-bearing curl aimed
+# at a CONCRETE EXTERNAL host; internal targets (loopback, *.decisiondata.io,
+# *.local) and placeholder/no-URL lines are ordinary documentation.
+_EXFIL_CURL_LINE_RE = re.compile(
+    r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)',
+    re.IGNORECASE)
+_CONTEXT_URL_RE = re.compile(r'https?://[^\s"\'`)>]+', re.IGNORECASE)
+_INTERNAL_URL_RE = re.compile(
+    r'https?://(?:localhost|127\.0\.0\.1|\[?::1\]?|0\.0\.0\.0'
+    r'|[\w.-]*\.decisiondata\.io|[\w.-]+\.local)(?::\d+)?(?:/|$)',
+    re.IGNORECASE)
+
+
+def _exfil_curl_hit(content: str) -> bool:
+    """True when a secret-referencing curl line targets a concrete external URL."""
+    for line in content.splitlines():
+        if not _EXFIL_CURL_LINE_RE.search(line):
+            continue
+        for url in _CONTEXT_URL_RE.findall(line):
+            if not _INTERNAL_URL_RE.match(url):
+                return True
+    return False
 
 _CONTEXT_INVISIBLE_CHARS = {
     '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
@@ -66,6 +91,10 @@ def _scan_context_content(content: str, filename: str) -> str:
     for pattern, pid in _CONTEXT_THREAT_PATTERNS:
         if re.search(pattern, content, re.IGNORECASE):
             findings.append(pid)
+
+    # Target-aware curl adjudication (see _exfil_curl_hit).
+    if _exfil_curl_hit(content):
+        findings.append("exfil_curl")
 
     if findings:
         logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
@@ -1323,6 +1352,47 @@ def compose_operating_model(root: Path, audience: str) -> Optional[str]:
 CONTRACT_TRUNCATION_MARKER = "[CONTRACT TRUNCATED — incomplete, do not treat as authoritative]"
 
 
+def _dropped_sections(body: str, cap: int) -> "list[str]":
+    """Names of the markdown sections lost when *body* is sliced at *cap*:
+    the section containing the cut (delivered incomplete) plus every section
+    that starts at or after the cut (fleet-repair 00.3, WTS 7e1d32e9 — a
+    truncated agent must at least be able to say WHAT it is missing)."""
+    partial = None
+    fully_dropped = []
+    for m in re.finditer(r'(?m)^(#{1,4})\s+(.+?)\s*$', body):
+        if m.start() < cap:
+            partial = m.group(2)
+        else:
+            fully_dropped.append(m.group(2))
+    out = []
+    if partial is not None and len(body) > cap:
+        out.append("%s (cut mid-section)" % partial)
+    out.extend(fully_dropped)
+    return out
+
+
+# Fail-closed composition for the coordinator (fleet-repair 00.3, operator
+# decision 2026-07-30): P1 silently missing its deploy gate is worse than a
+# loud failure. When p1-default composes over cap, the role card is WITHHELD
+# (never half-delivered) — the shared core still ships, deploy authority is
+# explicitly revoked, and the failure is surfaced to the operator. Every other
+# audience keeps truncate-and-warn.
+_P1_FAIL_CLOSED_NOTICE = (
+    "## OPERATING CONTRACT COMPOSITION FAILED — RUNNING FAIL-CLOSED\n"
+    "The p1-default contract composed to %d chars against the %d cap. A "
+    "truncated coordinator contract must not ship, so the role card was "
+    "withheld this turn (the shared core above still applies). Sections that "
+    "would have been lost or cut: %s.\n"
+    "Until an operator fixes the tree (`dd-context-validate` must pass):\n"
+    "- Do NOT exercise deploy authority (no deploy_approve / deploy_transition).\n"
+    "- Do NOT dispatch new specialist lanes.\n"
+    "- Tell the operator in your FIRST reply: \"P1 operating contract failed "
+    "composition (over cap); running fail-closed without deploy authority "
+    "until dd-context-validate passes.\"\n"
+    + CONTRACT_TRUNCATION_MARKER
+)
+
+
 def _load_context_tree_node(slug: str, root: Path, audience: str) -> Optional[str]:
     """Load one awareness node's summary body by fixed slug. None on any failure.
 
@@ -1361,14 +1431,34 @@ def _load_context_tree_node(slug: str, root: Path, audience: str) -> Optional[st
         return None
     if len(body) > _CONTEXT_TREE_PER_NODE_CHAR_CAP:
         dropped = len(body) - _CONTEXT_TREE_PER_NODE_CHAR_CAP
+        lost = _dropped_sections(body, _CONTEXT_TREE_PER_NODE_CHAR_CAP)
+        lost_txt = "; ".join(lost) if lost else "unnamed tail content"
+        if slug == "operating-model" and audience == "p1-default":
+            # Fail-closed for the coordinator (00.3): ship core + explicit
+            # authority revocation, never a half-delivered card.
+            logger.error(
+                "operating-model composition FAIL-CLOSED for p1-default: %d "
+                "chars vs cap %d (would lose: %s). Role card WITHHELD; deploy "
+                "authority revoked in-band. Fix the tree and rerun "
+                "dd-context-validate.",
+                len(body), _CONTEXT_TREE_PER_NODE_CHAR_CAP, lost_txt,
+            )
+            core = _read_node_body(root / "operating-model" / "_core.md", root) or ""
+            notice = _P1_FAIL_CLOSED_NOTICE % (
+                len(body), _CONTEXT_TREE_PER_NODE_CHAR_CAP, lost_txt)
+            combined = f"{core}\n\n{notice}" if core else notice
+            # The combined fallback must itself respect the cap.
+            return combined[:_CONTEXT_TREE_PER_NODE_CHAR_CAP + len(CONTRACT_TRUNCATION_MARKER) + 1]
         logger.warning(
             "context-tree node %r OVER per-node cap (audience=%r): %d chars, cap "
-            "%d — TRUNCATING and dropping %d chars. Injecting %s. The operating "
-            "contract delivered this turn is INCOMPLETE.",
+            "%d — TRUNCATING and dropping %d chars (lost: %s). Injecting %s. The "
+            "operating contract delivered this turn is INCOMPLETE.",
             slug, audience, len(body), _CONTEXT_TREE_PER_NODE_CHAR_CAP,
-            dropped, CONTRACT_TRUNCATION_MARKER,
+            dropped, lost_txt, CONTRACT_TRUNCATION_MARKER,
         )
-        return body[:_CONTEXT_TREE_PER_NODE_CHAR_CAP] + f"\n{CONTRACT_TRUNCATION_MARKER}"
+        return (body[:_CONTEXT_TREE_PER_NODE_CHAR_CAP]
+                + f"\n{CONTRACT_TRUNCATION_MARKER}"
+                + f"\n[dropped sections: {lost_txt}]")
     return body
 
 

@@ -1840,6 +1840,11 @@ class AIAgent:
             self._fallback_chain = []
         self._fallback_index = 0
         self._fallback_activated = False
+        # Fleet-repair 0.4 (WTS 7e1d32e9): durable record of every fallback
+        # activation this session — a degraded turn must never be visually
+        # identical to a good one. Never reset on primary-restore; this is a
+        # history of what happened, not current state.
+        self._fallback_events: list = []
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -1879,6 +1884,24 @@ class AIAgent:
             _before = {t["function"]["name"] for t in self.tools}
             self.tools = [t for t in self.tools if t["function"]["name"] not in _strip]
             self._delivery_stripped_tools = tuple(sorted(_before & _strip))
+
+        # Fleet-repair 1.1 (WTS 7e1d32e9): never advertise a dead capability.
+        # With no platform callback wired, clarify hard-errors ("not available
+        # in this execution context") — yet every gateway turn advertised it,
+        # so agents burned a call on the error and then guessed. No callback ⇒
+        # clarify is omitted from the serialized tool list, and the agent puts
+        # its question in its answer instead. Transport implementers (items
+        # 1.2/1.3): pass clarify_callback at CONSTRUCTION — attaching it after
+        # __init__ will not restore the stripped tool.
+        if self.clarify_callback is None and self.tools:
+            _pre = len(self.tools)
+            self.tools = [t for t in self.tools if t["function"]["name"] != "clarify"]
+            if len(self.tools) != _pre:
+                logging.info(
+                    "%sclarify omitted from tool list: no clarify_callback wired "
+                    "for platform %r (fleet-repair 1.1 — a dead affordance must "
+                    "not be advertised).", self.log_prefix, self.platform,
+                )
 
         # Show tool configuration and store valid tool names for validation
         self.valid_tool_names = set()
@@ -4590,6 +4613,11 @@ class AIAgent:
 
             if self._last_context_usage is not None:
                 entry["context_usage"] = self._last_context_usage
+
+            # 0.4: a session that ever degraded says so in its durable record.
+            if getattr(self, "_fallback_events", None):
+                entry["fallback_events"] = list(self._fallback_events)
+                entry["served_model_degraded"] = True
 
             atomic_json_write(
                 self.session_log_file,
@@ -8008,6 +8036,18 @@ class AIAgent:
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
             self._fallback_activated = True
+            # 0.4: record the degradation durably (session log + delegate
+            # entries read this).
+            try:
+                self._fallback_events.append({
+                    "from_model": old_model,
+                    "to_model": fb_model,
+                    "to_provider": fb_provider,
+                    "reason": getattr(reason, "name", None) or (str(reason) if reason else None),
+                    "at": datetime.now().isoformat(),
+                })
+            except Exception:
+                pass
 
             # Honor per-provider / per-model request_timeout_seconds for the
             # fallback target (same knob the primary client uses).  None = use
