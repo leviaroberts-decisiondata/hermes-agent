@@ -192,7 +192,6 @@ def build_continuation_prompt(
         f"Lane: {lane}\n"
         f"Gate: {gate}\n"
         + (f"Terminal state: {terminal_state}\n" if terminal_state else "")
-        + (f"Retry disposition: {retry_disposition}\n" if retry_disposition else "")
         + f"Run dir: {run_dir}\n"
         f"Run id: {run_id}\n"
         f"Result artifact: {art}"
