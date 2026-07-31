@@ -787,6 +787,18 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     return None
 
 
+def _looks_like_line_numbered_dump(content: str) -> bool:
+    """Fleet-repair hardening (WTS 7e1d32e9): read_file emits LINE_NUM|CONTENT
+    lines; writing that back verbatim corrupts the target file. Flag content
+    where a strong majority of non-empty lines carry a leading NN| prefix —
+    that is a read-tool dump, not intended file content."""
+    lines = [ln for ln in (content or "").splitlines() if ln.strip()]
+    if len(lines) < 5:
+        return False
+    prefixed = sum(1 for ln in lines if re.match(r"^\s*\d{1,6}\|", ln))
+    return prefixed / len(lines) > 0.9
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
     sensitive_err = _check_sensitive_path(path, task_id)
@@ -796,6 +808,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
         return tool_error(
             "Refusing to write internal read_file status text as file content. "
             "Re-read the file or reconstruct the intended file contents before writing."
+        )
+    if _looks_like_line_numbered_dump(content):
+        return tool_error(
+            "Refusing to write content that looks like a read_file dump: >90% "
+            "of lines carry a LINE_NUM| prefix. Strip the line-number prefixes "
+            "and write the actual file contents."
         )
     try:
         # Resolve once for the registry lock + stale check.  Failures here

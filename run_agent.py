@@ -303,6 +303,36 @@ class IterationBudget:
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
+
+def _is_manifest_bookkeeping_call(tool_call) -> bool:
+    """Fleet-repair 3.1 (WTS 7e1d32e9): True only for a terminal call whose
+    ENTIRE command is a single dd-lane-manifest invocation. The closeout fuse
+    exists to stop new investigation, not to stop a run from recording what it
+    found — but the exemption must be smuggle-proof: any shell chaining,
+    substitution, redirect, or newline disqualifies the call (a refused
+    bookkeeping write still has the daemon-harvest fallback; a smuggled
+    investigation has no backstop)."""
+    try:
+        if tool_call.function.name != "terminal":
+            return False
+        args = json.loads(tool_call.function.arguments or "{}")
+        cmd = (args.get("command") or "") if isinstance(args, dict) else ""
+        if not cmd or "$(" in cmd:
+            return False
+        if any(ch in cmd for ch in ";|&`><\n"):
+            return False
+        import shlex
+        tokens = shlex.split(cmd)
+        if not tokens:
+            return False
+        head = os.path.basename(tokens[0])
+        if head == "dd-lane-manifest":
+            return True
+        return (head in ("python", "python3") and len(tokens) > 1
+                and os.path.basename(tokens[1]) == "dd-lane-manifest")
+    except Exception:
+        return False
+
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
@@ -4618,6 +4648,30 @@ class AIAgent:
             if getattr(self, "_fallback_events", None):
                 entry["fallback_events"] = list(self._fallback_events)
                 entry["served_model_degraded"] = True
+
+            # Fleet-repair 5.2 (WTS 7e1d32e9): flag a long single-threaded
+            # DELIVERY turn that never delegated — the durable signal backing
+            # the role-card rule (prompt rules are not durable controls).
+            _is_delivery = bool(getattr(self, "skip_context_files", False)
+                                and not getattr(self, "load_soul_identity", True))
+            if _is_delivery:
+                _tool_names = []
+                for _m in cleaned:
+                    if not isinstance(_m, dict):
+                        continue
+                    for _tc in (_m.get("tool_calls") or []):
+                        if isinstance(_tc, dict):
+                            _n = (_tc.get("function") or {}).get("name")
+                            if _n:
+                                _tool_names.append(_n)
+                _st_threshold = int(os.environ.get(
+                    "DD_SLACK_SINGLE_THREAD_FLAG_CALLS", "15"))
+                if (len(_tool_names) >= _st_threshold
+                        and "delegate_task" not in _tool_names):
+                    entry["single_threaded_no_delegation"] = {
+                        "tool_calls": len(_tool_names),
+                        "threshold": _st_threshold,
+                    }
 
             atomic_json_write(
                 self.session_log_file,
@@ -9640,19 +9694,49 @@ class AIAgent:
             self.execution_deadline is not None and self.execution_deadline.in_closeout()
         ):
             self._closeout_active = True
+            # Fleet-repair 3.1 (WTS 7e1d32e9): the RESULT CONTRACT requires
+            # dd-lane-manifest gate/blocker/provenance/next-owner writes at
+            # exactly this moment — the old blanket refusal destroyed two runs
+            # (2,287.9s) and corrupted a third's manifest on mission 87211c6c.
+            # A call whose entire command is one dd-lane-manifest invocation
+            # executes; everything else is refused as before.
+            _bookkept = 0
             for tool_call in tool_calls:
+                if _is_manifest_bookkeeping_call(tool_call):
+                    try:
+                        _bk_args = json.loads(tool_call.function.arguments or "{}")
+                    except (ValueError, TypeError):
+                        _bk_args = {}
+                    _bk_result = self._invoke_tool(
+                        tool_call.function.name,
+                        _bk_args if isinstance(_bk_args, dict) else {},
+                        effective_task_id,
+                        tool_call_id=tool_call.id,
+                        messages=messages,
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "content": _bk_result,
+                        "tool_call_id": tool_call.id,
+                    })
+                    _bookkept += 1
+                    continue
                 messages.append({
                     "role": "tool",
                     "content": (
                         "[CLOSEOUT ACTIVE — tool call refused] The execution "
                         "budget is in its reserved closeout window; no new "
-                        "investigation may start. Produce your final or "
+                        "investigation may start. dd-lane-manifest bookkeeping "
+                        "calls are still permitted. Produce your final or "
                         "PARTIAL result now from the evidence already in "
                         "this conversation."
                     ),
                     "tool_call_id": tool_call.id,
                 })
-            self._touch_activity("closeout: refused tool batch, awaiting synthesis")
+            self._touch_activity(
+                "closeout: %d manifest bookkeeping call(s) executed, rest "
+                "refused, awaiting synthesis" % _bookkept if _bookkept else
+                "closeout: refused tool batch, awaiting synthesis")
             return
 
         # ── Per-call budget cap (WTS ac4bcb05 AC3) ─────────────────────

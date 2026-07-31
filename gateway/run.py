@@ -997,6 +997,128 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     return None
 
 
+# ── Fleet-repair 1.2 (WTS 7e1d32e9): the gateway clarify transport ──────────
+class _GatewayClarifyTransport:
+    """Callable ``clarify_callback`` for gateway turns.
+
+    Posts the agent's question (plus up to 4 choices) to the operator's own
+    chat/thread, PARKS the agent worker thread — touching activity on every
+    wait slice so the inactivity watchdog never counts the park as a stall —
+    and resumes with the operator's next non-command message in that session
+    (routed by ``GatewayRunner._handle_message``).
+
+    Contract (operator decisions 2026-07-30):
+      * bounded wait (``DD_CLARIFY_WAIT_SECS``, default 900s); on timeout the
+        tool result instructs the agent to state its assumption explicitly and
+        proceed — "asked, unanswered, proceeded on X" belongs in the receipt;
+      * ONE clarify per turn — further calls are told to proceed on stated
+        assumptions (intent questions are cheap, question-spam is not);
+      * a recognized slash command from the operator cancels the wait and then
+        dispatches normally (/new must never be swallowed as an answer);
+      * any execution deadline is extended by the parked time on resume.
+
+    Must be wired at AIAgent CONSTRUCTION — run_agent strips the clarify tool
+    from the serialized list when no callback is present (fleet-repair 1.1).
+    If two turns in one session park simultaneously (rare: a background task
+    plus the main turn), the later question wins the registry and the earlier
+    waiter times out to its stated-assumption path.
+    """
+
+    WAIT_SLICE_SECS = 20.0
+
+    def __init__(self, runner, source):
+        self.runner = runner
+        self.source = source
+        self.session_key = runner._session_key_for_source(source)
+        self.agent = None          # attached right after AIAgent construction
+        self.used_this_turn = False
+
+    def reset_for_turn(self) -> None:
+        self.used_this_turn = False
+
+    def _send_threadsafe(self, loop, adapter, text: str, timeout: float = 30.0):
+        metadata = ({"thread_id": self.source.thread_id}
+                    if getattr(self.source, "thread_id", None) else None)
+        fut = asyncio.run_coroutine_threadsafe(
+            adapter.send(self.source.chat_id, text, metadata=metadata), loop)
+        return fut.result(timeout=timeout)
+
+    def __call__(self, question: str, choices=None) -> str:
+        import threading as _threading
+        if self.used_this_turn:
+            return ("[clarify already used this turn — proceed on your stated "
+                    "assumption and record it in your receipt]")
+        self.used_this_turn = True
+        loop = getattr(self.runner, "_main_loop", None)
+        adapter = self.runner.adapters.get(self.source.platform)
+        if loop is None or adapter is None or not loop.is_running():
+            return json.dumps({"error": "Clarify transport unavailable "
+                                        "(no adapter/event loop for this platform)."})
+        opts = [str(c).strip() for c in (choices or []) if str(c).strip()][:4]
+        lines = ["❓ " + (question or "").strip()]
+        for i, c in enumerate(opts, 1):
+            lines.append(f"  {i}. {c}")
+        lines.append("Reply with a number or your own answer."
+                     if opts else "Reply in this chat to continue the turn.")
+        evt = _threading.Event()
+        pending = {"event": evt, "answer": None, "cancelled": None,
+                   "choices": opts, "question": question,
+                   "asked_at": time.time()}
+        self.runner._pending_clarifies[self.session_key] = pending
+        try:
+            self._send_threadsafe(loop, adapter, "\n".join(lines))
+        except Exception as exc:
+            self.runner._pending_clarifies.pop(self.session_key, None)
+            return json.dumps({"error": f"Clarify question could not be posted: {exc}"})
+
+        wait_total = float(os.environ.get("DD_CLARIFY_WAIT_SECS", "900"))
+        waited, answered = 0.0, False
+        while waited < wait_total:
+            slice_s = min(self.WAIT_SLICE_SECS, wait_total - waited)
+            if evt.wait(slice_s):
+                answered = True
+                break
+            waited += slice_s
+            if self.agent is not None:
+                try:
+                    self.agent._touch_activity(
+                        "parked: awaiting operator answer (clarify)")
+                except Exception:
+                    pass
+        self.runner._pending_clarifies.pop(self.session_key, None)
+
+        # The parked time never counts against an execution deadline.
+        parked = time.time() - pending["asked_at"]
+        dl = getattr(self.agent, "execution_deadline", None) if self.agent else None
+        if dl is not None:
+            for attr in ("deadline_ts", "_deadline_ts", "closeout_ts", "_closeout_ts"):
+                try:
+                    if hasattr(dl, attr) and isinstance(getattr(dl, attr), (int, float)):
+                        setattr(dl, attr, getattr(dl, attr) + parked)
+                except Exception:
+                    pass
+
+        if answered and pending.get("cancelled"):
+            return (f"[clarify cancelled: {pending['cancelled']} — proceed on "
+                    f"your stated assumption and record it in your receipt]")
+        if answered and (pending.get("answer") or "").strip():
+            ans = pending["answer"].strip()
+            if opts and ans.isdigit() and 1 <= int(ans) <= len(opts):
+                ans = opts[int(ans) - 1]
+            return f"Operator answered: {ans}"
+        try:
+            self._send_threadsafe(
+                loop, adapter,
+                "(no answer in %dm — proceeding on my stated assumption; "
+                "it will be recorded in the receipt)" % max(1, int(wait_total // 60)))
+        except Exception:
+            pass
+        return ("[clarify timeout: no operator answer after %.0fs. State the "
+                "assumption you are proceeding on EXPLICITLY in your response "
+                "and record 'asked, unanswered, proceeded on <assumption>' in "
+                "your receipt/WTS note.]" % wait_total)
+
+
 class GatewayRunner:
     """
     Main gateway controller.
@@ -1023,6 +1145,11 @@ class GatewayRunner:
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Fleet-repair 1.2: session_key -> pending clarify dict (see
+        # _GatewayClarifyTransport). _main_loop is stamped per message in
+        # _handle_message so worker threads can post questions thread-safely.
+        self._pending_clarifies: Dict[str, dict] = {}
+        self._main_loop = None
         self._warn_if_docker_media_delivery_is_risky()
 
         # Load ephemeral config from config.yaml / env vars.
@@ -3811,6 +3938,14 @@ class GatewayRunner:
         """
         source = event.source
 
+        # Fleet-repair 1.2: worker threads (clarify transport) need the live
+        # loop to post questions; stamp it on every message so it is always
+        # the running loop even across restarts of the async runtime.
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
@@ -3971,6 +4106,33 @@ class GatewayRunner:
                         e,
                     )
                 _update_prompts.pop(_quick_key, None)
+
+        # ── Fleet-repair 1.2 (WTS 7e1d32e9): pending-clarify answer routing ──
+        # A parked turn is waiting on exactly this operator's next message in
+        # this session. Non-command text resolves the wait and must NOT
+        # dispatch a new turn (the parked turn produces the reply). A
+        # recognized slash command cancels the wait, then dispatches normally
+        # — /new and friends must never be swallowed as answers. This sits
+        # BEFORE the busy-session handling: a parked turn IS a running agent.
+        _pending_clarify = self._pending_clarifies.get(_quick_key)
+        if _pending_clarify is not None and not is_internal:
+            _cl_cmd = event.get_command()
+            _cl_recognized = None
+            if _cl_cmd:
+                try:
+                    from hermes_cli.commands import resolve_command as _resolve_cl
+                    _cl_def = _resolve_cl(_cl_cmd)
+                    _cl_recognized = _cl_def.name if _cl_def else None
+                except Exception:
+                    _cl_recognized = None
+            if _cl_recognized:
+                _pending_clarify["cancelled"] = f"/{_cl_recognized} from operator"
+                _pending_clarify["event"].set()
+                # fall through — the command executes normally below
+            else:
+                _pending_clarify["answer"] = (event.text or "").strip()
+                _pending_clarify["event"].set()
+                return None  # the parked turn's own reply is the response
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -7394,6 +7556,8 @@ class GatewayRunner:
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            # Fleet-repair 1.2: built on the loop thread, used from the worker.
+            _bg_clarify_transport = _GatewayClarifyTransport(self, source)
 
             def run_sync():
                 agent = AIAgent(
@@ -7422,7 +7586,11 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    # Fleet-repair 1.2: background tasks can ask too — the
+                    # answer routes back via the same chat's session key.
+                    clarify_callback=_bg_clarify_transport,
                 )
+                _bg_clarify_transport.agent = agent
                 try:
                     return agent.run_conversation(
                         user_message=prompt,
@@ -7437,13 +7605,27 @@ class GatewayRunner:
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
+            # Fleet-repair (WTS 7e1d32e9, review §3.3 #3): the header must
+            # reflect how the run actually ended. The old literal ✅ rendered
+            # a hard API failure identically to a success.
+            def _bg_header(res, preview_text):
+                if not res or res.get("failed"):
+                    return f'❌ Background task FAILED\nPrompt: "{preview_text}"\n\n'
+                _ds = res.get("deadline_state")
+                if _ds == "timed_out":
+                    return f'⏱️ Background task timed out\nPrompt: "{preview_text}"\n\n'
+                if _ds == "partial" or not res.get("completed", True):
+                    return ('◐ Background task PARTIAL (ended before completion)'
+                            f'\nPrompt: "{preview_text}"\n\n')
+                return f'✅ Background task complete\nPrompt: "{preview_text}"\n\n'
+
             # Extract media files from the response
             if response:
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                header = _bg_header(result, preview)
 
                 if text_content:
                     await adapter.send(
@@ -7484,7 +7666,7 @@ class GatewayRunner:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=_bg_header(result, preview) + "(No response generated)",
                     metadata=_thread_metadata,
                 )
 
@@ -9900,6 +10082,14 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+        # Fleet-repair 1.2: one clarify per TURN — reset the transport's
+        # used-flag when a cached agent starts a fresh turn.
+        _cb = getattr(agent, "clarify_callback", None)
+        if _cb is not None and hasattr(_cb, "reset_for_turn"):
+            try:
+                _cb.reset_for_turn()
+            except Exception:
+                pass
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
@@ -11088,7 +11278,10 @@ class GatewayRunner:
                         logger.debug("Reusing cached agent for session %s", session_key)
 
             if agent is None:
-                # Config changed or first message — create fresh agent
+                # Config changed or first message — create fresh agent.
+                # Fleet-repair 1.2: the clarify transport must be wired at
+                # CONSTRUCTION (1.1 strips the tool when no callback exists).
+                _clarify_transport = _GatewayClarifyTransport(self, source)
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -11096,6 +11289,7 @@ class GatewayRunner:
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
+                    clarify_callback=_clarify_transport,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
@@ -11119,6 +11313,9 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                # 1.2: the transport touches agent activity while parked and
+                # extends its deadline by the parked time on resume.
+                _clarify_transport.agent = agent
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
