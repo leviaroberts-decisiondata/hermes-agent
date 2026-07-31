@@ -311,6 +311,18 @@ def _make_run_env(env: dict) -> dict:
     if _profile_home:
         run_env["HOME"] = _profile_home
 
+    # Per-turn canonical WTS task -> DD_TURN_WTS_TASK for `dd-delivery ship`. Sourced
+    # from the task-local session contextvar (per-turn isolated), injected into THIS
+    # subprocess env only — never into the shared gateway os.environ, so concurrent
+    # turns cannot cross-contaminate. Absent/empty on non-turn (CLI/cron) contexts.
+    try:
+        from gateway.session_context import get_session_env
+        _turn_task = get_session_env("HERMES_SESSION_WTS_TASK_ID", "")
+        if _turn_task and "DD_TURN_WTS_TASK" not in run_env:
+            run_env["DD_TURN_WTS_TASK"] = _turn_task
+    except Exception:
+        pass
+
     return run_env
 
 

@@ -1637,13 +1637,22 @@ def _run_single_child(
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
+        # Fleet-repair 0.2 (WTS 7e1d32e9): "has a summary" is not "completed".
+        # _handle_max_iterations ALWAYS produces a summary, so a child that ran
+        # out of budget mid-task reported completed/green-check; a hard API
+        # failure's error text also counted as a summary. Status now follows
+        # how the run actually ended.
         if interrupted:
             status = "interrupted"
-        elif summary:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif result.get("failed"):
+            # final_response is the ERROR TEXT of a hard API failure, not output.
+            status = "failed"
+        elif summary and completed:
             status = "completed"
+        elif summary:
+            # Budget exhausted (max_iterations): usable output exists but the
+            # task did not run to completion — a truthful PARTIAL.
+            status = "partial"
         else:
             status = "failed"
 
@@ -1703,6 +1712,8 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif result.get("failed"):
+            exit_reason = "error"
         elif deadline_state == "timed_out":
             exit_reason = "deadline"
         elif deadline_state == "partial":
@@ -1726,6 +1737,8 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            # 0.4: surface any mid-run model degradation on the child's entry.
+            "fallback_events": list(getattr(child, "_fallback_events", None) or []),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2190,7 +2203,10 @@ def delegate_task(
                     )
                     dur = entry.get("duration_seconds", 0)
                     status = entry.get("status", "?")
-                    icon = "✓" if status == "completed" else "✗"
+                    # 0.2: a budget-exhausted child must not render a green
+                    # check — partial gets its own glyph.
+                    icon = ("✓" if status == "completed"
+                            else "◐" if status == "partial" else "✗")
                     remaining = n_tasks - completed_count
                     completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
                     if spinner_ref:

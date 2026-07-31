@@ -77,7 +77,7 @@ def run_oneshot(
 
     try:
         with redirect_stdout(devnull), redirect_stderr(devnull):
-            response = _run_agent(prompt, model=model, provider=provider)
+            response, failed = _run_agent(prompt, model=model, provider=provider)
     finally:
         try:
             devnull.close()
@@ -89,6 +89,17 @@ def run_oneshot(
         if not response.endswith("\n"):
             real_stdout.write("\n")
         real_stdout.flush()
+    if failed:
+        # Fleet-repair 0.1 (WTS 7e1d32e9): a hard API failure used to exit 0,
+        # so the lane rail recorded state=completed and the reaper graded a
+        # 987s triple-timeout 'Outcome: Done / gate: PASS'. Exit 8 is the
+        # distinct oneshot-failure code; the printed text is the error, not a
+        # result.
+        sys.stderr.write(
+            "hermes -z: agent run FAILED (API failure after retries) — "
+            "stdout carries the error text, not a result.\n"
+        )
+        return 8
     return 0
 
 
@@ -96,9 +107,11 @@ def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
-) -> str:
-    """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns the final response string."""
+) -> "tuple[str, bool]":
+    """Build an AIAgent exactly like a normal CLI chat turn would, then run a
+    single conversation.  Returns (final response string, failed) — `failed`
+    is True when the run ended in a hard API failure (fleet-repair 0.1: the
+    old `agent.chat()` path discarded the failure flag entirely)."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
@@ -202,7 +215,10 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
-    return agent.chat(prompt) or ""
+    result = agent.run_conversation(prompt) or {}
+    response = result.get("final_response") or ""
+    failed = bool(result.get("failed"))
+    return response, failed
 
 
 def _oneshot_clarify_callback(question: str, choices=None) -> str:
