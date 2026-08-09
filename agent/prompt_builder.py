@@ -1247,8 +1247,23 @@ def _signal_pin_mismatch(card_file: Path, root: Path, live_short_hash: str) -> b
 
 # Per-audience role views the operating-model node composes with the shared
 # core. Keys are the audience labels passed by each loader; values are the
-# role-view filename under operating-model/agent-roles/. Only WIRED audiences
-# appear here (dispatch/claude-code/openclaw are tree-side stubs, not composed).
+# role-view filename under operating-model/agent-roles/.
+#
+# THIS TABLE IS THE GROUND TRUTH for gateway composition. Only audiences that
+# appear here (plus _LANE_PROFILE_AUDIENCES below) are composed into a live
+# agent prompt. Cards declare their own mechanism in a `delivery:` frontmatter
+# field, and bin/dd-context-validate warns (never blocks) when a card's
+# declaration disagrees with this table — so the two cannot drift apart
+# silently again.
+#
+# "Not composed here" does NOT mean "reaches nobody": dispatch is delivered by
+# bin/dd-context-compose --target claude-md, which renders the card into a
+# CLAUDE.md that Claude Code loads. It is `delivery: generated-claude-md`, and
+# it is the audience this gateway never reaches — not a stub. claude-code and
+# openclaw render on demand but nothing currently generates them, so they are
+# `delivery: none`. An earlier comment here called all three "tree-side stubs,
+# not composed", which read as "inert" and contradicted dispatch.md's own
+# frontmatter; that ambiguity is what the `delivery:` vocabulary replaced.
 # "p1-specialists" was retired 2026-07-17 (WTS 2911977a): the WS4 resolver never
 # returns it, its card is status:superseded in the tree, and it must NOT be
 # composable — an audience absent here composes the shared core only.
