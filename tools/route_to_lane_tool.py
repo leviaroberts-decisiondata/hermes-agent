@@ -32,6 +32,7 @@ from typing import Optional
 
 import re
 
+from tools.p1_caller_boundary import require_p1_caller
 from tools.registry import registry, tool_error
 try:
     from tools.engineering_pool_selector import select_engineering_lane
@@ -730,6 +731,11 @@ def route_to_lane(
     Returns a concise, HONEST status string. Never reports success unless the
     lane actually ran and returned a result.
     """
+    # Authority first — before argument parsing, packet writing, wrapper spawn or
+    # reaper registration, so a refused caller creates no side effect (WTS 17cbc96c).
+    denied = require_p1_caller("route_to_lane")
+    if denied:
+        return denied
     lane = (lane or "").strip()
     if not lane:
         return tool_error("route_to_lane: 'lane' is required (e.g. qa, design, engineering, engineering-pool).")

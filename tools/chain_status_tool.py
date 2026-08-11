@@ -44,6 +44,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from tools.p1_caller_boundary import require_p1_caller
 from tools.registry import registry, tool_error
 
 _PG_BASE = os.environ.get("DD_CHAIN_PG_URL", "http://localhost:8513").rstrip("/")
@@ -464,6 +465,11 @@ def chain_status(
     guidance to pass a selector to pick one. Never a fabricated status, and never a
     bare dead-end error.
     """
+    # Authority first — chain_status reads P1's request_chains spine; a client
+    # home has no business resolving P1 chain state (WTS 17cbc96c).
+    denied = require_p1_caller("chain_status")
+    if denied:
+        return denied
     if not check_chain_status_requirements():
         return tool_error(
             "chain_status: the scoped chain-reader token is not available on this "

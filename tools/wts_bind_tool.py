@@ -29,6 +29,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tools.p1_caller_boundary import require_p1_caller
 from tools.registry import registry, tool_error
 
 _SHARED_HOME = Path.home() / ".hermes"
@@ -71,6 +72,11 @@ def wts_bind(
     Returns the helper's KEY=VALUE block (WTS_TASK_ID / BOUND / VERIFY / TRACKER /
     ANCHOR_KEY) on success, or an honest tool_error on failure — NEVER a fabricated id.
     """
+    # Authority first — before any binder invocation, so a refused caller creates
+    # no WTS anchor and no task (WTS 17cbc96c).
+    denied = require_p1_caller("wts_bind")
+    if denied:
+        return denied
     if not check_wts_bind_requirements():
         return tool_error(
             "wts_bind: the binder helper (~/.hermes/bin/dd-wts-bind) is not "

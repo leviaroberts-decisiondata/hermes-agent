@@ -15,6 +15,22 @@ import pytest
 import tools.wts_bind_tool as wb
 
 
+
+
+@pytest.fixture(autouse=True)
+def _as_canonical_p1_home(monkeypatch):
+    """Run these tests as the canonical P1 instance.
+
+    tests/conftest.py sandboxes HERMES_HOME to a per-test tempdir, so the
+    P1 dispatch boundary (tools/p1_caller_boundary, WTS 17cbc96c) correctly
+    reports an unidentified caller and refuses — production fails closed on
+    exactly that. These modules exercise the *authorised* P1 path, so they
+    declare that identity explicitly rather than the boundary being loosened
+    to accommodate a test harness. Refusal behaviour itself is covered in
+    tests/tools/test_p1_caller_boundary.py.
+    """
+    monkeypatch.setattr("tools.p1_caller_boundary.active_caller_id", lambda: "default")
+
 class _Agent:
     """Stand-in carrying a routing key like the gateway attaches per turn."""
     def __init__(self, route_key=None):
