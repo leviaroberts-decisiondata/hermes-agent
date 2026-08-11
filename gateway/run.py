@@ -9583,8 +9583,16 @@ class GatewayRunner:
                         )
                         # Consume it: a refused callback must not be retried
                         # noisily, and must never fall back to another session.
+                        #
+                        # The outcome token is `refused-quarantine:<reason>` and
+                        # NOT `quarantined:<reason>` — the reaper reads this
+                        # marker back cross-process and used to wrap any non-empty
+                        # outcome as `wake=gateway-accepted(...)`, log it as the
+                        # canonical injection proof, and grade the run orch=DONE.
+                        # A refusal reported as the rail's strongest success
+                        # signal is worse than no signal (WTS 17cbc96c).
                         lane_wake.mark_processed(
-                            event, outcome=f"quarantined:{admission.reason}"
+                            event, outcome=lane_wake.refused_outcome(admission.reason)
                         )
                         continue
                     source = self._build_process_event_source(event)

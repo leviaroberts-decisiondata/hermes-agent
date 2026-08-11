@@ -914,9 +914,22 @@ def route_to_lane(
 
     env = os.environ.copy()
     # The visible lane wrappers are shared DecisionData infrastructure. Pin their
-    # home so a caller running from .hermes-classic (or any other HERMES_HOME)
-    # cannot make the wrapper create run dirs / resolve reaper Python / write
-    # registries under the wrong home.
+    # home so the wrapper always creates run dirs, resolves reaper Python and
+    # writes registries under the SHARED home, whichever P1-INTERNAL surface
+    # dispatched — ~/.hermes itself, or one of its ~/.hermes/profiles/<name>
+    # specialists, which run with their own HERMES_HOME.
+    #
+    # This comment used to say "a caller running from .hermes-classic (or any
+    # other HERMES_HOME)". That is no longer reachable: require_p1_caller() at the
+    # top of this tool refuses every sibling home (.hermes-classic / -ptg / -azul /
+    # -hyperscience) before any argument is parsed (WTS 17cbc96c). Pinning is now
+    # about keeping P1's own surfaces on ONE lane tree, not about containing a
+    # foreign home.
+    #
+    # Note the consequence, because it is not obvious: after this assignment
+    # HERMES_HOME no longer identifies the CALLER, so dd-lane-run cannot derive who
+    # dispatched it and would label every caller "default". That is exactly why the
+    # caller's real instance + session are passed explicitly below.
     env["HERMES_HOME"] = str(_SHARED_HOME)
     env.setdefault("DD_HERMES_AGENT_DIR", str(_SHARED_HOME / "hermes-agent"))
     route_key = str(getattr(parent_agent, "_dd_route_key", "") or "").strip()

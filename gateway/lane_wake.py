@@ -43,6 +43,7 @@ merge/Slack-canary actions (req 5).
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
@@ -478,6 +479,10 @@ QUARANTINE_REASONS = (
     "authority_absent",        # event carries no authority fields at all
     "missing_instance",        # legacy callback — must NOT default to P1
     "missing_session",         # no exact originating session
+    "run_dir_absent",          # the callback names no run directory at all
+    "run_dir_escape",          # run_dir is not a real path inside this lane tree
+    "dispatch_footprint_absent",  # the directory carries no evidence of a dispatch
+    "run_id_mismatch",         # directory name, sidecar and callback disagree
     "no_dispatch_record",      # nothing to check the claim against
     "record_incomplete",       # dispatch record exists but names no authority
     "instance_mismatch",       # different Hermes instance dispatched this
@@ -491,6 +496,26 @@ QUARANTINE_REASONS = (
     "stale",                   # older than the callback freshness window
     "replayed",                # this idempotency key was already delivered
 )
+
+
+# The processed-marker outcome written when a callback is REFUSED. It is read
+# back cross-process by ~/.hermes/bin/dd-lane-reaper (wake_injection_proof), which
+# used to wrap ANY non-empty outcome as `wake=gateway-accepted(<outcome>,<key>)`,
+# log "gateway drain injected the P1 continuation (canonical proof)" and grade the
+# run orch=DONE. A quarantine was therefore reported as the strongest possible
+# success signal the rail has.
+#
+# So the token leads with `refused-`: it cannot be read as acceptance by anything
+# that pattern-matches it, present or future, and it is unambiguous to a human
+# reading a reap marker. The reaper patch in bin/patches/ keys on the `refused-`
+# prefix (and still recognises the older `quarantined:` markers already on disk).
+WAKE_OUTCOME_REFUSED = "refused-quarantine"
+
+
+def refused_outcome(reason: str) -> str:
+    """The processed-marker outcome for a quarantined callback. One definition."""
+    reason = str(reason or "").strip() or "unspecified"
+    return f"{WAKE_OUTCOME_REFUSED}:{reason}"
 
 
 class Admission:
@@ -511,6 +536,18 @@ class Admission:
 
 
 def _event_age_secs(event: dict) -> Optional[int]:
+    """Seconds since the event was enqueued. ``enqueued_at`` is UTC ("…Z").
+
+    Uses :func:`calendar.timegm`, the inverse of :func:`time.gmtime` and the only
+    correct way to turn a UTC struct back into an epoch. The previous
+    ``time.mktime(parsed) + time.timezone`` interpreted the UTC struct as LOCAL
+    time and then corrected with the STANDARD offset, so it was wrong by exactly
+    one hour for the whole of daylight saving. Measured 2026-08-11 in MDT: a
+    just-enqueued event reported age=3600s instead of 0. At the 86400s default
+    that is invisible; with DD_LANE_WAKE_MAX_AGE_SECS tightened under an hour it
+    quarantines every fresh callback — in summer only, which is the worst kind of
+    bug to be holding a security gate.
+    """
     raw = str(event.get("enqueued_at") or "").strip()
     if not raw:
         return None
@@ -518,7 +555,7 @@ def _event_age_secs(event: dict) -> Optional[int]:
         parsed = time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         return None
-    return int(time.time() - time.mktime(parsed) + time.timezone)
+    return int(time.time() - calendar.timegm(parsed))
 
 
 def admit_callback(event: dict, *, receiving_instance: Optional[str] = None,
@@ -529,9 +566,14 @@ def admit_callback(event: dict, *, receiving_instance: Optional[str] = None,
     WTS mutation, chain advance or lane dispatch. Returns a verdict; the caller
     performs the (single) side effect of writing quarantine evidence.
 
-    Checked in order — schema, receiver identity, claimed authority, the dispatch
-    record, then freshness and replay — so the first failure is the most
-    fundamental one and is the reason code that gets recorded.
+    Checked in order — schema, the run directory's structural containment, claimed
+    authority against the dispatch record, run identity, then freshness and replay
+    — so the first failure is the most fundamental one and is the reason code that
+    gets recorded.
+
+    Containment runs BEFORE the sidecar is read, deliberately: an event that names
+    a directory outside P1's lane tree does not get to have a file read from that
+    directory and interpreted as authority.
     """
     try:
         from tools import dispatch_authority as da
@@ -551,9 +593,29 @@ def admit_callback(event: dict, *, receiving_instance: Optional[str] = None,
         return Admission(False, "schema_unsupported", f"schema={schema or '(absent)'}",
                          receiving_instance=receiver)
 
-    record = da.authority_for_run(event.get("run_dir") or "")
+    # STRUCTURAL CONTAINMENT. The dispatch record is only worth comparing when the
+    # directory it describes is genuinely one of this home's lane runs: reachable
+    # under $HERMES_HOME/dd-lanes/<lane>/runs/<run_id> without a symlink or a ".."
+    # escape, and carrying a real dispatch footprint. A reviewer's hand-written
+    # wake event plus a matching hand-written sidecar in a scratch directory was
+    # ADMITTED before this check existed. It is containment, NOT authentication —
+    # see the threat model in tools/dispatch_authority.py.
+    run_dir = event.get("run_dir") or ""
+    reason = da.run_dir_containment(run_dir, lane_root=hermes_home() / da.LANE_TREE_DIRNAME)
+    if reason:
+        return Admission(False, reason, f"run_dir={run_dir or '(absent)'}",
+                         receiving_instance=receiver)
+
+    record = da.authority_for_run(run_dir)
     claim = da.claim_from_event(event)
     reason = da.authority_mismatch(record, claim, receiving_instance=receiver)
+    if reason:
+        return Admission(False, reason, "", receiving_instance=receiver, record=record)
+
+    # The run id is anchored to the directory name — the one value a fabricated
+    # record cannot choose freely now that the directory is pinned to a real
+    # dispatch. The sidecar and the callback must both agree with it.
+    reason = da.run_identity_mismatch(run_dir, record, claim)
     if reason:
         return Admission(False, reason, "", receiving_instance=receiver, record=record)
 

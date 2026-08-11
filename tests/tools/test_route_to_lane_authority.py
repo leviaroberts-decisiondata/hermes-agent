@@ -44,6 +44,11 @@ class _Agent:
 @pytest.fixture(autouse=True)
 def _as_p1(monkeypatch):
     monkeypatch.setattr("tools.p1_caller_boundary.active_caller_id", lambda: P1)
+    # d96e0165d moved the boundary from an id comparison to
+    # hermes_cli.profiles.is_p1_internal_home(), which reads the REAL
+    # HERMES_HOME — so patching the id alone stopped declaring P1 and every
+    # test in this module was refused rather than exercised. Patch both.
+    monkeypatch.setattr("tools.p1_caller_boundary._is_p1_internal", lambda: True)
     monkeypatch.setattr(da, "active_instance", lambda: P1)
 
 

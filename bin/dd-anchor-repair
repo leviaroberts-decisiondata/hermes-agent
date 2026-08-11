@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""dd-anchor-repair — see, and deliberately resolve, Telegram anchor friction.
+
+WTS 17cbc96c. NOT INSTALLED: this lives in the repo at ``bin/dd-anchor-repair``
+and is run by hand. It is deliberately not copied into ``~/.hermes/bin`` — an
+operator repair tool that rewrites provenance should be invoked knowingly, from
+a checkout someone is looking at, not be reachable as ambient infrastructure.
+
+Why it exists
+-------------
+All five Hermes homes (``~/.hermes``, ``.hermes-classic``, ``-ptg``, ``-azul``,
+``-hyperscience``) run as the same unix user and share ONE anchor file,
+``~/.hermes/dd-lanes/telegram-anchors.json``. The old key was ``tg:<chat_id>``
+and Levi's Telegram chat id (8737984752) is identical across all five bots, so a
+single key meant five different conversations. That is how client work got bound
+to a P1 anchor on 2026-08-10.
+
+``wts_bind`` now namespaces new anchors as ``tg:<instance>:<chat_id>[:<thread>]``
+and REFUSES (``legacy_ambiguous``) rather than guessing who owns a legacy entry.
+A refusal is correct, but a refusal Levi meets for the first time mid-turn is
+friction. This tool exists so that friction is (a) visible BEFORE it is hit and
+(b) resolvable in one deliberate, auditable step.
+
+    dd-anchor-repair --preflight
+    dd-anchor-repair --preflight --chat 8737984752 --instance default
+    dd-anchor-repair --stamp tg:8737984752 --instance default \
+        --evidence "session 2026-06-13 dd-p1 created this anchor; goal matches P1 backlog"
+
+Rules this tool holds to
+------------------------
+* **It never guesses.** ``--instance`` and ``--evidence`` are both required for a
+  stamp. Nothing is inferred from the chat id, the ``owner`` string or the file's
+  location — all three are identical across the five homes.
+* **It never deletes.** Stamping only ADDS provenance fields to an existing
+  entry. No key is removed, no value is overwritten. Stamping an entry that
+  already names a DIFFERENT instance is refused, not resolved.
+* **It is idempotent.** Re-stamping the same key with the same instance is a
+  no-op that exits 0 and rewrites nothing.
+* **It writes atomically, with a backup**, and appends an append-only audit
+  record beside the anchor file.
+* **Preflight uses the real gate.** It calls
+  ``tools.wts_bind_tool.classify_anchor`` — the exact function ``wts_bind``
+  consults — so preflight can never disagree with the live refusal.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# macOS system python3 is 3.9 and cannot even IMPORT tools/registry.py (PEP 604
+# unions). Rather than make an operator remember a venv path to run a repair tool,
+# hand ourselves to the interpreter this repo actually runs on. Guarded by a
+# sentinel so a broken venv can never produce an exec loop.
+if sys.version_info < (3, 10) and not os.environ.get("_DD_ANCHOR_REPAIR_REEXEC"):
+    for _candidate in (REPO_ROOT / "venv" / "bin" / "python",
+                       Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"):
+        if _candidate.is_file() and os.access(str(_candidate), os.X_OK):
+            os.environ["_DD_ANCHOR_REPAIR_REEXEC"] = "1"
+            os.execv(str(_candidate),
+                     [str(_candidate), str(Path(__file__).resolve()), *sys.argv[1:]])
+    sys.exit(
+        f"dd-anchor-repair: needs Python >= 3.10 (running {sys.version.split()[0]}) "
+        f"and no hermes venv was found. Re-run with the venv interpreter:\n"
+        f"  ~/.hermes/hermes-agent/venv/bin/python {Path(__file__).resolve()} --preflight"
+    )
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools import wts_bind_tool as wb  # noqa: E402
+
+WTS = "17cbc96c-a70f-46e7-af23-1458d04b5368"
+INSTANCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_REFUSED = 2
+
+
+# ── file I/O ─────────────────────────────────────────────────────────────────
+
+def default_anchors_path() -> Path:
+    return Path.home() / ".hermes" / "dd-lanes" / "telegram-anchors.json"
+
+
+def load_anchors(path: Path) -> dict:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} is not a JSON object")
+    return data
+
+
+def _sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def save_anchors(path: Path, anchors: dict) -> Path:
+    """Back up, then replace atomically. Returns the backup path.
+
+    The backup is written FIRST and is a full copy of the previous file, so an
+    interrupted run leaves either the original or the original plus a backup —
+    never a truncated anchor store.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    backup = path.with_name(f"{path.name}.bak-anchor-repair-{stamp}")
+    backup.write_bytes(path.read_bytes())
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".anchors.", suffix=".tmp")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(anchors, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, str(path))
+    return backup
+
+
+def audit_path(anchors_file: Path) -> Path:
+    return anchors_file.with_name(f"{anchors_file.name}.audit.jsonl")
+
+
+def append_audit(anchors_file: Path, record: dict) -> Path:
+    """Append-only provenance trail. Never rewritten, never pruned by this tool."""
+    target = audit_path(anchors_file)
+    with open(target, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+    return target
+
+
+# ── shared helpers ───────────────────────────────────────────────────────────
+
+def split_legacy_key(key: str):
+    """(chat_id, thread) for a LEGACY key, or None when the key is not legacy.
+
+    Legacy is ``tg:<chat_id>[:<thread>]``; namespaced is
+    ``tg:<instance>:<chat_id>[:<thread>]``. Two shapes are decidable:
+
+    * ``tg:<x>`` — two segments. A namespaced key always has at least three, so
+      this is legacy whatever ``<x>`` is.
+    * ``tg:<digits>:<rest>`` — no Hermes instance id is all-digits, so a numeric
+      second segment is a Telegram chat id and the key is legacy.
+
+    KNOWN LIMIT, stated rather than papered over: ``tg:<word>:<rest>`` is genuinely
+    ambiguous — it reads equally as legacy(chat=<word>, thread=<rest>) or as
+    namespaced(instance=<word>, chat=<rest>). Preflight does not report those,
+    because guessing is the failure mode this whole change exists to remove. Every
+    Telegram chat id is numeric, so this only hides non-Telegram keys (Slack
+    channel ids and API/canary names appear in the live file), and ``--stamp``
+    still works on them by exact key.
+    """
+    key = key or ""
+    if not key.startswith("tg:"):
+        return None
+    rest = key[3:]
+    if not rest:
+        return None
+    head, sep, tail = rest.partition(":")
+    if not head:
+        return None
+    if not sep:
+        return head, None
+    if head.isdigit():
+        return head, (tail or None)
+    return None
+
+
+def resolve_instance(explicit: "str | None") -> "str | None":
+    """The instance to act as. Explicit wins; otherwise derive, never guess."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    derived = wb.active_instance()
+    return derived or None
+
+
+def repair_command(key: str, instance: str) -> str:
+    return (
+        f'bin/dd-anchor-repair --stamp {key} --instance {instance} '
+        f'--evidence "<why you know {instance} owns this anchor>"'
+    )
+
+
+# ── --preflight ──────────────────────────────────────────────────────────────
+
+def cmd_preflight(args) -> int:
+    path = Path(args.anchors).expanduser()
+    if not path.is_file():
+        print(f"dd-anchor-repair: no anchor file at {path}", file=sys.stderr)
+        return EXIT_ERROR
+    instance = resolve_instance(args.instance)
+    if not instance:
+        print(
+            "dd-anchor-repair: cannot identify this Hermes instance and will not "
+            "guess one. Pass --instance <id> (default | classic | ptg | azul | "
+            "hyperscience | <profile>).",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    anchors = load_anchors(path)
+    wanted_chat = (args.chat or "").strip()
+
+    seen: list = []
+    for key in sorted(anchors):
+        parsed = split_legacy_key(key)
+        if not parsed:
+            continue
+        chat_id, thread = parsed
+        if wanted_chat and chat_id != wanted_chat:
+            continue
+        # The REAL gate, not a re-implementation of it.
+        status, resolved_key = wb.classify_anchor(anchors, instance, chat_id, thread)
+        seen.append((key, chat_id, thread, status, resolved_key))
+
+    refusing = [row for row in seen if row[3] == "legacy_ambiguous"]
+
+    print(f"anchor file : {path}")
+    print(f"instance    : {instance}")
+    if wanted_chat:
+        print(f"chat filter : {wanted_chat}")
+    print(f"legacy keys : {len(seen)} examined")
+    print(f"WOULD REFUSE: {len(refusing)}")
+    print()
+
+    if not refusing:
+        print("No anchor key would refuse a wts_bind from this instance.")
+        if seen:
+            print("Legacy keys examined and their disposition:")
+            for key, _chat, _thread, status, _resolved in seen:
+                print(f"  {status:<18} {key}")
+        return EXIT_OK
+
+    print("These keys have NO recorded provenance. wts_bind will refuse on them")
+    print("because the same key could belong to any of the five Hermes homes:")
+    print()
+    for key, chat_id, thread, _status, _resolved in refusing:
+        entry = anchors.get(key) or {}
+        goal = str(entry.get("goal") or "")[:72]
+        owner = str(entry.get("owner") or "(none)")
+        task = str(entry.get("task_id") or "(none)")
+        print(f"  {key}")
+        print(f"      chat={chat_id} thread={thread or '(none)'} task_id={task}")
+        print(f"      owner-hint={owner!r}  goal={goal!r}")
+        print(f"      owner-hint is NOT provenance — all five homes write the same field.")
+        print(f"      repair: {repair_command(key, instance)}")
+        print()
+    print("Or bind fresh without touching the ambiguous entry: wts_bind(..., force_new=True)")
+    return EXIT_OK
+
+
+# ── --stamp ──────────────────────────────────────────────────────────────────
+
+def cmd_stamp(args) -> int:
+    path = Path(args.anchors).expanduser()
+    if not path.is_file():
+        print(f"dd-anchor-repair: no anchor file at {path}", file=sys.stderr)
+        return EXIT_ERROR
+
+    key = (args.stamp or "").strip()
+    instance = (args.instance or "").strip()
+    evidence = (args.evidence or "").strip()
+
+    if not instance:
+        print("dd-anchor-repair: --instance is required. This tool does not guess.",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    if not INSTANCE_RE.match(instance):
+        print(f"dd-anchor-repair: --instance {instance!r} is not a valid instance id.",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    if not evidence:
+        print(
+            "dd-anchor-repair: --evidence is required and must say HOW you know "
+            f"{instance} owns {key}. A stamp with no evidence is a guess with a "
+            "timestamp on it.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    anchors = load_anchors(path)
+    entry = anchors.get(key)
+    if entry is None:
+        print(
+            f"dd-anchor-repair: {key} is not in {path}. This tool only records "
+            f"provenance on an anchor that already exists; it never creates one.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+    if not isinstance(entry, dict):
+        print(f"dd-anchor-repair: {key} is not an object; refusing to touch it.",
+              file=sys.stderr)
+        return EXIT_REFUSED
+
+    existing = wb._entry_instance(entry)
+    if existing and existing == instance:
+        print(f"dd-anchor-repair: {key} already records hermes_instance={instance!r}. "
+              f"Nothing to do (idempotent); the file was not rewritten.")
+        return EXIT_OK
+    if existing and existing != instance:
+        print(
+            f"dd-anchor-repair: REFUSED — {key} already records "
+            f"hermes_instance={existing!r}, and you asked for {instance!r}. "
+            f"Provenance is never overwritten: if {existing!r} is wrong, correct it "
+            f"by hand with a human in the loop and say why in the audit file.",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    before_sha = _sha256(path)
+    now = int(time.time())
+    updated = dict(entry)  # copy: the original mapping is never mutated in place
+    updated.update({
+        "hermes_instance": instance,
+        "instance_provenance": evidence,
+        "instance_stamped_at": now,
+        "instance_stamped_by": "dd-anchor-repair",
+        "instance_stamp_wts": WTS,
+    })
+    # Nothing may disappear. Cheap, explicit, and worth the two lines.
+    missing = [k for k in entry if k not in updated]
+    if missing:
+        print(f"dd-anchor-repair: internal refusal — stamping would drop {missing}.",
+              file=sys.stderr)
+        return EXIT_ERROR
+
+    if args.dry_run:
+        print(f"dd-anchor-repair: DRY RUN — would stamp {key} with:")
+        for field in ("hermes_instance", "instance_provenance", "instance_stamped_at",
+                      "instance_stamped_by", "instance_stamp_wts"):
+            print(f"    {field} = {updated[field]!r}")
+        print(f"  file unchanged: {path}")
+        return EXIT_OK
+
+    anchors[key] = updated
+    backup = save_anchors(path, anchors)
+    audit = append_audit(path, {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "action": "stamp",
+        "anchor_key": key,
+        "instance": instance,
+        "evidence": evidence,
+        "task_id": str(entry.get("task_id") or ""),
+        "anchors_sha256_before": before_sha,
+        "anchors_sha256_after": _sha256(path),
+        "backup": backup.name,
+        "wts": WTS,
+        "tool": "bin/dd-anchor-repair",
+    })
+
+    print(f"dd-anchor-repair: stamped {key} -> hermes_instance={instance!r}")
+    print(f"  backup : {backup}")
+    print(f"  audit  : {audit}")
+    print(f"  next   : wts_bind from {instance} will now MIGRATE this entry to "
+          f"{wb.anchor_key(instance, *(split_legacy_key(key) or (key, None)))} "
+          f"and keep the legacy entry as superseded.")
+    return EXIT_OK
+
+
+# ── entry point ──────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        prog="dd-anchor-repair",
+        description="See and deliberately resolve legacy Telegram anchor ambiguity "
+                    "(WTS 17cbc96c). Never guesses, never deletes.",
+    )
+    ap.add_argument("--preflight", action="store_true",
+                    help="list every anchor key that WOULD refuse a wts_bind here")
+    ap.add_argument("--chat", default="", help="restrict --preflight to one chat id")
+    ap.add_argument("--stamp", default="", metavar="ANCHOR_KEY",
+                    help="record provenance on an existing anchor key")
+    ap.add_argument("--instance", default="", metavar="ID",
+                    help="the Hermes instance that owns the anchor (required for --stamp)")
+    ap.add_argument("--evidence", default="", metavar="TEXT",
+                    help="how you know (required for --stamp)")
+    ap.add_argument("--anchors", default=str(default_anchors_path()),
+                    help="anchor file (default: ~/.hermes/dd-lanes/telegram-anchors.json)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --stamp: print the change and write nothing")
+    return ap
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.preflight and args.stamp:
+        print("dd-anchor-repair: --preflight and --stamp are separate operations.",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        if args.preflight:
+            return cmd_preflight(args)
+        if args.stamp:
+            return cmd_stamp(args)
+    except Exception as exc:
+        print(f"dd-anchor-repair: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    build_parser().print_help()
+    return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

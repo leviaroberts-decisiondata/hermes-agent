@@ -30,6 +30,11 @@ def _as_canonical_p1_home(monkeypatch):
     tests/tools/test_p1_caller_boundary.py.
     """
     monkeypatch.setattr("tools.p1_caller_boundary.active_caller_id", lambda: "default")
+    # d96e0165d moved the boundary from an id comparison to
+    # hermes_cli.profiles.is_p1_internal_home(), which reads the REAL
+    # HERMES_HOME — so patching the id alone stopped declaring P1 and every
+    # test in this module was refused rather than exercised. Patch both.
+    monkeypatch.setattr("tools.p1_caller_boundary._is_p1_internal", lambda: True)
     # The dispatch-authority record (WTS 17cbc96c) reads the instance from the
     # same trusted source; declare it here too so the authorised path is
     # exercised. Refusal behaviour is covered in the boundary/authority suites.

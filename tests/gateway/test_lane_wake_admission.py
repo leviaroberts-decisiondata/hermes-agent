@@ -18,6 +18,7 @@ send, any subprocess helper (the reaper, the WTS binder, the attach helper), the
 WTS tools, or lane dispatch.
 """
 
+import calendar
 import importlib
 import json
 import os
@@ -47,10 +48,23 @@ def wake(tmp_path, monkeypatch):
     return lane_wake
 
 
-def _run_dir(tmp_path, run_id="20260810-173216-69340"):
-    rd = Path(tmp_path) / "dd-lanes" / "engineering" / "runs" / run_id
+def _run_dir(tmp_path, run_id="20260810-173216-69340", lane="engineering", meta=True):
+    """A directory that LOOKS like a real dispatch, because admission requires it.
+
+    The lane-tree shape (``<lane>/runs/<run_id>``) plus ``meta.json`` are the
+    structural containment the independent review added: a callback naming a
+    directory that is not a real lane run is refused before its sidecar is even
+    read. Fixtures must therefore be real runs — the forged shapes get their own
+    tests in TestStructuralContainment below.
+    """
+    rd = Path(tmp_path) / "dd-lanes" / lane / "runs" / run_id
     rd.mkdir(parents=True, exist_ok=True)
     (rd / "stdout.log").write_text("[engineering] PASS | ok | done\n", encoding="utf-8")
+    if meta:
+        (rd / "meta.json").write_text(
+            json.dumps({"lane": lane, "run_id": run_id, "lane_run_id": run_id,
+                        "routing_present": True}),
+            encoding="utf-8")
     return rd
 
 
@@ -444,4 +458,310 @@ class TestZeroSideEffectQuarantine:
         runner._running = True
         monkeypatch.setattr(asyncio, "sleep", _make_fake_sleep(runner))
         await runner._drain_lane_wake_queue(interval=0.01)
+        assert len(adapter.handled) == 1
+
+
+# ── structural containment, through the real admission path (review Fix 2) ───
+# An independent reviewer hand-wrote a wake event AND a matching dispatch sidecar
+# naming instance="default", and it was ADMITTED: every field the gate compared
+# was self-consistent, and nothing checked that the run it described was real.
+#
+# The containment below is the answer, and it is deliberately NOT a signature.
+# Everything here runs as the same unix user; a hostile process with that uid can
+# rewrite the checker itself. What these tests pin is the confused-deputy case:
+# misrouted, replayed, and fabricated-by-accident callbacks.
+
+class TestStructuralContainment:
+    def test_a_fabricated_run_dir_outside_the_lane_tree_is_refused(self, wake, tmp_path):
+        """The reviewer's forgery, verbatim: a scratch directory with a perfect
+        sidecar and a perfectly-addressed callback."""
+        forged = tmp_path / "scratch" / "runs" / "20260810-173216-69340"
+        forged.mkdir(parents=True)
+        (forged / "meta.json").write_text(
+            json.dumps({"lane": "engineering", "run_id": forged.name}), encoding="utf-8")
+        _authorise(forged)
+        event = _emit(wake, forged)
+        assert event["instance"] == P1, "fixture precondition: the forgery names P1"
+        verdict = wake.admit_callback(event)
+        assert not verdict.ok
+        assert verdict.reason == "run_dir_escape", verdict.reason
+
+    def test_a_fabricated_run_dir_without_meta_json_is_refused(self, wake, tmp_path):
+        """Right place, right shape, but no dispatch ever happened here."""
+        rd = _run_dir(tmp_path, meta=False)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        assert wake.admit_callback(event).reason == "dispatch_footprint_absent"
+
+    def test_a_symlinked_run_dir_is_refused(self, wake, tmp_path):
+        """A planted link makes an outside directory look contained."""
+        real = tmp_path / "outside"
+        real.mkdir()
+        (real / "meta.json").write_text(
+            json.dumps({"lane": "engineering", "run_id": "20260810-173216-69340"}),
+            encoding="utf-8")
+        link = tmp_path / "dd-lanes" / "engineering" / "runs" / "20260810-173216-69340"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real, target_is_directory=True)
+        _authorise(link)
+        event = _emit(wake, link)
+        assert wake.admit_callback(event).reason == "run_dir_escape"
+
+    def test_a_dotdot_run_dir_is_refused(self, wake, tmp_path):
+        rd = _run_dir(tmp_path)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        event["run_dir"] = str(rd.parent / ".." / "runs" / rd.name)
+        assert wake.admit_callback(event).reason == "run_dir_escape"
+
+    def test_a_callback_naming_no_run_dir_is_refused(self, wake, tmp_path):
+        rd = _run_dir(tmp_path)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        event["run_dir"] = ""
+        assert wake.admit_callback(event).reason == "run_dir_absent"
+
+    def _sidecar_for_another_run(self, rd, run_id):
+        from tools import dispatch_authority as da
+
+        rec = da.build_authority(
+            caller_instance=P1, destination_instance=P1,
+            originating_session_id=P1_SESSION,
+            run_id=run_id, run_dir=str(rd), lane="engineering", wts_task="17cbc96c",
+            platform="telegram", chat_type="dm", chat_id=LEVI_CHAT_ID,
+        )
+        da.write_sidecar(rd, rec)
+        return rec
+
+    def test_a_sidecar_from_another_run_is_refused(self, wake, tmp_path):
+        """A REAL run directory carrying a REAL sidecar — for a different run.
+        The record/claim comparison catches this one first."""
+        rd = _run_dir(tmp_path)
+        self._sidecar_for_another_run(rd, "20260810-174145-32360")
+        event = _emit(wake, rd)
+        assert wake.admit_callback(event).reason == "run_mismatch"
+
+    def test_a_sidecar_and_callback_that_agree_with_each_other_but_not_the_directory(
+        self, wake, tmp_path
+    ):
+        """Both halves lie consistently. The DIRECTORY NAME is the anchor: it is
+        the one value that is pinned to a real dispatch by containment, so a
+        genuine run's directory cannot be reused to carry another run's record."""
+        rd = _run_dir(tmp_path)
+        self._sidecar_for_another_run(rd, "20260810-174145-32360")
+        event = _emit(wake, rd)
+        event["run_id"] = "20260810-174145-32360"  # agrees with the sidecar
+        assert wake.admit_callback(event).reason == "run_id_mismatch"
+
+    def test_containment_is_measured_against_this_homes_lane_tree(self, wake, tmp_path):
+        """The root comes from HERMES_HOME, never from the event — otherwise a
+        callback could nominate the tree it is judged against."""
+        other_home = tmp_path / "another-home"
+        rd = _run_dir(other_home)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        assert wake.admit_callback(event).reason == "run_dir_escape"
+
+    def test_containment_precedes_reading_the_sidecar(self, wake, tmp_path, monkeypatch):
+        """An event naming a directory outside the tree does not get a file read
+        from that directory and interpreted as authority."""
+        from tools import dispatch_authority as da
+
+        forged = tmp_path / "scratch" / "runs" / "20260810-173216-69340"
+        forged.mkdir(parents=True)
+        _authorise(forged)
+        event = _emit(wake, forged)
+
+        reads = []
+        real_read = da.read_sidecar
+        monkeypatch.setattr(da, "read_sidecar",
+                            lambda rd: reads.append(str(rd)) or real_read(rd))
+        assert not wake.admit_callback(event).ok
+        assert reads == [], f"sidecar was read from an uncontained path: {reads}"
+
+    @pytest.mark.asyncio
+    async def test_a_forged_callback_never_reaches_the_model(
+        self, wake, tmp_path, monkeypatch, no_side_effects
+    ):
+        """End to end, through the REAL drain: zero side effects."""
+        import asyncio
+
+        forged = tmp_path / "scratch" / "runs" / "20260810-173216-69340"
+        forged.mkdir(parents=True)
+        (forged / "meta.json").write_text(
+            json.dumps({"lane": "engineering", "run_id": forged.name}), encoding="utf-8")
+        _authorise(forged)
+        _emit(wake, forged)
+
+        adapter = _MockAdapter()
+        runner = _runner(adapter)
+        monkeypatch.setattr(asyncio, "sleep", _make_fake_sleep(runner))
+        await runner._drain_lane_wake_queue(interval=0.01)
+
+        assert adapter.handled == [], "a forged callback started a model turn"
+        assert adapter.sent == []
+        assert no_side_effects["subprocess"] == []
+        assert wake.list_quarantined()[0]["reason"] == "run_dir_escape"
+
+
+# ── the scrubbed-meta callback is not a forgery (review: wts_task asymmetry) ──
+
+class TestWtsTaskAsymmetryThroughAdmission:
+    def test_a_callback_silent_about_wts_task_is_still_admitted(self, wake, tmp_path):
+        """The reaper's scrubbed-meta recovery path emits no wts_task, while the
+        dispatch record (written by route_to_lane, which knew it) has one. That is
+        a normal P1 callback; quarantining it drops real work."""
+        rd = _run_dir(tmp_path)
+        _authorise(rd, wts_task="17cbc96c-a70f-46e7-af23-1458d04b5368")
+        event = _emit(wake, rd, wts_task=None)
+        assert event["wts_task"] is None, "fixture precondition"
+        verdict = wake.admit_callback(event)
+        assert verdict.ok, verdict.reason
+
+    def test_a_callback_naming_a_different_wts_task_is_still_refused(self, wake, tmp_path):
+        """The crossover shape — P1's run, a client's task — must still refuse."""
+        rd = _run_dir(tmp_path)
+        _authorise(rd, wts_task="17cbc96c-a70f-46e7-af23-1458d04b5368")
+        event = _emit(wake, rd, wts_task="2f1a2e80-9c00-41bb-95f5-0a38a20412cb")
+        assert wake.admit_callback(event).reason == "wts_mismatch"
+
+
+# ── freshness must not depend on the season (review: DST) ────────────────────
+# tests/conftest.py pins ``TZ=UTC`` for determinism, and that is PRECISELY why
+# this bug reached production and survived review: under UTC, ``time.timezone``
+# is 0 and ``time.mktime`` treats the UTC struct correctly, so the broken
+# expression is indistinguishable from the correct one. Every test here therefore
+# sets a DST-observing zone explicitly. Without that, mutating the fix back to
+# ``time.mktime(parsed) + time.timezone`` is caught by nothing.
+
+@pytest.fixture()
+def dst_zone(monkeypatch):
+    """Run in America/Denver (MST/MDT) — a real zone that observes DST."""
+    monkeypatch.setenv("TZ", "America/Denver")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+class TestEventAgeIsDstSafe:
+    def test_a_just_enqueued_event_is_not_an_hour_old(self, wake, tmp_path, dst_zone):
+        """`enqueued_at` is UTC. The old code did mktime(utc_struct)+timezone,
+        which reads a UTC struct as LOCAL and corrects with the STANDARD offset —
+        wrong by exactly 3600s for the whole of daylight saving. Measured
+        2026-08-11 in MDT: age=3600 for an event enqueued this instant."""
+        rd = _run_dir(tmp_path)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        age = wake._event_age_secs(event)
+        assert age is not None
+        assert 0 <= age < 60, f"a just-enqueued event reported age={age}s"
+
+    def test_age_is_dst_safe_in_both_halves_of_the_year(self, wake, monkeypatch, dst_zone):
+        """Pin it in January (MST) AND July (MDT), so the bug cannot come back the
+        next time the clocks change — and so a run in either half of the year is
+        equally good evidence."""
+        for moment in ("2026-01-15T12:00:00Z", "2026-07-15T12:00:00Z"):
+            fixed = calendar.timegm(time.strptime(moment, "%Y-%m-%dT%H:%M:%SZ"))
+            monkeypatch.setattr(time, "time", lambda: fixed + 30)
+            assert wake._event_age_secs({"enqueued_at": moment}) == 30, moment
+            monkeypatch.undo()
+
+    def test_the_zone_this_runs_in_really_does_observe_dst(self, dst_zone):
+        """Guards the guard: if the fixture stopped taking effect, the DST tests
+        above would silently become vacuous — which is the exact way this bug
+        survived in the first place."""
+        assert time.daylight, "the test zone does not observe DST; the DST tests are vacuous"
+        assert time.timezone != 0, "TZ is still UTC; the DST tests are vacuous"
+
+    def test_a_genuinely_old_event_is_still_stale(self, wake, tmp_path):
+        """The fix must not blunt the check it lives in."""
+        rd = _run_dir(tmp_path)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        event["enqueued_at"] = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
+        assert wake.admit_callback(event, max_age_secs=3600).reason == "stale"
+        assert wake.admit_callback(event, max_age_secs=10800).ok
+
+    def test_a_fresh_event_survives_a_tight_freshness_window(self, wake, tmp_path):
+        """This is the failure the DST bug actually caused: with the window
+        tightened below an hour, every fresh callback was quarantined — in
+        summer only."""
+        rd = _run_dir(tmp_path)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        assert wake.admit_callback(event, max_age_secs=300).ok
+
+    def test_an_unparseable_timestamp_is_not_an_age(self, wake):
+        assert wake._event_age_secs({"enqueued_at": "yesterday"}) is None
+        assert wake._event_age_secs({}) is None
+
+
+# ── a quarantine is not a delivery (review Fix 3) ────────────────────────────
+# gateway/run.py records the refusal in the wake queue's processed marker, and
+# ~/.hermes/bin/dd-lane-reaper reads that marker back cross-process. It used to
+# wrap ANY non-empty outcome as `wake=gateway-accepted(<outcome>,<key>)`, log
+# "gateway drain injected the P1 continuation (canonical proof)", and grade the
+# run orch=DONE. So a refused callback was reported as the strongest success
+# signal the rail has. The reaper half is patched in
+# bin/patches/dd-lane-reaper--authority-gate.patch and executed as bash by
+# tests/tools/test_dd_lane_reaper_authority_patch.py; this half pins the token
+# that patch reads.
+
+class TestQuarantineOutcomeToken:
+    @pytest.mark.asyncio
+    async def test_the_marker_says_refused_not_something_acceptance_shaped(
+        self, wake, tmp_path, monkeypatch, no_side_effects
+    ):
+        import asyncio
+
+        rd = _run_dir(tmp_path)
+        _authorise(rd, instance="ptg", session="ptg-1")
+        event = _emit(wake, rd)
+        key = event["idempotency_key"]
+
+        adapter = _MockAdapter()
+        runner = _runner(adapter)
+        monkeypatch.setattr(asyncio, "sleep", _make_fake_sleep(runner))
+        await runner._drain_lane_wake_queue(interval=0.01)
+
+        marker = wake._processed_dir() / wake._safe_key_filename(key)
+        assert marker.exists(), "the refused callback was not consumed"
+        outcome = json.loads(marker.read_text(encoding="utf-8"))["outcome"]
+
+        assert outcome.startswith("refused-"), outcome
+        assert outcome == f"refused-quarantine:destination_mismatch"
+        # The token the reaper reads must not be mistakable for delivery.
+        for acceptance in ("injected", "claimed", "accepted", "processed", "ok"):
+            assert acceptance not in outcome, (
+                f"the refusal token contains {acceptance!r}, which a consumer "
+                f"pattern-matching for acceptance would read as success")
+
+    def test_the_refusal_token_has_exactly_one_definition(self, wake):
+        assert wake.WAKE_OUTCOME_REFUSED == "refused-quarantine"
+        assert wake.refused_outcome("session_mismatch") == (
+            "refused-quarantine:session_mismatch")
+        assert wake.refused_outcome("") == "refused-quarantine:unspecified"
+
+    @pytest.mark.asyncio
+    async def test_an_admitted_callback_still_records_an_acceptance_outcome(
+        self, wake, tmp_path, monkeypatch
+    ):
+        """NON-REGRESSION: the canonical injection proof must survive."""
+        import asyncio
+
+        rd = _run_dir(tmp_path)
+        _authorise(rd)
+        event = _emit(wake, rd)
+        key = event["idempotency_key"]
+
+        adapter = _MockAdapter()
+        runner = _runner(adapter)
+        monkeypatch.setattr(asyncio, "sleep", _make_fake_sleep(runner))
+        await runner._drain_lane_wake_queue(interval=0.01)
+
+        marker = wake._processed_dir() / wake._safe_key_filename(key)
+        outcome = json.loads(marker.read_text(encoding="utf-8"))["outcome"]
+        assert not outcome.startswith("refused-"), outcome
         assert len(adapter.handled) == 1

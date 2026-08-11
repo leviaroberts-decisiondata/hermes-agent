@@ -187,21 +187,33 @@ def migrate_legacy_anchor(anchors: dict, instance: str, chat_id: str,
 
 
 def _legacy_ambiguous_error(legacy_key: str, ns_key: str, instance: str) -> str:
+    """The refusal a human reads mid-turn. It must end the confusion, not start it.
+
+    Levi asked for this directly: when the anchor gate refuses, the message has to
+    name the exact key, the exact instance, and the ONE line that repairs it —
+    otherwise a correct refusal is indistinguishable from a broken tool. The two
+    repair paths are stated as literal commands so neither the human nor the model
+    has to invent one.
+    """
     return tool_error(
-        f"wts_bind: REFUSED — this chat has a LEGACY, instance-less anchor "
-        f"({legacy_key}) and no anchor for this Hermes instance ({instance}). "
-        f"All five Hermes homes share one anchor file and Levi's Telegram chat id "
-        f"is the same for every bot, so a legacy key does not say which home bound "
-        f"it. Resolving it here could attach this instance's work to another "
-        f"home's task, or claim another home's task as this one's — the 2026-08-10 "
-        f"failure (WTS 17cbc96c). Nothing was created, resolved or mutated.\n"
-        f"To repair deliberately: confirm from evidence which home owns "
-        f"{legacy_key}, then record it on that entry in "
-        f"~/.hermes/dd-lanes/telegram-anchors.json as "
-        f'"hermes_instance": "<instance>". This tool then migrates it to '
-        f"{ns_key} once, preserving the legacy entry as superseded. "
-        f"Or pass force_new=true to bind a NEW task under the namespaced key and "
-        f"leave the ambiguous one untouched."
+        f"wts_bind: REFUSED — anchor key {legacy_key} has no recorded owner, and "
+        f"this Hermes instance ({instance}) has no anchor of its own for this chat "
+        f"(it would be {ns_key}).\n"
+        f"WHY: all five Hermes homes share one anchor file "
+        f"(~/.hermes/dd-lanes/telegram-anchors.json) and Levi's Telegram chat id is "
+        f"the same for every bot, so {legacy_key} does not say which home bound it. "
+        f"Resolving it here would either attach {instance}'s work to another home's "
+        f"task or claim another home's task as this one's — the 2026-08-10 failure "
+        f"(WTS 17cbc96c). Nothing was created, resolved or mutated.\n"
+        f"REPAIR (one line, once you know from evidence that {instance} owns it):\n"
+        f"    bin/dd-anchor-repair --stamp {legacy_key} --instance {instance} "
+        f'--evidence "<how you know>"\n'
+        f"  Then re-run wts_bind: it migrates {legacy_key} -> {ns_key} and keeps the "
+        f"legacy entry as superseded (nothing is ever deleted).\n"
+        f"SEE FIRST: bin/dd-anchor-repair --preflight --instance {instance} "
+        f"lists every anchor key that would refuse here.\n"
+        f"OR SKIP IT: wts_bind(..., force_new=true) binds a NEW task under {ns_key} "
+        f"and leaves {legacy_key} untouched."
     )
 
 

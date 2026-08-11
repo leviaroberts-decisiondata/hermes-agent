@@ -383,3 +383,330 @@ class TestEventStamping:
         event = {"instance": "azul", "originating_session_id": "azul-1"}
         da.stamp_event_authority(event, run_dir=run_dir)
         assert event["instance"] == "azul", "sidecar silently relabelled the claim"
+
+
+# ── structural containment (WTS 17cbc96c, review Fix 2) ──────────────────────
+# The record answers "who dispatched this?". These answer the question underneath
+# it — "is there a real dispatch here at all?" An independent reviewer hand-wrote
+# a wake event and a matching sidecar in a scratch directory and it was ADMITTED,
+# because everything the gate compared was self-consistent and nothing checked
+# that it described anything real.
+#
+# This is containment, NOT authentication. The threat model is a confused deputy
+# — misrouted, replayed or fabricated-by-accident callbacks. A hostile process
+# running as `openclaw` can rewrite these very checks, and no test here pretends
+# otherwise.
+
+class _LaneTree:
+    """A realistic lane tree: $HOME/dd-lanes/<lane>/runs/<run_id> + meta.json."""
+
+    def __init__(self, home: Path):
+        self.home = Path(home)
+        self.root = self.home / "dd-lanes"
+
+    def run(self, *, lane="engineering", run_id="20260810-173216-69340",
+            meta=True, meta_run_id=None, meta_lane=None) -> Path:
+        rd = self.root / lane / "runs" / run_id
+        rd.mkdir(parents=True, exist_ok=True)
+        if meta:
+            body = {
+                "lane": meta_lane if meta_lane is not None else lane,
+                "run_id": meta_run_id if meta_run_id is not None else run_id,
+                "lane_run_id": meta_run_id if meta_run_id is not None else run_id,
+                "started_at": "2026-08-10T23:32:16Z",
+                "routing_present": True,
+            }
+            (rd / "meta.json").write_text(json.dumps(body), encoding="utf-8")
+        return rd
+
+
+@pytest.fixture()
+def tree(tmp_path):
+    return _LaneTree(tmp_path)
+
+
+class TestRunDirContainment:
+    def test_a_real_lane_run_is_contained(self, tree):
+        rd = tree.run()
+        assert da.run_dir_containment(rd, lane_root=tree.root) is None
+
+    def test_absent_run_dir_is_refused(self, tree):
+        assert da.run_dir_containment("", lane_root=tree.root) == "run_dir_absent"
+        assert da.run_dir_containment(None, lane_root=tree.root) == "run_dir_absent"
+
+    def test_relative_run_dir_is_refused(self, tree):
+        assert da.run_dir_containment("dd-lanes/engineering/runs/x",
+                                      lane_root=tree.root) == "run_dir_escape"
+
+    def test_a_directory_outside_the_lane_tree_is_refused(self, tmp_path, tree):
+        """The reviewer's forgery: a well-formed run in a scratch directory."""
+        outside = tmp_path / "scratch" / "engineering" / "runs" / "20260810-173216-69340"
+        outside.mkdir(parents=True)
+        (outside / "meta.json").write_text(
+            json.dumps({"lane": "engineering", "run_id": outside.name}), encoding="utf-8")
+        assert da.run_dir_containment(outside, lane_root=tree.root) == "run_dir_escape"
+
+    def test_dotdot_escape_is_refused(self, tree, tmp_path):
+        """Normalises back inside the tree, but names `..` on the way — refuse it
+        rather than reason about what it resolves to."""
+        rd = tree.run()
+        sneaky = tree.root / "engineering" / "runs" / ".." / "runs" / rd.name
+        assert Path(os.path.normpath(str(sneaky))) == rd  # it really does normalise in
+        assert da.run_dir_containment(sneaky, lane_root=tree.root) == "run_dir_escape"
+
+    def test_dotdot_escape_that_leaves_the_tree_is_refused(self, tree, tmp_path):
+        outside = tmp_path / "elsewhere"
+        outside.mkdir()
+        sneaky = tree.root / "engineering" / "runs" / ".." / ".." / ".." / "elsewhere"
+        assert da.run_dir_containment(sneaky, lane_root=tree.root) == "run_dir_escape"
+
+    def test_symlinked_run_dir_is_refused(self, tree, tmp_path):
+        """A planted link makes an outside directory LOOK contained."""
+        real = tmp_path / "outside-run"
+        real.mkdir()
+        (real / "meta.json").write_text(
+            json.dumps({"lane": "engineering", "run_id": "20260810-173216-69340"}),
+            encoding="utf-8")
+        link = tree.root / "engineering" / "runs" / "20260810-173216-69340"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real, target_is_directory=True)
+        assert da.run_dir_containment(link, lane_root=tree.root) == "run_dir_escape"
+
+    def test_symlinked_lane_component_is_refused(self, tree, tmp_path):
+        """The link is higher up the path, not on the run dir itself."""
+        real_lane = tmp_path / "outside-lane"
+        (real_lane / "runs" / "20260810-173216-69340").mkdir(parents=True)
+        (real_lane / "runs" / "20260810-173216-69340" / "meta.json").write_text(
+            json.dumps({"lane": "engineering", "run_id": "20260810-173216-69340"}),
+            encoding="utf-8")
+        tree.root.mkdir(parents=True, exist_ok=True)
+        (tree.root / "engineering").symlink_to(real_lane, target_is_directory=True)
+        rd = tree.root / "engineering" / "runs" / "20260810-173216-69340"
+        assert da.run_dir_containment(rd, lane_root=tree.root) == "run_dir_escape"
+
+    def test_wrong_depth_is_refused(self, tree):
+        """`<lane>/runs/<id>` exactly — not a child of a run, not a bare lane."""
+        rd = tree.run()
+        nested = rd / "subdir"
+        nested.mkdir()
+        assert da.run_dir_containment(nested, lane_root=tree.root) == "run_dir_escape"
+        assert da.run_dir_containment(tree.root / "engineering",
+                                      lane_root=tree.root) == "run_dir_escape"
+
+    def test_a_directory_that_is_not_a_runs_dir_is_refused(self, tree):
+        odd = tree.root / "engineering" / "artifacts" / "20260810-173216-69340"
+        odd.mkdir(parents=True)
+        (odd / "meta.json").write_text(
+            json.dumps({"run_id": odd.name}), encoding="utf-8")
+        assert da.run_dir_containment(odd, lane_root=tree.root) == "run_dir_escape"
+
+    def test_fabricated_run_dir_without_meta_json_is_refused(self, tree):
+        """A bare `mkdir -p` in the right place is not a dispatch."""
+        rd = tree.run(meta=False)
+        assert da.run_dir_containment(rd, lane_root=tree.root) == "dispatch_footprint_absent"
+
+    def test_meta_json_naming_a_different_run_is_refused(self, tree):
+        rd = tree.run(meta_run_id="20260810-174145-32360")
+        assert da.run_dir_containment(rd, lane_root=tree.root) == "dispatch_footprint_absent"
+
+    def test_meta_json_naming_a_different_lane_is_refused(self, tree):
+        rd = tree.run(meta_lane="qa")
+        assert da.run_dir_containment(rd, lane_root=tree.root) == "dispatch_footprint_absent"
+
+    def test_unparseable_meta_json_is_refused(self, tree):
+        rd = tree.run()
+        (rd / "meta.json").write_text("{not json", encoding="utf-8")
+        assert da.run_dir_containment(rd, lane_root=tree.root) == "dispatch_footprint_absent"
+
+    def test_meta_json_that_is_a_list_is_refused(self, tree):
+        rd = tree.run()
+        (rd / "meta.json").write_text("[]", encoding="utf-8")
+        assert da.run_dir_containment(rd, lane_root=tree.root) == "dispatch_footprint_absent"
+
+    def test_lane_root_comes_from_hermes_home_not_the_event(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert da.lane_tree_root() == tmp_path / "dd-lanes"
+        tree = _LaneTree(tmp_path)
+        rd = tree.run()
+        assert da.run_dir_containment(rd) is None
+
+    def test_containment_reads_only(self, tree):
+        rd = tree.run()
+        before = sorted(p.name for p in tree.home.rglob("*"))
+        da.run_dir_containment(rd, lane_root=tree.root)
+        da.run_dir_containment(tree.root / "nope" / "runs" / "x", lane_root=tree.root)
+        assert sorted(p.name for p in tree.home.rglob("*")) == before
+
+
+class TestRunIdentity:
+    def test_agreement_passes(self, tree):
+        rd = tree.run()
+        rec = {"run_id": rd.name}
+        assert da.run_identity_mismatch(rd, rec, {"run_id": rd.name}) is None
+
+    def test_sidecar_run_id_must_equal_the_directory(self, tree):
+        """A sidecar copied from another run into a real run directory."""
+        rd = tree.run()
+        rec = {"run_id": "20260810-174145-32360"}
+        assert da.run_identity_mismatch(rd, rec, {"run_id": rd.name}) == "run_id_mismatch"
+
+    def test_sidecar_without_a_run_id_is_refused(self, tree):
+        rd = tree.run()
+        assert da.run_identity_mismatch(rd, {}, {"run_id": rd.name}) == "run_id_mismatch"
+        assert da.run_identity_mismatch(rd, None, {"run_id": rd.name}) == "run_id_mismatch"
+
+    def test_event_run_id_must_equal_the_directory(self, tree):
+        rd = tree.run()
+        rec = {"run_id": rd.name}
+        assert da.run_identity_mismatch(
+            rd, rec, {"run_id": "20260810-174145-32360"}) == "run_id_mismatch"
+
+    def test_event_may_be_silent_about_the_run_id(self, tree):
+        rd = tree.run()
+        assert da.run_identity_mismatch(rd, {"run_id": rd.name}, {}) is None
+
+
+# ── wts_task asymmetry (review: absence is not a conflict) ───────────────────
+
+class TestWtsTaskAsymmetry:
+    """The scrubbed-meta reap path re-derives routing from the mirror and has no
+    bound WTS task to pass, so it emits `wts_task: None` while the dispatch record
+    — written by route_to_lane, which DID know it — has one. That is a normal P1
+    callback. Quarantining it drops real work while reporting a security refusal.
+    """
+
+    def test_record_has_a_task_and_the_callback_is_silent_is_admitted(self, tmp_path):
+        run_dir, _ = _record(tmp_path, wts_task="17cbc96c-a70f-46e7-af23-1458d04b5368")
+        event = _callback(wts_task="")
+        assert _verdict(run_dir, event) is None
+
+    def test_record_has_a_task_and_the_callback_names_another_is_refused(self, tmp_path):
+        """The crossover shape: P1's record, a client's task. Still quarantined."""
+        run_dir, _ = _record(tmp_path, wts_task="17cbc96c-a70f-46e7-af23-1458d04b5368")
+        event = _callback(wts_task="2f1a2e80-9c00-41bb-95f5-0a38a20412cb")
+        assert _verdict(run_dir, event) == "wts_mismatch"
+
+    def test_tolerance_does_not_extend_to_the_run(self, tmp_path):
+        run_dir, rec = _record(tmp_path)
+        event = _callback()
+        event.pop("run_id")
+        assert _verdict(run_dir, event) == "run_mismatch"
+
+    def test_tolerance_does_not_extend_to_the_route(self, tmp_path):
+        run_dir, _ = _record(tmp_path)
+        event = _callback()
+        event["platform"] = ""
+        event["chat_type"] = ""
+        event["chat_id"] = ""
+        assert _verdict(run_dir, event) == "route_mismatch"
+
+    def test_tolerance_does_not_extend_to_the_mission(self, tmp_path):
+        run_dir, _ = _record(tmp_path, mission_id="m-1")
+        event = _callback(mission_id="")
+        assert _verdict(run_dir, event) == "mission_mismatch"
+
+    def test_tolerance_does_not_extend_to_the_chain(self, tmp_path):
+        run_dir, _ = _record(tmp_path, chain_id="chain-a")
+        event = _callback(chain_id="")
+        assert _verdict(run_dir, event) == "chain_mismatch"
+
+    def test_absence_never_widens_the_destination(self, tmp_path):
+        """A silent wts_task must not help a foreign callback in any way."""
+        run_dir, _ = _record(tmp_path, instance="ptg", session="ptg-1",
+                             wts_task="2f1a2e80")
+        event = _callback(instance="ptg", session="ptg-1", wts_task="")
+        assert _verdict(run_dir, event, receiver=P1) == "destination_mismatch"
+
+
+# ── the reaper's re-inject gate (WTS 17cbc96c, review Fix 1) ─────────────────
+# ~/.hermes/bin/dd-lane-reaper resolves its re-inject target with
+# gateway.mirror._find_session_id(platform, chat_id) — the same chat id for all
+# five bots. This is the decision that replaces it. The bash side is a four-line
+# shim (bin/patches/dd-lane-reaper--authority-gate.patch) precisely so the logic
+# is testable here.
+
+class TestReinjectAuthorisation:
+    def test_p1s_own_run_is_authorised(self, tmp_path):
+        run_dir, _ = _record(tmp_path, instance=P1)
+        assert da.reinject_authorisation(run_dir, receiving_instance=P1) == "ok"
+
+    @pytest.mark.parametrize("client", [i for i in INSTANCES if i != P1])
+    def test_a_client_run_in_p1s_reaper_is_not_authorised(self, tmp_path, client):
+        """The incident, on the passive path: PTG's/Azul's closeout must never be
+        appended to P1's transcript, however the chat id resolves."""
+        run_dir, _ = _record(tmp_path, instance=client, session=f"{client}-1")
+        verdict = da.reinject_authorisation(run_dir, receiving_instance=P1)
+        assert verdict.startswith("skip:destination-"), verdict
+        assert client in verdict
+
+    def test_a_run_with_no_dispatch_record_is_not_authorised(self, tmp_path):
+        run_dir, _ = _record(tmp_path, write=False)
+        assert da.reinject_authorisation(run_dir, receiving_instance=P1) == (
+            "skip:no-dispatch-record")
+
+    def test_a_malformed_sidecar_is_not_authorised(self, tmp_path):
+        run_dir, _ = _record(tmp_path)
+        da.sidecar_path(run_dir).write_text("{not json", encoding="utf-8")
+        assert da.reinject_authorisation(run_dir, receiving_instance=P1) == (
+            "skip:no-dispatch-record")
+
+    def test_a_foreign_schema_sidecar_is_not_authorised(self, tmp_path):
+        run_dir, rec = _record(tmp_path)
+        rec["schema"] = "something-else/1"
+        da.sidecar_path(run_dir).write_text(json.dumps(rec), encoding="utf-8")
+        assert da.reinject_authorisation(run_dir, receiving_instance=P1) == (
+            "skip:no-dispatch-record")
+
+    def test_a_record_naming_no_destination_is_not_authorised(self, tmp_path):
+        run_dir, rec = _record(tmp_path)
+        rec["destination_instance"] = ""
+        rec["caller_instance"] = ""
+        da.sidecar_path(run_dir).write_text(json.dumps(rec), encoding="utf-8")
+        assert da.reinject_authorisation(run_dir, receiving_instance=P1) == (
+            "skip:record-incomplete")
+
+    def test_an_unidentified_reaper_authorises_nothing(self, tmp_path):
+        run_dir, _ = _record(tmp_path)
+        assert da.reinject_authorisation(run_dir, receiving_instance="") == (
+            "skip:reaper-instance-unidentified")
+
+    def test_no_run_dir_is_not_authorised(self):
+        assert da.reinject_authorisation("", receiving_instance=P1) == "skip:no-run-dir"
+
+    def test_wake_target_v2_can_authorise_a_pre_sidecar_run(self, tmp_path):
+        """Every historical run predates the dispatch sidecar; v2 wake-target is
+        the fallback, and it must still be instance-scoped."""
+        run_dir = tmp_path / "runs" / "20260810-173216-69340"
+        run_dir.mkdir(parents=True)
+        (run_dir / "wake-target").write_text(json.dumps({
+            "schema": "wake-target/2", "platform": "telegram", "chat_type": "dm",
+            "chat_id": LEVI_CHAT_ID, "run_id": run_dir.name,
+            "instance": "ptg", "session_id": "ptg-1",
+        }), encoding="utf-8")
+        assert da.reinject_authorisation(run_dir, receiving_instance=P1).startswith(
+            "skip:destination-ptg")
+        assert da.reinject_authorisation(run_dir, receiving_instance="ptg") == "ok"
+
+    def test_wake_target_v1_yields_no_authorisation(self, tmp_path):
+        """v1 carries no instance. It must read as UNKNOWN, never as P1."""
+        run_dir = tmp_path / "runs" / "20260810-173216-69340"
+        run_dir.mkdir(parents=True)
+        (run_dir / "wake-target").write_text(json.dumps({
+            "schema": "wake-target/1", "platform": "telegram", "chat_type": "dm",
+            "chat_id": LEVI_CHAT_ID, "run_id": run_dir.name,
+        }), encoding="utf-8")
+        assert da.reinject_authorisation(run_dir, receiving_instance=P1) == (
+            "skip:no-dispatch-record")
+
+    def test_the_reason_carries_no_secret(self, tmp_path):
+        run_dir, _ = _record(tmp_path, instance="azul", session="azul-secret-session")
+        verdict = da.reinject_authorisation(run_dir, receiving_instance=P1)
+        assert LEVI_CHAT_ID not in verdict
+        assert "azul-secret-session" not in verdict
+
+    def test_it_never_raises(self, tmp_path):
+        class _Explodes:
+            def __str__(self):
+                raise RuntimeError("boom")
+        assert da.reinject_authorisation(_Explodes(), receiving_instance=P1).startswith(
+            "skip:")

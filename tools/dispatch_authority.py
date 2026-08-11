@@ -13,6 +13,34 @@ caller writes a small, versioned sidecar into the lane's ``run_dir``; at callbac
 time the receiving gateway compares the callback against it and refuses anything
 that does not match, *before* the model is invoked.
 
+Threat model — read this before "hardening" it
+----------------------------------------------
+**What this defends against: a confused deputy.** A callback that is misrouted,
+replayed, fabricated by accident, or addressed to a different Hermes instance must
+not be able to start a model turn in *this* gateway. That is the whole 2026-08-10
+incident: nobody attacked anything. A shared reaper, a shared queue and a chat id
+identical across five bots were enough, on their own, to deliver PTG's and Azul's
+lane results into P1's session.
+
+**What this does NOT defend against: a hostile process running as the same uid.**
+All five Hermes homes, the reaper, the gateways and this file run as ``openclaw``.
+Any process with that uid can rewrite this module, the sidecars, the wake queue and
+the live scripts. An HMAC over the sidecar would be theatre — the key would sit in
+a file the same uid can read, and the verifier is a file the same uid can edit. We
+deliberately do **not** claim same-uid integrity, and no caller may describe these
+checks as authentication. Real uid separation (running the sibling homes as
+different users) is the only fix for the hostile case, and it is out of scope here.
+
+What we add instead is cheap **structural containment**
+(:func:`run_dir_containment`, :func:`run_identity_mismatch`): a callback must name a
+run directory that really sits inside P1's lane tree at
+``$HERMES_HOME/dd-lanes/<lane>/runs/<run_id>``, reached without a symlink or a
+``..`` escape, carrying a real dispatch footprint (``meta.json`` naming the same
+run), whose ``run_id`` agrees with the directory name, the sidecar and the event.
+That defeats a *fabricated* record — before it, a reviewer's hand-written wake event
+plus a matching sidecar in a scratch directory was ADMITTED — without pretending to
+be a cryptographic boundary.
+
 Design rules
 ------------
 * **Identity is not a model argument.** ``caller_instance`` comes from
@@ -52,6 +80,15 @@ WAKE_TARGET_SCHEMA_V1 = "wake-target/1"
 WAKE_TARGET_SCHEMA_V2 = "wake-target/2"
 WAKE_TARGET_NAME = "wake-target"
 
+# Structural containment (see "Threat model" above). A lane run lives at exactly
+# `$HERMES_HOME/dd-lanes/<lane>/runs/<run_id>` — three components under the lane
+# tree, no more, no fewer — and every real dispatch drops a `meta.json` there
+# (1313 of 1316 runs on disk at 2026-08-11; the three misses are aborted
+# dispatches that never produced a callback either).
+LANE_TREE_DIRNAME = "dd-lanes"
+RUNS_DIRNAME = "runs"
+DISPATCH_FOOTPRINT_NAME = "meta.json"
+
 
 def active_instance() -> str:
     """This process's Hermes instance id, or "" when unidentifiable.
@@ -83,6 +120,121 @@ def route_fingerprint(platform: str, chat_type: str, chat_id: str) -> str:
 
 def _utc_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ── structural containment ───────────────────────────────────────────────────
+# The authority record answers "who dispatched this?". These answer the question
+# underneath it: "is there a real dispatch here at all?" A record is only worth
+# comparing when the directory it describes is genuinely one of P1's lane runs.
+# Before this, a hand-written wake event plus a hand-written sidecar in a scratch
+# directory was ADMITTED — the record was self-consistent and nothing checked
+# that it described anything real.
+#
+# This is containment, not authentication. See the module threat model: it stops
+# misrouting, replay and fabrication-by-accident; it does not stop a hostile
+# process running as the same uid, and nothing here should be described as if it
+# did.
+
+def lane_tree_root(home: "str | Path | None" = None) -> Path:
+    """P1's lane tree — ``$HERMES_HOME/dd-lanes``.
+
+    Derived from HERMES_HOME (trusted runtime configuration), never from an
+    event field, so a callback cannot nominate the root it will be measured
+    against. Tests isolate by setting HERMES_HOME, exactly as the rest of the
+    lane-wake machinery already does.
+    """
+    base = Path(str(home)) if home else Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
+    return base / LANE_TREE_DIRNAME
+
+
+def run_dir_containment(run_dir: "str | Path", *,
+                        lane_root: "str | Path | None" = None) -> "str | None":
+    """None when ``run_dir`` really is one of P1's lane runs; else a reason code.
+
+    Three things must hold, and each one is a way a fabricated callback failed to
+    be caught before:
+
+    1. ``run_dir`` is absolute and names ``<lane>/runs/<run_id>`` under the lane
+       tree — exactly three components, no ``..`` anywhere in the path.
+    2. After full symlink resolution it is STILL that same directory. This is what
+       rejects a planted link, whether the link is the run directory itself or any
+       component above it, that would otherwise make an outside directory *look*
+       contained.
+    3. It carries a dispatch footprint: ``meta.json``, naming the same run id (and
+       the same lane, when it records one). A bare ``mkdir -p`` fails here.
+
+    Reason codes are stable strings — they are logged and stored in quarantine
+    evidence, so treat them as an interface.
+    """
+    raw = str(run_dir or "").strip()
+    if not raw:
+        return "run_dir_absent"
+
+    root = Path(str(lane_root)) if lane_root else lane_tree_root()
+
+    # (1) shape + lexical containment. Done on the UNRESOLVED path so that a
+    # ".." that would be normalised away is still seen.
+    path = Path(raw)
+    if not path.is_absolute() or ".." in path.parts:
+        return "run_dir_escape"
+    try:
+        rel = Path(os.path.normpath(raw)).relative_to(Path(os.path.normpath(str(root))))
+    except Exception:
+        return "run_dir_escape"
+    parts = rel.parts
+    if len(parts) != 3 or parts[1] != RUNS_DIRNAME or not parts[0] or not parts[2]:
+        return "run_dir_escape"
+
+    # (2) physical containment: resolve BOTH sides and require the same answer.
+    # realpath the ROOT too, so a symlink in the root's own prefix (macOS
+    # /tmp -> /private/tmp, and every pytest tmp_path) is not mistaken for an
+    # escape, while a symlink at or below the root still is. A per-component
+    # os.path.islink() walk was tried here and removed: it could not reject
+    # anything this comparison does not already reject, and a guard no test can
+    # distinguish is a guard nobody can maintain.
+    try:
+        real_root = Path(os.path.realpath(str(root)))
+        real_run = Path(os.path.realpath(raw))
+    except Exception:
+        return "run_dir_escape"
+    if real_run != real_root.joinpath(*parts) or not real_run.is_dir():
+        return "run_dir_escape"
+
+    # (3) a real dispatch happened here.
+    try:
+        meta = json.loads((real_run / DISPATCH_FOOTPRINT_NAME).read_text(encoding="utf-8"))
+    except Exception:
+        return "dispatch_footprint_absent"
+    if not isinstance(meta, dict):
+        return "dispatch_footprint_absent"
+    meta_run = str(meta.get("run_id") or meta.get("lane_run_id") or "").strip()
+    if not meta_run or meta_run != parts[2]:
+        return "dispatch_footprint_absent"
+    meta_lane = str(meta.get("lane") or "").strip()
+    if meta_lane and meta_lane != parts[0]:
+        return "dispatch_footprint_absent"
+    return None
+
+
+def run_identity_mismatch(run_dir: "str | Path", record: "dict | None",
+                          claim: "dict | None" = None) -> "str | None":
+    """None when the run id agrees everywhere; else ``"run_id_mismatch"``.
+
+    The directory name is the anchor — it is the one value an attacker cannot
+    choose freely once :func:`run_dir_containment` has pinned the directory to a
+    real dispatch. The sidecar and the callback must both agree with it, so a
+    genuine run's directory cannot be reused to carry another run's record.
+    """
+    basename = Path(str(run_dir or "").rstrip("/")).name
+    if not basename:
+        return "run_id_mismatch"
+    rec_run = str((record or {}).get("run_id") or "").strip()
+    if rec_run != basename:
+        return "run_id_mismatch"
+    claim_run = str((claim or {}).get("run_id") or "").strip()
+    if claim_run and claim_run != basename:
+        return "run_id_mismatch"
+    return None
 
 
 def build_authority(
@@ -238,6 +390,25 @@ def authority_for_run(run_dir: "str | Path") -> "dict | None":
 # One place decides whether a callback matches its dispatch record, so the
 # gateway drain, the reaper and the tests all agree on what "matches" means.
 
+# Fields where the CALLBACK may legitimately be silent about something the
+# record knows. Silence is not a contradiction, and treating it as one quarantined
+# real work.
+#
+# `wts_task`: the reaper reaps a run whose meta was scrubbed (the TOCTOU recovery
+# path) and re-derives its routing from the mirror, but that path has no bound WTS
+# task to pass, so it emits `wts_task: None`. The dispatch record — written by
+# route_to_lane, which DID know the task — has one. That asymmetry is a normal P1
+# callback, and quarantining it would drop a real result on the floor while
+# reporting a security refusal.
+#
+# The tolerance is ONLY for absence. A callback that names a DIFFERENT WTS task
+# than the record is still quarantined: that is the crossover shape (P1 writing on
+# a client's task), and it is exactly what must never pass. Nothing about the
+# DESTINATION is tolerated here — instance, session, destination and run_id are
+# checked unconditionally above.
+_ABSENCE_TOLERATED = ("wts_task",)
+
+
 # Ordered so the most fundamental failure is reported first; the caller uses the
 # first reason as the quarantine reason code.
 def authority_mismatch(
@@ -301,9 +472,9 @@ def authority_mismatch(
     if rec_session != claim_session:
         return "session_mismatch"
 
-    # Run / work identity. Compared only when BOTH sides carry the field, so a
-    # partially populated older record cannot be used to smuggle a mismatch: an
-    # absent field on the *claim* side for a field the record HAS is a mismatch.
+    # Run / work identity. A CONFLICTING value is always a mismatch. An ABSENT
+    # value on the claim side is a mismatch only for fields the emit path always
+    # carries — see _ABSENCE_TOLERATED.
     for field, code in (
         ("run_id", "run_mismatch"),
         ("wts_task", "wts_mismatch"),
@@ -316,7 +487,7 @@ def authority_mismatch(
         rec_v, claim_v = str(rec_v).strip(), str(claim_v).strip()
         if rec_v and claim_v and rec_v != claim_v:
             return code
-        if rec_v and not claim_v:
+        if rec_v and not claim_v and field not in _ABSENCE_TOLERATED:
             return code
 
     return None
@@ -366,6 +537,50 @@ def stamp_event_authority(event: dict, *, run_dir: "str | Path" = "") -> dict:
     return event
 
 
+def reinject_authorisation(run_dir: "str | Path",
+                           *, receiving_instance: Optional[str] = None) -> str:
+    """May THIS instance append this run's closeout to its OWN gateway transcript?
+
+    Returns ``"ok"`` or ``"skip:<reason>"`` — never raises, and the reason is a
+    short, non-alarming, non-secret token suitable for a log line and a reap
+    marker.
+
+    This is the gate for ``dd-lane-reaper``'s ``reinject_caller_session()``, which
+    resolves its destination with ``gateway.mirror._find_session_id(platform,
+    chat_id)``. Levi's Telegram chat id ``8737984752`` is identical across all
+    five bots, so that lookup names a transport, not an owner: on 2026-08-10 it
+    put PTG's and Azul's lane closeouts onto P1's transcript, and P1 then wrote
+    notes onto CLIENT WTS records. The run's dispatch record knows where its
+    callback may return; that, and not the chat id, decides.
+
+    Skipping is not a failure and must not be reported as one. The result is
+    already durable on the WTS task and the lane thread; only the passive
+    transcript append is withheld — which is the entire point.
+
+    FAIL CLOSED: an unidentifiable instance, an absent record, a record with no
+    destination, or any exception is NOT authorisation.
+    """
+    try:
+        me = (receiving_instance if receiving_instance is not None else active_instance()) or ""
+        if not me:
+            return "skip:reaper-instance-unidentified"
+        rd = str(run_dir or "").strip()
+        if not rd:
+            return "skip:no-run-dir"
+        record = authority_for_run(rd)
+        if not record:
+            return "skip:no-dispatch-record"
+        dest = str(record.get("destination_instance")
+                   or record.get("caller_instance") or "").strip()
+        if not dest:
+            return "skip:record-incomplete"
+        if dest != me:
+            return f"skip:destination-{dest}-not-{me}"
+        return "ok"
+    except Exception as exc:  # never break the reaper's sweep
+        return f"skip:authority-check-error-{type(exc).__name__}"
+
+
 def summarize_for_evidence(event: "dict | None", record: "dict | None") -> dict:
     """Non-secret metadata for quarantine/audit evidence.
 
@@ -409,6 +624,9 @@ def summarize_for_evidence(event: "dict | None", record: "dict | None") -> dict:
 
 
 __all__ = [
+    "DISPATCH_FOOTPRINT_NAME",
+    "LANE_TREE_DIRNAME",
+    "RUNS_DIRNAME",
     "SCHEMA",
     "SIDECAR_NAME",
     "WAKE_TARGET_SCHEMA_V1",
@@ -418,9 +636,13 @@ __all__ = [
     "authority_mismatch",
     "build_authority",
     "claim_from_event",
+    "lane_tree_root",
     "read_sidecar",
     "read_wake_target",
+    "reinject_authorisation",
     "route_fingerprint",
+    "run_dir_containment",
+    "run_identity_mismatch",
     "sidecar_path",
     "stamp_event_authority",
     "summarize_for_evidence",

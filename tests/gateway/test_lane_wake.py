@@ -36,6 +36,13 @@ def _mk_run_dir(tmp_path, run_id="20260606-141249-78059", body="[engineering] PA
     rd = Path(tmp_path) / "dd-lanes" / "engineering" / "runs" / run_id
     rd.mkdir(parents=True, exist_ok=True)
     (rd / "stdout.log").write_text(body, encoding="utf-8")
+    # meta.json is the DISPATCH FOOTPRINT (WTS 17cbc96c). dd-lane-run writes it on
+    # every real dispatch, and admission now requires it so a fabricated directory
+    # cannot carry a callback. Fixtures must therefore look like real runs, not
+    # like the forgery the check exists to reject.
+    (rd / "meta.json").write_text(
+        json.dumps({"lane": "engineering", "run_id": run_id, "lane_run_id": run_id}),
+        encoding="utf-8")
     return rd
 
 
