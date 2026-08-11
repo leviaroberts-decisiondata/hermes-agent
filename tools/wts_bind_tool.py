@@ -25,8 +25,11 @@ stdout. No secret ever reaches argv/stdout/the model.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from tools.p1_caller_boundary import require_p1_caller
@@ -34,6 +37,172 @@ from tools.registry import registry, tool_error
 
 _SHARED_HOME = Path.home() / ".hermes"
 _BINDER = _SHARED_HOME / "bin" / "dd-wts-bind"
+
+
+# ── INSTANCE-NAMESPACED ANCHORS (WTS 17cbc96c) ───────────────────────────────
+# The anchor store lives at ~/.hermes/dd-lanes/telegram-anchors.json. All five
+# Hermes homes run as the SAME unix user, so all five write the SAME file — and
+# the key was `tg:<chat_id>`, with Levi's chat id identical across every bot.
+# One key therefore meant five different conversations, and a client's binding
+# and P1's binding were literally the same entry. That is how client work got
+# bound to a P1 anchor on 2026-08-10.
+#
+# New keys are `tg:<instance>:<chat_id>[:<thread>]`. Old `tg:<chat_id>` keys are
+# LEGACY and AMBIGUOUS: they are never resolved, and never migrated on a guess.
+
+
+def _anchors_path() -> Path:
+    """The shared Telegram anchor store (also read by ~/.hermes/bin/dd-wts-bind)."""
+    return _SHARED_HOME / "dd-lanes" / "telegram-anchors.json"
+
+
+def active_instance() -> str:
+    """This Hermes instance's id, or "" when unidentifiable (never P1)."""
+    try:
+        from hermes_cli.profiles import get_active_home_id
+
+        return get_active_home_id() or ""
+    except Exception:
+        return ""
+
+
+def anchor_key(instance: str, chat_id: str, thread: "str | None" = None) -> str:
+    """The namespaced anchor identity: ``tg:<instance>:<chat_id>[:<thread>]``."""
+    key = f"tg:{instance}:{chat_id}"
+    if thread and str(thread).strip():
+        key = f"{key}:{str(thread).strip()}"
+    return key
+
+
+def legacy_anchor_key(chat_id: str, thread: "str | None" = None) -> str:
+    """The pre-fix, instance-less identity: ``tg:<chat_id>[:<thread>]``."""
+    key = f"tg:{chat_id}"
+    if thread and str(thread).strip():
+        key = f"{key}:{str(thread).strip()}"
+    return key
+
+
+def _load_anchors() -> dict:
+    try:
+        data = json.loads(_anchors_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_anchors(anchors: dict) -> bool:
+    """Atomic write, mirroring dd-wts-bind's own save so the two never disagree."""
+    try:
+        path = _anchors_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".anchors.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(anchors, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, str(path))
+        return True
+    except Exception:
+        return False
+
+
+def _entry_instance(entry: dict) -> str:
+    """Instance recorded ON a legacy entry — the only authoritative provenance.
+
+    A legacy entry was written before instances existed, so it carries none.
+    Anything that DOES carry one was stamped deliberately: either by this tool
+    when it created/migrated the entry, or by an operator performing the
+    documented repair. Nothing is inferred from the chat id, the owner string or
+    the file's location — all three are identical across the five homes.
+    """
+    if not isinstance(entry, dict):
+        return ""
+    for field in ("hermes_instance", "instance"):
+        value = str(entry.get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def classify_anchor(anchors: dict, instance: str, chat_id: str,
+                    thread: "str | None" = None) -> tuple:
+    """Decide how this turn's anchor may be used. Returns ``(status, key)``.
+
+    ``namespaced``        — an instance-scoped anchor exists; use it.
+    ``absent``            — nothing bound here; a fresh namespaced bind is safe.
+    ``legacy_migratable`` — a legacy entry carries authoritative provenance for
+                            THIS instance; migrate it and record the migration.
+    ``legacy_ambiguous``  — a legacy entry exists with no provenance. It may
+                            belong to any of the five homes. FAIL CLOSED.
+    """
+    ns_key = anchor_key(instance, chat_id, thread)
+    legacy_key = legacy_anchor_key(chat_id, thread)
+    anchors = anchors if isinstance(anchors, dict) else {}
+
+    if (anchors.get(ns_key) or {}).get("task_id"):
+        return ("namespaced", ns_key)
+
+    legacy = anchors.get(legacy_key) or {}
+    if legacy.get("task_id") and not legacy.get("superseded_by"):
+        owner = _entry_instance(legacy)
+        if owner == instance:
+            return ("legacy_migratable", legacy_key)
+        if owner:
+            # Provenance says it belongs to a DIFFERENT home. Then it is not
+            # ambiguous and it is not ours: leave it completely alone (client
+            # evidence) and bind fresh under our own namespaced key.
+            return ("absent", ns_key)
+        return ("legacy_ambiguous", legacy_key)
+
+    return ("absent", ns_key)
+
+
+def migrate_legacy_anchor(anchors: dict, instance: str, chat_id: str,
+                          thread: "str | None" = None) -> "dict | None":
+    """Copy an authoritatively-owned legacy anchor onto its namespaced key.
+
+    Idempotent, and PRESERVING: the legacy entry is kept and marked
+    ``superseded_by`` rather than deleted, so ptg-hermes / azul-hermes /
+    hyperscience-hermes evidence stays reconstructable. Returns the updated
+    anchors dict, or None if the migration is not authorised.
+    """
+    status, legacy_key = classify_anchor(anchors, instance, chat_id, thread)
+    if status != "legacy_migratable":
+        return None
+    ns_key = anchor_key(instance, chat_id, thread)
+    legacy = dict(anchors.get(legacy_key) or {})
+    now = int(time.time())
+    migrated = dict(legacy)
+    migrated.update({
+        "hermes_instance": instance,
+        "migrated_from": legacy_key,
+        "migrated_at": now,
+        "migration_provenance": "hermes_instance recorded on the legacy entry",
+        "migration_wts": "17cbc96c-a70f-46e7-af23-1458d04b5368",
+    })
+    anchors[ns_key] = migrated
+    legacy["superseded_by"] = ns_key
+    legacy["superseded_at"] = now
+    anchors[legacy_key] = legacy
+    return anchors
+
+
+def _legacy_ambiguous_error(legacy_key: str, ns_key: str, instance: str) -> str:
+    return tool_error(
+        f"wts_bind: REFUSED — this chat has a LEGACY, instance-less anchor "
+        f"({legacy_key}) and no anchor for this Hermes instance ({instance}). "
+        f"All five Hermes homes share one anchor file and Levi's Telegram chat id "
+        f"is the same for every bot, so a legacy key does not say which home bound "
+        f"it. Resolving it here could attach this instance's work to another "
+        f"home's task, or claim another home's task as this one's — the 2026-08-10 "
+        f"failure (WTS 17cbc96c). Nothing was created, resolved or mutated.\n"
+        f"To repair deliberately: confirm from evidence which home owns "
+        f"{legacy_key}, then record it on that entry in "
+        f"~/.hermes/dd-lanes/telegram-anchors.json as "
+        f'"hermes_instance": "<instance>". This tool then migrates it to '
+        f"{ns_key} once, preserving the legacy entry as superseded. "
+        f"Or pass force_new=true to bind a NEW task under the namespaced key and "
+        f"leave the ambiguous one untouched."
+    )
 
 
 def check_wts_bind_requirements() -> bool:
@@ -95,7 +264,39 @@ def wts_bind(
     if not resolve_only and not (goal or "").strip():
         return tool_error("wts_bind: provide `goal` (the unit of work) unless resolve_only=true.")
 
-    cmd = [str(_BINDER), "--chat", chat_id]
+    # ── ANCHOR NAMESPACING + LEGACY GATE (WTS 17cbc96c) ──
+    # Runs BEFORE the binder is invoked, so a refusal creates no task, no anchor
+    # and no Directus write.
+    instance = active_instance()
+    if not instance:
+        return tool_error(
+            "wts_bind: refused — this process cannot identify its Hermes instance, "
+            "so any anchor it wrote would be ambiguous across homes. An "
+            "unidentified instance is never P1 (WTS 17cbc96c). Nothing was bound."
+        )
+    ns_key = anchor_key(instance, chat_id, thread)
+    if not force_new:
+        anchors = _load_anchors()
+        status, key = classify_anchor(anchors, instance, chat_id, thread)
+        if status == "legacy_ambiguous":
+            return _legacy_ambiguous_error(key, ns_key, instance)
+        if status == "legacy_migratable":
+            migrated = migrate_legacy_anchor(anchors, instance, chat_id, thread)
+            if migrated is None or not _save_anchors(migrated):
+                return tool_error(
+                    f"wts_bind: the legacy anchor {key} is authoritatively owned by "
+                    f"this instance but the migration to {ns_key} could not be "
+                    f"written. Refusing rather than binding against an unmigrated "
+                    f"ambiguous key. Nothing was created or mutated."
+                )
+
+    # The binder derives its anchor key verbatim as ``tg:<--chat>[:<--thread>]``
+    # (~/.hermes/bin/dd-wts-bind), and uses --chat for nothing else. Passing the
+    # instance-scoped token through that slot yields ``tg:<instance>:<chat_id>``
+    # with NO change to the shared helper — the shape the fix requires, realized
+    # without touching a live 0700 binary. If dd-wts-bind ever gains a native
+    # --anchor-key flag, switch to it and delete this note.
+    cmd = [str(_BINDER), "--chat", f"{instance}:{chat_id}"]
     if thread and str(thread).strip():
         cmd += ["--thread", str(thread).strip()]
     if force_new:
