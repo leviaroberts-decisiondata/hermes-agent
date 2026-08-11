@@ -17,9 +17,6 @@ import pytest
 import tools.route_to_lane_tool as r2l
 
 
-@pytest.fixture
-
-
 @pytest.fixture(autouse=True)
 def _as_canonical_p1_home(monkeypatch):
     """Run these tests as the canonical P1 instance.
@@ -33,7 +30,13 @@ def _as_canonical_p1_home(monkeypatch):
     tests/tools/test_p1_caller_boundary.py.
     """
     monkeypatch.setattr("tools.p1_caller_boundary.active_caller_id", lambda: "default")
+    # The dispatch-authority record (WTS 17cbc96c) reads the instance from the
+    # same trusted source; declare it here too so the authorised path is
+    # exercised. Refusal behaviour is covered in the boundary/authority suites.
+    monkeypatch.setattr("tools.dispatch_authority.active_instance", lambda: "default")
 
+
+@pytest.fixture
 def fake_tree(tmp_path, monkeypatch):
     """Build a fake ~/.hermes/{bin,dd-lanes} with a scriptable wrapper.
 

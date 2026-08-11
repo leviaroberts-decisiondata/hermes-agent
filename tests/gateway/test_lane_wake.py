@@ -50,6 +50,27 @@ def _emit(wake, rd, **over):
     return wake.emit_wake_event(**kw)
 
 
+def _authorise(rd, *, instance="default", session_id="p1-session-1",
+               lane="engineering", wts_task="331b65f8-39e1-4523-b52d-19fd4461fb52",
+               chat_id="8737984752"):
+    """Write the dispatch-authority sidecar a real dispatch would leave behind.
+
+    WTS 17cbc96c: without it a callback carries no authority and the receiving
+    gateway quarantines it — which is the point, and is asserted separately in
+    tests/gateway/test_lane_wake_admission.py.
+    """
+    from tools import dispatch_authority as da
+
+    record = da.build_authority(
+        caller_instance=instance, destination_instance=instance,
+        originating_session_id=session_id,
+        run_id=Path(str(rd)).name, run_dir=str(rd), lane=lane, wts_task=wts_task,
+        platform="telegram", chat_type="dm", chat_id=chat_id,
+    )
+    da.write_sidecar(rd, record)
+    return record
+
+
 def test_emit_enqueues_one_event(wake, tmp_path):
     rd = _mk_run_dir(tmp_path)
     token = _emit(wake, rd)
@@ -57,7 +78,7 @@ def test_emit_enqueues_one_event(wake, tmp_path):
     pending = wake.list_pending_events()
     assert len(pending) == 1
     ev = pending[0]
-    assert ev["schema"] == "lane-wake/1"
+    assert ev["schema"] == "lane-wake/2"
     assert ev["lane"] == "engineering"
     assert ev["gate"] == "PASS"
     assert ev["wts_task"] == "331b65f8-39e1-4523-b52d-19fd4461fb52"
@@ -254,8 +275,13 @@ async def test_gateway_drain_injects_internal_event_once(wake, tmp_path, monkeyp
     from gateway.platforms.base import MessageEvent
     from gateway.session import SessionSource
 
-    # Enqueue a real wake event for a telegram DM (P1's shape).
+    # Enqueue a real wake event for a telegram DM (P1's shape), with the
+    # dispatch authority a genuine P1 dispatch records (WTS 17cbc96c) — this is
+    # the NON-REGRESSION case: a valid, authorised callback is still admitted
+    # exactly once.
     rd = _mk_run_dir(tmp_path)
+    _authorise(rd)
+    monkeypatch.setattr("tools.dispatch_authority.active_instance", lambda: "default")
     assert _emit(wake, rd).startswith("emitted(")
 
     captured = []

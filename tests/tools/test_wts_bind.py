@@ -18,7 +18,7 @@ import tools.wts_bind_tool as wb
 
 
 @pytest.fixture(autouse=True)
-def _as_canonical_p1_home(monkeypatch):
+def _as_canonical_p1_home(monkeypatch, tmp_path):
     """Run these tests as the canonical P1 instance.
 
     tests/conftest.py sandboxes HERMES_HOME to a per-test tempdir, so the
@@ -30,6 +30,13 @@ def _as_canonical_p1_home(monkeypatch):
     tests/tools/test_p1_caller_boundary.py.
     """
     monkeypatch.setattr("tools.p1_caller_boundary.active_caller_id", lambda: "default")
+    # Anchor namespacing (WTS 17cbc96c) reads the same trusted identity. The
+    # anchor STORE resolves off ``Path.home()/".hermes"``, which is the REAL
+    # shared file even under a sandboxed HERMES_HOME — redirect it so no test
+    # can read or write live anchors.
+    monkeypatch.setattr(wb, "active_instance", lambda: "default")
+    monkeypatch.setattr(wb, "_SHARED_HOME", tmp_path / "shared-home")
+
 
 class _Agent:
     """Stand-in carrying a routing key like the gateway attaches per turn."""
@@ -74,13 +81,16 @@ class TestChatResolution:
         monkeypatch.setenv("FAKE_STDOUT", "WTS_TASK_ID=t1\nBOUND=created\nVERIFY=ok")
         wb.wts_bind(goal="x", chat="999", parent_agent=_Agent(route_key="agent:main:telegram:dm:111"))
         argv = _argv(fake_binder)
-        assert "--chat" in argv and argv[argv.index("--chat") + 1] == "999"
+        # WTS 17cbc96c: the binder derives its anchor key as ``tg:<--chat>``, so
+        # the instance-scoped token goes through that slot — the resulting anchor
+        # is ``tg:default:999``, not the ambiguous ``tg:999``.
+        assert "--chat" in argv and argv[argv.index("--chat") + 1] == "default:999"
 
     def test_chat_derived_from_route_key(self, fake_binder, monkeypatch):
         monkeypatch.setenv("FAKE_STDOUT", "WTS_TASK_ID=t1\nBOUND=created\nVERIFY=ok")
         wb.wts_bind(goal="x", parent_agent=_Agent(route_key="agent:main:telegram:dm:8737984752"))
         argv = _argv(fake_binder)
-        assert argv[argv.index("--chat") + 1] == "8737984752"
+        assert argv[argv.index("--chat") + 1] == "default:8737984752"
 
     def test_no_chat_anywhere_is_honest_error(self, fake_binder):
         out = wb.wts_bind(goal="x", parent_agent=_Agent(route_key="agent:main:slack:channel:C1"))
