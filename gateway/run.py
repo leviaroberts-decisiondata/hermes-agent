@@ -832,6 +832,7 @@ def _attach_dd_context_for_turn(
     parent_run_id: Optional[str] = None,
     wts_task_id: Optional[str] = None,
     route_key: Optional[str] = None,
+    gateway_session_id: Optional[str] = None,
 ) -> dict:
     """Attach the per-turn DecisionData identity context to a (cached) AIAgent.
 
@@ -864,6 +865,18 @@ def _attach_dd_context_for_turn(
     # key (``agent:hermes:gateway:…``), which carries no chat_id, so route_to_lane
     # must read this separate attribute. Keep both: observability stays scrubbed.
     agent._dd_route_key = route_key or session_key
+    # The EXACT originating session id + this gateway's instance identity
+    # (WTS 17cbc96c). A detached lane's callback may only re-enter the session
+    # that dispatched it, on the instance that dispatched it — and neither can be
+    # recovered from the routing key, whose chat id is identical across all five
+    # bots. Both are trusted process/runtime facts, never model arguments.
+    agent._dd_gateway_session_id = gateway_session_id or ""
+    try:
+        from hermes_cli.profiles import get_active_home_id
+
+        agent._dd_home_id = get_active_home_id() or ""
+    except Exception:
+        agent._dd_home_id = ""
     agent._dd_parent_run_id = parent_run_id
     agent._dd_wts_task_id = wts_task_id
     agent._dd_context = ctx
@@ -11332,6 +11345,7 @@ class GatewayRunner:
                 run_id=_dd_run_id,
                 session_key=_dd_session_key,
                 route_key=session_key,
+                gateway_session_id=session_id,
             )
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None

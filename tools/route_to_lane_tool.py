@@ -553,7 +553,85 @@ def _parse_session_origin(session_key: str) -> "dict | None":
     return None
 
 
-def _register_pending_with_reaper(out: str, parent_agent, wts_task: Optional[str] = None) -> str:
+def _originating_session_id(parent_agent) -> str:
+    """The EXACT gateway session that dispatched this lane (WTS 17cbc96c).
+
+    Preferred source is ``_dd_gateway_session_id``, which the gateway attaches
+    per turn from its own session id — a trusted process fact, not a model
+    argument. Older gateways do not set it; fall back to the last segment of the
+    observability key (``agent:hermes:gateway:[<profile>:]<session>``), which is
+    a sanitised form of the same id. Returns "" when neither is available, and a
+    caller with "" writes NO authority record rather than a guessed one.
+    """
+    direct = str(getattr(parent_agent, "_dd_gateway_session_id", "") or "").strip()
+    if direct:
+        return direct
+    obs = str(getattr(parent_agent, "_dd_session_key", "") or "").strip()
+    if obs.startswith("agent:hermes:gateway:"):
+        tail = obs.split(":")[-1].strip()
+        if tail:
+            return tail
+    return ""
+
+
+def _write_dispatch_authority(
+    run_dir: str,
+    parent_agent,
+    origin: dict,
+    *,
+    lane: str = "",
+    wts_task: Optional[str] = None,
+    mission_id: Optional[str] = None,
+) -> str:
+    """Record WHO dispatched this run and WHERE its callback may return.
+
+    Additive to the reaper's positional ``--register`` contract (which is left
+    byte-identical): a versioned 0600 JSON sidecar in the run dir, read by the
+    receiving gateway's admission check before a callback becomes a model turn.
+
+    Returns a short non-secret status token for the caller-facing note.
+    """
+    try:
+        from tools import dispatch_authority as da
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"authority: UNWRITTEN ({type(exc).__name__})"
+
+    session_id = _originating_session_id(parent_agent)
+    caller = da.active_instance()
+    if not caller or not session_id:
+        # Never invent authority. A run dispatched without a nameable instance or
+        # session gets NO record, so its callback is quarantined on return rather
+        # than being admitted on a guess.
+        missing = "instance" if not caller else "session"
+        return f"authority: NOT RECORDED (no {missing}) — callback will be quarantined"
+
+    record = da.build_authority(
+        caller_instance=caller,
+        destination_instance=caller,
+        originating_session_id=session_id,
+        run_id=Path(run_dir.rstrip("/")).name,
+        run_dir=run_dir,
+        lane=lane,
+        wts_task=wts_task,
+        mission_id=mission_id,
+        platform=origin.get("platform", ""),
+        chat_type=origin.get("chat_type", ""),
+        chat_id=origin.get("chat_id", ""),
+    )
+    written = da.write_sidecar(run_dir, record)
+    if not written:
+        return "authority: UNWRITTEN (sidecar write failed) — callback will be quarantined"
+    return f"authority: {da.SCHEMA} instance={caller} session={session_id}"
+
+
+def _register_pending_with_reaper(
+    out: str,
+    parent_agent,
+    wts_task: Optional[str] = None,
+    *,
+    lane: str = "",
+    mission_id: Optional[str] = None,
+) -> str:
     """P-C / B-1a: register a detached PENDING run with the openclaw reaper.
 
     The reaper (a standalone launchd agent) returns the lane's real closeout to
@@ -602,6 +680,12 @@ def _register_pending_with_reaper(out: str, parent_agent, wts_task: Optional[str
     # the reaper coerces to its DEFAULT_BUDGET_SECS — the empty string is a valid
     # "use default" sentinel, not a missing arg.
     wts = (wts_task or "").strip()
+    # WTS 17cbc96c — write the authority sidecar BEFORE registering, so a run
+    # that gets reaped immediately still has a record to be checked against.
+    # Additive: the positional --register call below is unchanged.
+    authority_note = _write_dispatch_authority(
+        run_dir, parent_agent, origin, lane=lane, wts_task=wts_task, mission_id=mission_id,
+    )
     cmd = [
         str(_REAPER), "--register", run_dir, session_key,
         origin["platform"], origin["chat_id"], origin["chat_type"],
@@ -624,8 +708,8 @@ def _register_pending_with_reaper(out: str, parent_agent, wts_task: Optional[str
     if proc.returncode == 0:
         wts_note = f"; wts_task={wts}" if wts else "; wts_task=none (no final WTS attach)"
         return (f"reaper-registration: OK (run will return its closeout to this "
-                f"session; run_dir={run_dir}{wts_note})")
-    return f"reaper-registration: FAILED (exit={proc.returncode})"
+                f"session; run_dir={run_dir}{wts_note}; {authority_note})")
+    return f"reaper-registration: FAILED (exit={proc.returncode}); {authority_note}"
 
 
 def _known_lanes() -> list[str]:
@@ -844,6 +928,25 @@ def route_to_lane(
         env.setdefault("HERMES_SESSION_KEY", session_key)
     if wts_task and wts_task.strip():
         env["DD_WTS_TASK_ID"] = wts_task.strip()
+    # ── CALLER AUTHORITY for the spawn-time wake-target sidecar (WTS 17cbc96c) ──
+    # HERMES_HOME is pinned to the SHARED home two lines above, so dd-lane-run
+    # cannot derive who dispatched it — it would see the shared home and call
+    # every caller "default". Pass the caller's real instance + exact session
+    # explicitly. Both come from trusted process state (HERMES_HOME of THIS
+    # process, and the gateway's own session id), never from a model argument.
+    # Absent values are simply not set: dd-lane-run then writes a wake-target
+    # with no authority, and the callback is quarantined on return.
+    try:
+        from tools import dispatch_authority as _da
+
+        _caller_instance = _da.active_instance()
+        _caller_session = _originating_session_id(parent_agent)
+        if _caller_instance:
+            env["DD_CALLER_INSTANCE"] = _caller_instance
+        if _caller_session:
+            env["DD_CALLER_SESSION_ID"] = _caller_session
+    except Exception:
+        pass
     # Slice C/D (DD_MISSION_ROOT): mission-bound dispatches carry the mission
     # through the wrapper into dd-lane-run (env fallback for --mission-id /
     # --purpose / --remediation-depth), where the pre-dispatch transition
@@ -1016,7 +1119,9 @@ def route_to_lane(
         # closeout returns to THIS session automatically (zero user follow-up).
         # Pass the resolved wts_task so the reaper attaches the FINAL result to the
         # bound task on reap (WTS 331b65f8 req 3/4) — not just the sync PENDING.
-        reaper_note = _register_pending_with_reaper(out, parent_agent, wts_task)
+        reaper_note = _register_pending_with_reaper(
+            out, parent_agent, wts_task, lane=lane, mission_id=mission_id,
+        )
         # Slice 1 / G1: return a NORMAL accepted envelope (run_id + lease + state)
         # instead of an error-shaped PENDING. `pending` is not a failure.
         if _accepted_dispatch_on():

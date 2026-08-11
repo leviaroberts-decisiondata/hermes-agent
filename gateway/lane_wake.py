@@ -262,6 +262,11 @@ def emit_wake_event(
     terminal_state: Optional[str] = None,
     retry_disposition: Optional[str] = None,
     closeout: Optional[str] = None,
+    instance: Optional[str] = None,
+    destination_instance: Optional[str] = None,
+    originating_session_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    chain_id: Optional[str] = None,
 ) -> str:
     """Enqueue a single ACTIVE-WAKE event onto the durable file queue.
 
@@ -310,7 +315,12 @@ def emit_wake_event(
                                         run_id=run_id, terminal_state=terminal_state)
 
         event = {
-            "schema": "lane-wake/1",
+            # lane-wake/2 adds the callback AUTHORITY fields (instance,
+            # destination_instance, originating_session_id, mission/chain) —
+            # WTS 17cbc96c. The shape is otherwise unchanged and readers accept
+            # v1 too, but a v1 event carries no instance and is therefore
+            # quarantined by the receiving gateway rather than admitted.
+            "schema": "lane-wake/2",
             "idempotency_key": key,
             "kind": kind,
             "run_dir": run_dir,
@@ -338,6 +348,28 @@ def emit_wake_event(
                                "mode": gov.get("mode")} if gov else None),
             "enqueued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        # ── CALLBACK AUTHORITY (WTS 17cbc96c) ──
+        # Explicit args win (the producer knows); otherwise the fields are read
+        # from the run's OWN dispatch record, so the reaper's existing CLI call
+        # gains authority without an argument change. Nothing is invented: a run
+        # with no record produces an event with no authority, and the receiving
+        # gateway quarantines it. That is the designed failure mode.
+        for _field, _value in (
+            ("instance", instance),
+            ("destination_instance", destination_instance),
+            ("originating_session_id", originating_session_id),
+            ("mission_id", mission_id),
+            ("chain_id", chain_id),
+        ):
+            _clean = (_value or "").strip() if isinstance(_value, str) else _value
+            if _clean:
+                event[_field] = _clean
+        try:
+            from tools import dispatch_authority as _da
+
+            _da.stamp_event_authority(event, run_dir=run_dir)
+        except Exception:
+            pass
         # Exactly-once delivery (board 2026-07-15): the wake embeds the reaper's
         # closeout so the injected turn IS the authoritative receipt — no second
         # composition, no reinject double-delivery. Keep the tail (receipts +
