@@ -134,6 +134,30 @@ def wake_queue_dir() -> Path:
     return hermes_home() / "dd-lanes" / "wake-queue"
 
 
+def quarantine_dir() -> Path:
+    """Where refused callbacks are recorded (WTS 17cbc96c).
+
+    Per-home, so each gateway's evidence stays inside its own home exactly like
+    its sessions, memory and logs already do.
+    """
+    return hermes_home() / "quarantine"
+
+
+# Keep the evidence directory bounded — this is an audit trail, not a spool. The
+# newest N files are retained; older ones are pruned on write.
+QUARANTINE_KEEP = 500
+
+# A callback older than this is stale by construction: a lane result whose
+# gateway has been down for a day should be reconciled deliberately, not woken
+# into a session that has moved on. Overridable for operations, not by a model.
+def _max_callback_age_secs() -> int:
+    try:
+        raw = int((os.getenv("DD_LANE_WAKE_MAX_AGE_SECS") or "").strip() or 0)
+    except Exception:
+        return 86400
+    return raw if raw > 0 else 86400
+
+
 def _processed_dir() -> Path:
     return wake_queue_dir() / ".processed"
 
@@ -433,6 +457,196 @@ def already_processed(idempotency_key: str) -> bool:
     return (_processed_dir() / _safe_key_filename(idempotency_key)).exists()
 
 
+# ─────────────────────────── ADMISSION + QUARANTINE ──────────────────────────
+# WTS 17cbc96c. A wake event re-enters the gateway HERE, and the drain's next act
+# is to inject an internal MessageEvent — i.e. to start a model turn that will
+# read the event's prompt and act on it (WTS writes, attachments, further lane
+# dispatch). Everything below runs BEFORE that, and its only two outcomes are
+# "inject" and "write evidence and stop".
+#
+# The 2026-08-10 crossover is the reason: destination was resolved from
+# (platform, chat_id), which is identical across all five bots, so P1's shared
+# reaper delivered PTG's and Azul's lane results into P1's session.
+
+_SUPPORTED_EVENT_SCHEMAS = ("lane-wake/1", "lane-wake/2")
+
+# Stable reason codes. They are written into quarantine evidence and logged, so
+# treat them as an interface, not as prose.
+QUARANTINE_REASONS = (
+    "schema_unsupported",      # event shape this gateway does not understand
+    "unidentified_receiver",   # this gateway cannot name its own instance
+    "authority_absent",        # event carries no authority fields at all
+    "missing_instance",        # legacy callback — must NOT default to P1
+    "missing_session",         # no exact originating session
+    "no_dispatch_record",      # nothing to check the claim against
+    "record_incomplete",       # dispatch record exists but names no authority
+    "instance_mismatch",       # different Hermes instance dispatched this
+    "destination_mismatch",    # this gateway is not the intended destination
+    "session_mismatch",        # right instance, wrong session
+    "run_mismatch",
+    "wts_mismatch",
+    "mission_mismatch",
+    "chain_mismatch",
+    "route_mismatch",
+    "stale",                   # older than the callback freshness window
+    "replayed",                # this idempotency key was already delivered
+)
+
+
+class Admission:
+    """Verdict for one callback. ``ok`` is the ONLY thing that authorises entry."""
+
+    __slots__ = ("ok", "reason", "detail", "receiving_instance", "record")
+
+    def __init__(self, ok: bool, reason: str = "", detail: str = "",
+                 receiving_instance: str = "", record: Optional[dict] = None):
+        self.ok = ok
+        self.reason = reason
+        self.detail = detail
+        self.receiving_instance = receiving_instance
+        self.record = record
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"Admission(ok={self.ok}, reason={self.reason!r})"
+
+
+def _event_age_secs(event: dict) -> Optional[int]:
+    raw = str(event.get("enqueued_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+    return int(time.time() - time.mktime(parsed) + time.timezone)
+
+
+def admit_callback(event: dict, *, receiving_instance: Optional[str] = None,
+                   max_age_secs: Optional[int] = None) -> Admission:
+    """Decide whether a wake event may enter this gateway. NO side effects.
+
+    Runs before the model is invoked, before any Telegram injection, before any
+    WTS mutation, chain advance or lane dispatch. Returns a verdict; the caller
+    performs the (single) side effect of writing quarantine evidence.
+
+    Checked in order — schema, receiver identity, claimed authority, the dispatch
+    record, then freshness and replay — so the first failure is the most
+    fundamental one and is the reason code that gets recorded.
+    """
+    try:
+        from tools import dispatch_authority as da
+    except Exception as exc:  # pragma: no cover - defensive
+        # We cannot verify authority, therefore we cannot admit. Fail closed.
+        return Admission(False, "authority_absent",
+                         f"authority module unavailable ({type(exc).__name__})")
+
+    receiver = receiving_instance if receiving_instance is not None else da.active_instance()
+
+    if not isinstance(event, dict) or not event:
+        return Admission(False, "schema_unsupported", "event is not a mapping",
+                         receiving_instance=receiver)
+
+    schema = str(event.get("schema") or "").strip()
+    if schema not in _SUPPORTED_EVENT_SCHEMAS:
+        return Admission(False, "schema_unsupported", f"schema={schema or '(absent)'}",
+                         receiving_instance=receiver)
+
+    record = da.authority_for_run(event.get("run_dir") or "")
+    claim = da.claim_from_event(event)
+    reason = da.authority_mismatch(record, claim, receiving_instance=receiver)
+    if reason:
+        return Admission(False, reason, "", receiving_instance=receiver, record=record)
+
+    # Freshness. A stale callback is not evidence of an attack, but waking a
+    # session a day later with "continue this workflow" is its own hazard.
+    limit = max_age_secs if max_age_secs is not None else _max_callback_age_secs()
+    age = _event_age_secs(event)
+    if age is not None and limit > 0 and age > limit:
+        return Admission(False, "stale", f"age={age}s limit={limit}s",
+                         receiving_instance=receiver, record=record)
+
+    # Replay. The drain also dedupes, but admission must be able to answer this
+    # on its own so a replayed event cannot be admitted by a different caller.
+    key = str(event.get("idempotency_key") or "").strip()
+    if key and already_processed(key):
+        return Admission(False, "replayed", "", receiving_instance=receiver, record=record)
+
+    return Admission(True, "", "", receiving_instance=receiver, record=record)
+
+
+def _prune_quarantine(keep: int = QUARANTINE_KEEP) -> None:
+    try:
+        files = sorted(quarantine_dir().glob("*.json"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-keep] if len(files) > keep else []:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def quarantine_callback(event: dict, admission: "Admission") -> "Path | None":
+    """Record a refused callback as structured, NON-SECRET evidence.
+
+    Writes exactly one file and does nothing else: no model invocation, no
+    Telegram injection, no WTS mutation, no attachment, no chain advance, no
+    lane dispatch, no retry. Contains reason code + metadata only — never the
+    continuation prompt, the closeout, the transcript, a token, or the raw chat
+    id (recorded as a fingerprint instead).
+    """
+    try:
+        from tools import dispatch_authority as da
+
+        payload = {
+            "schema": "lane-callback-quarantine/1",
+            "reason": admission.reason,
+            "detail": admission.detail,
+            "receiving_instance": admission.receiving_instance,
+            "quarantined_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "wts": "17cbc96c-a70f-46e7-af23-1458d04b5368",
+            "evidence": da.summarize_for_evidence(event, admission.record),
+        }
+        qdir = quarantine_dir()
+        qdir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(qdir, 0o700)
+        except Exception:
+            pass
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        digest = hashlib.sha256(
+            f"{event.get('idempotency_key') or ''}:{admission.reason}".encode("utf-8")
+        ).hexdigest()[:12]
+        target = qdir / f"{stamp}-{admission.reason or 'refused'}-{digest}.json"
+        fd, tmp = tempfile.mkstemp(dir=str(qdir), prefix=".quarantine-", suffix=".json")
+        try:
+            os.fchmod(fd, 0o600)
+        except Exception:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, str(target))
+        _prune_quarantine()
+        return target
+    except Exception:
+        # Evidence is best-effort; REFUSAL is not. A failed write must never
+        # become an admission.
+        return None
+
+
+def list_quarantined() -> list[dict]:
+    """Quarantine evidence, oldest first (operator/audit surface, no secrets)."""
+    out: list[dict] = []
+    qdir = quarantine_dir()
+    if not qdir.is_dir():
+        return out
+    for p in sorted(qdir.glob("*.json"), key=lambda x: x.stat().st_mtime):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            rec["_path"] = str(p)
+            out.append(rec)
+        except Exception:
+            continue
+    return out
+
+
 def _processed_marker_payload(event: dict, *, outcome: str) -> str:
     key = event.get("idempotency_key") or ""
     return json.dumps(
@@ -525,12 +739,27 @@ def _main(argv: list[str]) -> int:
     ap.add_argument("--source-label", default="dd-lane-reaper")
     ap.add_argument("--terminal-state", default="", help="typed terminal state (terminal-state/1)")
     ap.add_argument("--retry-disposition", default="", help="typed retry disposition (terminal-state/1)")
+    # Callback authority (WTS 17cbc96c). OPTIONAL: when omitted the fields are
+    # read from the run's dispatch-authority / wake-target sidecar, so existing
+    # producers keep working unchanged.
+    ap.add_argument("--instance", default="", help="dispatching Hermes instance id")
+    ap.add_argument("--destination-instance", default="", help="instance the callback must return to")
+    ap.add_argument("--session-id", default="", help="exact originating gateway session id")
+    ap.add_argument("--mission-id", default="")
+    ap.add_argument("--chain-id", default="")
     ap.add_argument("--list", action="store_true", help="print pending events (no secrets)")
+    ap.add_argument("--list-quarantine", action="store_true",
+                    help="print quarantined callbacks (reason codes + metadata, no secrets)")
     args = ap.parse_args(argv)
 
     if args.list:
         for ev in list_pending_events():
             print(json.dumps({k: v for k, v in ev.items() if k != "prompt"}, ensure_ascii=False))
+        return 0
+
+    if args.list_quarantine:
+        for rec in list_quarantined():
+            print(json.dumps(rec, ensure_ascii=False))
         return 0
 
     if args.emit:
@@ -558,6 +787,11 @@ def _main(argv: list[str]) -> int:
             source_label=args.source_label,
             terminal_state=args.terminal_state or None,
             retry_disposition=args.retry_disposition or None,
+            instance=args.instance or None,
+            destination_instance=args.destination_instance or None,
+            originating_session_id=args.session_id or None,
+            mission_id=args.mission_id or None,
+            chain_id=args.chain_id or None,
         )
         print(token)
         # Exit 0 on a clean emit/skip; 9 only on a real error (so bash can log it).

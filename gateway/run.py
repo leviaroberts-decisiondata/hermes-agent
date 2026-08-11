@@ -9558,6 +9558,35 @@ class GatewayRunner:
                     if key and lane_wake.already_processed(key):
                         lane_wake.mark_processed(event, outcome="already-processed")
                         continue
+                    # ── ADMISSION (WTS 17cbc96c) ── FIRST, before the routing
+                    # source is built, before any injection, and therefore before
+                    # the model runs. A callback that does not carry authority
+                    # matching its dispatch record — wrong instance, wrong
+                    # session, wrong run/WTS/chain, missing identity, stale or
+                    # replayed — is recorded as evidence and dropped HERE. It
+                    # never becomes a turn, so it cannot inject into Telegram,
+                    # mutate WTS, attach a file, advance a chain or dispatch a
+                    # lane. On 2026-08-10 the absence of this check is what let
+                    # PTG's and Azul's lane results land in P1's session.
+                    admission = lane_wake.admit_callback(event)
+                    if not admission.ok:
+                        evidence = lane_wake.quarantine_callback(event, admission)
+                        logger.warning(
+                            "Lane-wake QUARANTINED (%s): callback for lane=%s run=%s "
+                            "wts=%s claimed instance=%r session=%r, this gateway is %r "
+                            "— NOT injected, no model turn, no WTS/chain/dispatch side "
+                            "effect. evidence=%s",
+                            admission.reason, event.get("lane"), event.get("run_id"),
+                            event.get("wts_task"), event.get("instance"),
+                            event.get("originating_session_id"),
+                            admission.receiving_instance, evidence or "(unwritten)",
+                        )
+                        # Consume it: a refused callback must not be retried
+                        # noisily, and must never fall back to another session.
+                        lane_wake.mark_processed(
+                            event, outcome=f"quarantined:{admission.reason}"
+                        )
+                        continue
                     source = self._build_process_event_source(event)
                     if not source:
                         logger.warning(
