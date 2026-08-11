@@ -804,12 +804,41 @@ def get_active_home_id() -> str:
 
 
 def is_canonical_p1_home() -> bool:
-    """True only for the canonical P1 instance (the default ``~/.hermes`` home).
+    """True for P1 and for P1's OWN specialist profiles.
 
-    The authority test for P1-only dispatch capabilities. Fails closed: any
-    unknown, malformed or sibling home is not P1 (WTS 17cbc96c).
+    The authority test for P1-only dispatch capabilities (WTS 17cbc96c).
+
+    The trust boundary is the ``~/.hermes`` TREE, not the single default home.
+    ``~/.hermes/profiles/<name>`` gateways — dd-pmo, qa-review, dd-design,
+    architect-standards and the rest — are P1's own delegated specialists: they
+    live inside P1's home, share its config root, and dispatching lanes is their
+    normal job. The crossover this guard exists to stop came from SIBLING homes
+    (``~/.hermes-ptg``, ``~/.hermes-azul``, ``~/.hermes-hyperscience``), which are
+    independent installs with their own bots and clients.
+
+    An earlier revision tested ``== "default"`` and refused all 12 specialist
+    profiles, breaking a capability they have used across 500+ recorded
+    sessions. Fails closed exactly as before for siblings and for any home whose
+    identity cannot be resolved.
     """
-    return get_active_home_id() == "default"
+    return is_p1_internal_home()
+
+
+def is_p1_internal_home() -> bool:
+    """True when HERMES_HOME is ``~/.hermes`` or one of its own profiles."""
+    from hermes_constants import get_hermes_home
+    try:
+        resolved = get_hermes_home().resolve()
+        native_root = (Path.home() / ".hermes").resolve()
+    except Exception:
+        return False
+    if resolved == native_root:
+        return True
+    try:
+        rel = resolved.relative_to(native_root / "profiles")
+    except (ValueError, OSError):
+        return False
+    return len(rel.parts) == 1 and bool(_PROFILE_ID_RE.match(rel.parts[0]))
 
 
 # ---------------------------------------------------------------------------

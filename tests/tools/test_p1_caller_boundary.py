@@ -227,3 +227,44 @@ def _is_p1(home):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestP1OwnProfilesAreNotClients(unittest.TestCase):
+    """Regression: the first cut refused P1's own specialists.
+
+    `~/.hermes/profiles/<name>` gateways are P1's delegated specialists — they
+    live inside P1's home and dispatching lanes is their job. Refusing them
+    broke a capability used across 500+ recorded sessions. The crossover came
+    from SIBLING homes, which is what must stay refused.
+    """
+
+    P1_PROFILES = ("dd-design", "qa-review", "dd-pmo", "architect-standards",
+                   "dd-engineer-1", "devops-release", "product-os",
+                   "knowledge-context", "video-review", "security-review")
+
+    def test_every_p1_specialist_profile_keeps_dispatch(self):
+        for prof in self.P1_PROFILES:
+            with _HomeCtx(f"/Users/openclaw/.hermes/profiles/{prof}"):
+                for tool in P1_DISPATCH_TOOLS:
+                    self.assertIsNone(require_p1_caller(tool),
+                                      f"profiles/{prof} was refused {tool}")
+
+    def test_profiles_still_report_their_own_identity(self):
+        # Authority widened; identity did NOT — attribution stays per-profile.
+        with _HomeCtx("/Users/openclaw/.hermes/profiles/dd-pmo"):
+            self.assertEqual(get_active_home_id(), "dd-pmo")
+            self.assertTrue(is_canonical_p1_home())
+
+    def test_sibling_homes_are_still_refused(self):
+        for name, home in CLIENT_HOMES.items():
+            with _HomeCtx(home):
+                self.assertFalse(is_canonical_p1_home(), name)
+                self.assertIsNotNone(require_p1_caller("route_to_lane"), name)
+
+    def test_a_fake_profile_path_does_not_grant_authority(self):
+        for junk in ("/Users/openclaw/.hermes/profiles",
+                     "/Users/openclaw/.hermes/profiles/a/b",
+                     "/Users/openclaw/.hermes/profiles/../../.hermes-azul",
+                     "/Users/openclaw/.hermes-ptg/profiles/dd-pmo"):
+            with _HomeCtx(junk):
+                self.assertFalse(is_canonical_p1_home(), junk)

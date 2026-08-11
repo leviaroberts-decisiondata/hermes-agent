@@ -43,6 +43,21 @@ def active_caller_id() -> str:
         return ""
 
 
+def _is_p1_internal() -> bool:
+    """True for P1 and for P1's own ``~/.hermes/profiles/<name>`` specialists.
+
+    The trust boundary is the ~/.hermes TREE. Testing ``caller == "default"``
+    refused all 12 specialist profiles — a capability they use across 500+
+    recorded sessions — while the crossover this guard exists to stop came from
+    SIBLING homes. Any resolution failure is False, so this still fails closed.
+    """
+    try:
+        from hermes_cli.profiles import is_p1_internal_home
+        return bool(is_p1_internal_home())
+    except Exception:
+        return False
+
+
 def _describe(caller: str) -> str:
     return caller if caller else "<unidentified>"
 
@@ -55,7 +70,7 @@ def p1_authority_error(tool_name: str) -> "str | None":
     instead of looping against it.
     """
     caller = active_caller_id()
-    if caller == "default":
+    if _is_p1_internal():
         return None
     return (
         f"{tool_name}: refused — this Hermes instance ({_describe(caller)}) is not "
