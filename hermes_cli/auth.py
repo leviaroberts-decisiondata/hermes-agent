@@ -742,18 +742,54 @@ def _auth_file_path() -> Path:
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
-        try:
-            resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
-        if resolved == real_home_auth:
-            raise RuntimeError(
-                f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-                "via scripts/run_tests.sh for hermetic CI-parity env."
-            )
+        _refuse_if_real_auth_store(path)
     return path
+
+
+def _real_auth_store_roots() -> "list[Path]":
+    """Every directory tree under $HOME that can hold a REAL credential store.
+
+    Not one path. The 2026-08-11 incident wrote test fixtures into
+    ``~/.hermes-shared-auth/auth.json`` — the store all 16 gateways actually
+    use — and emptied ``~/.hermes/auth.json`` plus all 12
+    ``~/.hermes/profiles/*/auth.json``. The old guard compared against exactly
+    one hardcoded path, so it protected none of them.
+    """
+    home = Path.home()
+    roots = [home / ".hermes", home / ".hermes-shared-auth"]
+    try:
+        roots.extend(p for p in home.glob(".hermes-*") if p.is_dir())
+    except Exception:
+        pass
+    return roots
+
+
+def _refuse_if_real_auth_store(path: Path) -> None:
+    """Raise if `path` is a real credential store and we are under pytest.
+
+    Containment, not equality: anything inside ``~/.hermes``, ``~/.hermes-*``
+    or a profile home counts, however it was reached — including through the
+    ``HERMES_AUTH_STORE_PATH`` override, which bypasses the HERMES_HOME
+    sandbox entirely and is how the incident happened.
+    """
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    for root in _real_auth_store_roots():
+        try:
+            root_resolved = root.resolve(strict=False)
+        except Exception:
+            continue
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            raise RuntimeError(
+                f"Refusing to touch a real user auth store during a test run: {path}\n"
+                f"(matched real store root: {root})\n"
+                "Point HERMES_HOME *and* HERMES_AUTH_STORE_PATH at a tmp_path in your "
+                "fixture, or run via scripts/run_tests.sh. tests/conftest.py clears "
+                "HERMES_AUTH_STORE_PATH for exactly this reason — if you are seeing "
+                "this, something re-set it or the test bypassed the hermetic fixture."
+            )
 
 
 def _auth_lock_path() -> Path:
