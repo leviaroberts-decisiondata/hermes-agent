@@ -3857,6 +3857,12 @@ def _aux_provider_label(resolved_provider, model_str):
 
 
 def _emit_aux_telemetry(task, provider, model, duration_ms, response, error):
+    # Under pytest the client is a MagicMock and two mock 'model' strings
+    # already leaked into live llm_calls — tests must never POST into the
+    # observability store (same contract as the runner's recording emitters).
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+
     def _post():
         try:
             import urllib.request as _rq
