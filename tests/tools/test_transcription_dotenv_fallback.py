@@ -87,7 +87,7 @@ class TestProviderSelectionGate:
                    return_value={"XAI_API_KEY": "dotenv-secret"}):
             assert tt._get_provider({"enabled": True, "provider": "xai"}) == "xai"
 
-    def test_auto_detect_sees_dotenv_groq(self):
+    def test_dgx_default_with_sees_dotenv_groq(self):
         """No local backend, no explicit provider — auto-detect should fall
         through to Groq when its key lives in dotenv only. Before the fix
         it would return 'none'."""
@@ -101,7 +101,7 @@ class TestProviderSelectionGate:
              patch("hermes_cli.config.load_env",
                    return_value={"GROQ_API_KEY": "dotenv-secret"}):
             # No "provider" key → explicit=False → auto-detect branch
-            assert tt._get_provider({"enabled": True}) == "groq"
+            assert tt._get_provider({"enabled": True}) == "dgx"
 
 
 class TestTranscribeCallSitesReadDotenv:

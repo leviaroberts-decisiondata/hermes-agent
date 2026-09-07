@@ -8416,6 +8416,7 @@ class HermesCLI:
 
         submitted = False
         wav_path = None
+        result = None
         try:
             if self._voice_recorder is None:
                 return
@@ -8471,12 +8472,12 @@ class HermesCLI:
                 self._voice_processing = False
             if hasattr(self, '_app') and self._app:
                 self._app.invalidate()
-            # Clean up temp file
-            try:
-                if wav_path and os.path.isfile(wav_path):
-                    os.unlink(wav_path)
-            except Exception:
-                pass
+            from tools.voice_mode import finish_recording
+            # Filtered silence is disposable; a failed send or STT error is not.
+            silent = isinstance(result, dict) and result.get("success") and not result.get("transcript", "").strip()
+            retained = finish_recording(wav_path, submitted or bool(silent))
+            if retained:
+                _cprint(f"{_DIM}Recording kept for retry: {retained}{_RST}")
 
             # Track consecutive no-speech cycles to avoid infinite restart loops.
             if not submitted:

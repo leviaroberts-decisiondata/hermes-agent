@@ -218,6 +218,7 @@ from tools.voice_mode import (
     is_whisper_hallucination,
     play_audio_file,
     transcribe_recording,
+    finish_recording,
 )
 
 logger = logging.getLogger(__name__)
@@ -338,17 +339,14 @@ def stop_and_transcribe() -> Optional[str]:
     if not wav_path:
         return None
 
+    result = None
     try:
         result = transcribe_recording(wav_path)
     except Exception as e:
         logger.warning("voice transcription failed: %s", e)
         return None
     finally:
-        try:
-            if os.path.isfile(wav_path):
-                os.unlink(wav_path)
-        except Exception:
-            pass
+        finish_recording(wav_path, isinstance(result, dict) and bool(result.get("success")))
 
     # transcribe_recording returns {"success": bool, "transcript": str, ...}
     # — matches cli.py:_voice_stop_and_transcribe's result.get("transcript").
@@ -522,6 +520,7 @@ def _continuous_on_silence() -> None:
     transcript: Optional[str] = None
 
     if wav_path:
+        result = None
         try:
             result = transcribe_recording(wav_path)
             # transcribe_recording returns {"success": bool, "transcript": str,
@@ -541,11 +540,7 @@ def _continuous_on_silence() -> None:
             logger.warning("continuous transcription failed: %s", e)
             _debug(f"_continuous_on_silence: transcribe raised {type(e).__name__}: {e}")
         finally:
-            try:
-                if os.path.isfile(wav_path):
-                    os.unlink(wav_path)
-            except Exception:
-                pass
+            finish_recording(wav_path, isinstance(result, dict) and bool(result.get("success")))
 
     with _continuous_lock:
         if not _continuous_active:

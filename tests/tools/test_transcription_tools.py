@@ -86,21 +86,21 @@ class TestGetProviderGroq:
 class TestGetProviderFallbackPriority:
     """Auto-detect fallback priority and explicit provider behaviour."""
 
-    def test_auto_detect_prefers_local(self):
-        """Auto-detect prefers local over any cloud provider."""
+    def test_dgx_default_with_prefers_local(self):
+        """Installed providers and keys never change the DecisionData default."""
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "local"
+            assert _get_provider({}) == "dgx"
 
-    def test_auto_detect_prefers_groq_over_openai(self, monkeypatch):
-        """Auto-detect: groq (free) is preferred over openai (paid)."""
+    def test_dgx_default_with_prefers_groq_over_openai(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
              patch("tools.transcription_tools._has_local_command", return_value=False), \
              patch("tools.transcription_tools._HAS_OPENAI", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "groq"
+            assert _get_provider({}) == "dgx"
 
     def test_explicit_openai_no_key_returns_none(self, monkeypatch):
         """Explicit openai with no key returns none — no cross-provider fallback."""
@@ -115,10 +115,10 @@ class TestGetProviderFallbackPriority:
         from tools.transcription_tools import _get_provider
         assert _get_provider({"provider": "custom-endpoint"}) == "custom-endpoint"
 
-    def test_empty_config_defaults_to_local(self):
+    def test_empty_config_defaults_to_dgx(self):
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "local"
+            assert _get_provider({}) == "dgx"
 
 
 # ============================================================================
@@ -180,19 +180,19 @@ class TestExplicitProviderRespected:
             result = _get_provider({"provider": "openai"})
             assert result == "none"
 
-    def test_auto_detect_still_falls_back_to_cloud(self, monkeypatch):
-        """When no provider is explicitly set, auto-detect cloud fallback works."""
+    def test_dgx_default_with_still_falls_back_to_cloud(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-real-key")
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
              patch("tools.transcription_tools._has_local_command", return_value=False), \
              patch("tools.transcription_tools._HAS_OPENAI", True):
             from tools.transcription_tools import _get_provider
-            # Empty dict = no explicit provider, uses DEFAULT_PROVIDER auto-detect
+            # Empty dict selects DGX without native/cloud fallback.
             result = _get_provider({})
-            assert result == "openai"
+            assert result == "dgx"
 
-    def test_auto_detect_prefers_groq_over_openai(self, monkeypatch):
+    def test_dgx_default_with_prefers_groq_over_openai(self, monkeypatch):
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-real-key")
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
@@ -200,7 +200,7 @@ class TestExplicitProviderRespected:
              patch("tools.transcription_tools._HAS_OPENAI", True):
             from tools.transcription_tools import _get_provider
             result = _get_provider({})
-            assert result == "groq"
+            assert result == "dgx"
 
 
 # ============================================================================
@@ -1000,8 +1000,8 @@ class TestGetProviderMistral:
             from tools.transcription_tools import _get_provider
             assert _get_provider({"provider": "mistral"}) == "none"
 
-    def test_auto_detect_mistral_after_openai(self, monkeypatch):
-        """Auto-detect: mistral is tried after openai when both are unavailable."""
+    def test_dgx_default_with_mistral_after_openai(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1011,10 +1011,10 @@ class TestGetProviderMistral:
              patch("tools.transcription_tools._HAS_OPENAI", False), \
              patch("tools.transcription_tools._HAS_MISTRAL", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "mistral"
+            assert _get_provider({}) == "dgx"
 
-    def test_auto_detect_openai_preferred_over_mistral(self, monkeypatch):
-        """Auto-detect: openai is preferred over mistral (both paid, openai more common)."""
+    def test_dgx_default_with_openai_preferred_over_mistral(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-test")
         monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
@@ -1023,10 +1023,10 @@ class TestGetProviderMistral:
              patch("tools.transcription_tools._HAS_OPENAI", True), \
              patch("tools.transcription_tools._HAS_MISTRAL", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "openai"
+            assert _get_provider({}) == "dgx"
 
-    def test_auto_detect_groq_preferred_over_mistral(self, monkeypatch):
-        """Auto-detect: groq (free) is preferred over mistral (paid)."""
+    def test_dgx_default_with_groq_preferred_over_mistral(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
         monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
@@ -1034,10 +1034,10 @@ class TestGetProviderMistral:
              patch("tools.transcription_tools._HAS_OPENAI", True), \
              patch("tools.transcription_tools._HAS_MISTRAL", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "groq"
+            assert _get_provider({}) == "dgx"
 
-    def test_auto_detect_skips_mistral_without_sdk(self, monkeypatch):
-        """Auto-detect: mistral skipped when key is set but SDK is not installed."""
+    def test_dgx_default_with_skips_mistral_without_sdk(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1047,7 +1047,7 @@ class TestGetProviderMistral:
              patch("tools.transcription_tools._HAS_OPENAI", False), \
              patch("tools.transcription_tools._HAS_MISTRAL", False):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "none"
+            assert _get_provider({}) == "dgx"
 
 
 # ============================================================================
@@ -1271,8 +1271,8 @@ class TestGetProviderXAI:
         from tools.transcription_tools import _get_provider
         assert _get_provider({"provider": "xai"}) == "none"
 
-    def test_auto_detect_xai_after_mistral(self, monkeypatch):
-        """Auto-detect: xai is tried after mistral when all above are unavailable."""
+    def test_dgx_default_with_xai_after_mistral(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -1283,10 +1283,10 @@ class TestGetProviderXAI:
              patch("tools.transcription_tools._HAS_OPENAI", False), \
              patch("tools.transcription_tools._HAS_MISTRAL", False):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "xai"
+            assert _get_provider({}) == "dgx"
 
-    def test_auto_detect_mistral_preferred_over_xai(self, monkeypatch):
-        """Auto-detect: mistral is preferred over xai."""
+    def test_dgx_default_with_mistral_preferred_over_xai(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
         monkeypatch.setenv("XAI_API_KEY", "xai-test")
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
@@ -1297,17 +1297,17 @@ class TestGetProviderXAI:
              patch("tools.transcription_tools._HAS_OPENAI", False), \
              patch("tools.transcription_tools._HAS_MISTRAL", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "mistral"
+            assert _get_provider({}) == "dgx"
 
-    def test_auto_detect_no_key_returns_none(self, monkeypatch):
-        """Auto-detect: xai skipped when no key is set."""
+    def test_dgx_default_with_no_key_returns_none(self, monkeypatch):
+        """Installed providers and keys never change the DecisionData default."""
         monkeypatch.delenv("XAI_API_KEY", raising=False)
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", False), \
              patch("tools.transcription_tools._has_local_command", return_value=False), \
              patch("tools.transcription_tools._HAS_OPENAI", False), \
              patch("tools.transcription_tools._HAS_MISTRAL", False):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "none"
+            assert _get_provider({}) == "dgx"
 
 
 # ============================================================================

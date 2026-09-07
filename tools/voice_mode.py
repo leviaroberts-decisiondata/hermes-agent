@@ -786,6 +786,46 @@ def is_whisper_hallucination(transcript: str) -> bool:
 # ============================================================================
 # STT dispatch
 # ============================================================================
+def finish_recording(wav_path: Optional[str], success: bool) -> Optional[str]:
+    """Remove completed/silent captures; keep failures outside the temp-file sweeper.
+
+    Returns the retained path so callers can expose it. A failed save leaves the
+    original untouched. No background retry queue or successful-audio archive.
+    """
+    if not wav_path or not os.path.isfile(wav_path):
+        return None
+    try:
+        empty = os.path.getsize(wav_path) == 0
+    except OSError:
+        logger.warning("Could not inspect voice capture; original retained at %s", wav_path)
+        return wav_path
+    if success or empty:
+        try:
+            os.unlink(wav_path)
+        except OSError:
+            logger.warning("Could not remove completed voice capture: %s", wav_path)
+        return None
+    retained = None
+    try:
+        from hermes_constants import get_hermes_dir
+        folder = get_hermes_dir("cache/audio", "audio_cache") / "failed-recordings"
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, retained = tempfile.mkstemp(prefix="recording-", suffix=os.path.splitext(wav_path)[1], dir=folder)
+        with os.fdopen(fd, "wb") as dest, open(wav_path, "rb") as source:
+            shutil.copyfileobj(source, dest)
+        os.unlink(wav_path)
+    except OSError:
+        if retained:
+            try:
+                os.unlink(retained)
+            except OSError:
+                pass
+        retained = wav_path
+        logger.warning("Could not save failed recording; original retained at %s", retained)
+    logger.warning("Voice transcription failed; recording retained at %s", retained)
+    return retained
+
+
 def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str, Any]:
     """Transcribe a WAV recording using the existing Whisper pipeline.
 
