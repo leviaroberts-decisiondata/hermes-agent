@@ -56,6 +56,9 @@ def _build_agent(shared_client=None):
     agent.model = "gpt-5-codex"
     agent.log_prefix = ""
     agent.quiet_mode = True
+    # __new__ bypasses the DD execution-budget defaults from __init__.
+    agent.execution_deadline = None
+    agent._closeout_active = False
     agent._interrupt_requested = False
     agent._interrupt_message = None
     agent._client_lock = threading.RLock()

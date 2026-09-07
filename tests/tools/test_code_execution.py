@@ -277,8 +277,9 @@ else:
     print(f"OK {N}/{N}")
 '''
 
-        def slow_mock(function_name, function_args, task_id=None, user_task=None):
+        def slow_mock(function_name, function_args, task_id=None, user_task=None, caller_origin=""):
             import time as _t
+            self.assertEqual(caller_origin, "system_b")
             if function_name == "terminal":
                 _t.sleep(0.05)  # ensure requests overlap on the socket
                 cmd = function_args.get("command", "")
@@ -294,6 +295,7 @@ else:
                 code=code,
                 task_id="test-concurrent",
                 enabled_tools=list(SANDBOX_ALLOWED_TOOLS),
+                caller_origin="system_b",
             )
         result = json.loads(raw)
         self.assertEqual(result["status"], "success", msg=result)

@@ -91,6 +91,10 @@ class TestPreToolCheck:
         # Create a minimal mock agent with _interrupt_requested = True
         agent = MagicMock()
         agent._interrupt_requested = True
+        # This is a user interrupt, not an active execution closeout. Unset
+        # MagicMock attributes would otherwise look truthy to the DD fuse.
+        agent._closeout_active = False
+        agent.execution_deadline = None
         agent.log_prefix = ""
         agent._persist_session = MagicMock()
 
