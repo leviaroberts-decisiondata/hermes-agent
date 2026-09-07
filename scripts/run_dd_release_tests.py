@@ -15,6 +15,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED = (
+    "tests/scripts/test_dd_release_gate.py",
     "tests/test_dd_obs_config.py",
     "tests/test_route_to_lane_shared_home.py",
     "tests/test_route_to_lane_mission_parity.py",
@@ -67,24 +68,13 @@ def main():
     paths = set(REQUIRED)
     for pattern in PATTERNS:
         paths.update(str(path.relative_to(ROOT)) for path in ROOT.glob(pattern))
-    env = os.environ.copy()
-    credential_suffixes = (
-        "_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS",
-        "_ACCESS_KEY", "_PRIVATE_KEY", "_APP_SECRET", "_CLIENT_SECRET",
-        "_CORP_SECRET", "_AES_KEY",
-    )
-    behavior_names = {
-        "FAL_KEY", "HERMES_YOLO_MODE", "HERMES_INTERACTIVE", "HERMES_QUIET",
-        "HERMES_TOOL_PROGRESS", "HERMES_TOOL_PROGRESS_MODE", "HERMES_MAX_ITERATIONS",
-        "HERMES_GATEWAY_SESSION", "HERMES_PLATFORM", "HERMES_INFERENCE_PROVIDER",
-        "HERMES_MANAGED", "HERMES_DEV", "HERMES_CONTAINER",
-        "HERMES_EPHEMERAL_SYSTEM_PROMPT", "HERMES_TIMEZONE", "HERMES_REDACT_SECRETS",
-        "HERMES_BACKGROUND_NOTIFICATIONS", "HERMES_EXEC_ASK", "HERMES_HOME_MODE",
-        "DD_MISSION_ID", "DD_MISSION_PURPOSE", "DD_MISSION_REMEDIATION_DEPTH",
-    }
-    for name in list(env):
-        if name.endswith(credential_suffixes) or name.startswith("HERMES_SESSION_") or name in behavior_names:
-            del env[name]
+    # Start from OS essentials instead of a credential-name denylist: collection
+    # happens before conftest's per-test cleanup, and auth-store overrides and
+    # application-specific key names must never reach that stage.
+    env = {name: os.environ[name] for name in (
+        "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP",
+        "SHELL", "SYSTEMROOT", "COMSPEC",
+    ) if name in os.environ}
     env.update(TZ="UTC", LANG="C.UTF-8", LC_ALL="C.UTF-8", PYTHONHASHSEED="0")
     # Unit-test telemetry must not be posted to the running platform.
     for name in (
