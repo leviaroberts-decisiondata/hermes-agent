@@ -7408,6 +7408,9 @@ class HermesCLI:
             idx = 2  # default to "all"
         self.tool_progress_mode = cycle[(idx + 1) % len(cycle)]
         self.verbose = self.tool_progress_mode == "verbose"
+        from run_agent import _set_console_quiet_logging
+        logging.getLogger().setLevel(logging.DEBUG if self.verbose else logging.INFO)
+        _set_console_quiet_logging(not self.verbose)
 
         if self.agent:
             self.agent.verbose_logging = self.verbose
@@ -7813,8 +7816,8 @@ class HermesCLI:
                 logging.getLogger(noisy).setLevel(logging.WARNING)
         else:
             logging.getLogger().setLevel(logging.INFO)
-            for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
-                logging.getLogger(quiet_logger).setLevel(logging.ERROR)
+        from run_agent import _set_console_quiet_logging
+        _set_console_quiet_logging(not self.verbose)
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""

@@ -537,8 +537,17 @@ class TestComponentPrefixes:
     """COMPONENT_PREFIXES covers the expected components."""
 
     def test_gateway_prefix(self):
-        assert "gateway" in hermes_logging.COMPONENT_PREFIXES
-        assert ("gateway",) == hermes_logging.COMPONENT_PREFIXES["gateway"]
+        gateway_filter = hermes_logging._ComponentFilter(
+            hermes_logging.COMPONENT_PREFIXES["gateway"]
+        )
+        # DD capability decisions belong with gateway events; tool noise does not.
+        for name in ("gateway.run", "hermes.capability"):
+            assert gateway_filter.filter(logging.LogRecord(
+                name, logging.INFO, "", 0, "event", (), None,
+            ))
+        assert not gateway_filter.filter(logging.LogRecord(
+            "tools.terminal_tool", logging.INFO, "", 0, "event", (), None,
+        ))
 
     def test_agent_prefix(self):
         prefixes = hermes_logging.COMPONENT_PREFIXES["agent"]

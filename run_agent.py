@@ -60,6 +60,30 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 
 
+_QUIET_LOG_NAMESPACES = ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli')
+
+
+def _quiet_console_record(record):
+    return record.levelno >= logging.ERROR or not any(
+        record.name == name or record.name.startswith(name + '.')
+        for name in _QUIET_LOG_NAMESPACES
+    )
+
+
+def _set_console_quiet_logging(quiet: bool):
+    """Suppress console noise without dropping INFO/WARNING from file logs.
+
+    WTS f04462ce: namespace logger levels suppress records before every handler.
+    Keep the filter on console handlers only, and remove it when verbosity rises.
+    """
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
+            if quiet:
+                handler.addFilter(_quiet_console_record)
+            else:
+                handler.removeFilter(_quiet_console_record)
+
+
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
@@ -1247,6 +1271,31 @@ def _qwen_portal_headers() -> dict:
     }
 
 
+def _fallback_candidate_allowed(provider: str, model: str) -> bool:
+    """Keep startup and in-turn fallback admission consistent with DD policy."""
+    provider = (provider or "").strip().lower()
+    if provider == "copilot-acp" and os.getenv(
+        "HERMES_ENABLE_COPILOT_ACP_FALLBACK", ""
+    ).strip().lower() not in {"1", "true", "yes", "on"}:
+        logging.warning("Skipping copilot-acp fallback: explicit enablement is required")
+        return False
+    if provider in {"copilot", "copilot-acp"}:
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            model = normalize_model_for_provider(model, provider)
+        except Exception:
+            pass
+        try:
+            from hermes_cli.models import provider_model_ids
+            supported = {str(item).strip() for item in provider_model_ids(provider) if str(item).strip()}
+        except Exception:
+            supported = set()
+        if supported and model not in supported:
+            logging.warning("Skipping fallback %s via %s: model is not in provider catalog", model, provider)
+            return False
+    return True
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -1660,22 +1709,10 @@ class AIAgent:
 
         if self.verbose_logging:
             setup_verbose_logging()
+        _set_console_quiet_logging(self.quiet_mode and not self.verbose_logging)
+        if self.verbose_logging:
             logger.info("Verbose logging enabled (third-party library logs suppressed)")
-        else:
-            if self.quiet_mode:
-                # In quiet mode (CLI default), suppress all tool/infra log
-                # noise on the *console*. The TUI has its own rich display
-                # for status; logger INFO/WARNING messages just clutter it.
-                # File handlers (agent.log, errors.log) still capture everything.
-                for quiet_logger in [
-                    'tools',               # all tools.* (terminal, browser, web, file, etc.)
-                    'run_agent',            # agent runner internals
-                    'trajectory_compressor',
-                    'cron',                 # scheduler (only relevant in daemon mode)
-                    'hermes_cli',           # CLI helpers
-                ]:
-                    logging.getLogger(quiet_logger).setLevel(logging.ERROR)
-        
+
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
         self._stream_callback = None
@@ -1893,12 +1930,21 @@ class AIAgent:
                             _fb_entries = [fallback_model]
                         _fb_resolved = False
                         for _fb in _fb_entries:
+                            if not _fallback_candidate_allowed(_fb["provider"], _fb["model"]):
+                                continue
                             _fb_client, _fb_model = resolve_provider_client(
                                 _fb["provider"], model=_fb["model"], raw_codex=True,
                                 explicit_base_url=_fb.get("base_url"),
                                 explicit_api_key=_fb.get("api_key"),
                             )
                             if _fb_client is not None:
+                                self._fallback_events = [{
+                                    "from_model": self.model,
+                                    "to_model": _fb_model or _fb["model"],
+                                    "to_provider": _fb["provider"],
+                                    "reason": "primary_credentials_unavailable",
+                                    "at": datetime.now().isoformat(),
+                                }]
                                 self.provider = _fb["provider"]
                                 self.model = _fb_model or _fb["model"]
                                 self._fallback_activated = True
@@ -1982,7 +2028,7 @@ class AIAgent:
         # activation this session — a degraded turn must never be visually
         # identical to a good one. Never reset on primary-restore; this is a
         # history of what happened, not current state.
-        self._fallback_events: list = []
+        self._fallback_events: list = getattr(self, "_fallback_events", [])
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -2304,6 +2350,10 @@ class AIAgent:
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+        # WTS 709ed4b0: opt in per home; ordinary/main summarization stays unchanged.
+        self._compression_prune_before_summary = str(
+            _compression_cfg.get("prune_before_summary", False)
+        ).lower() in ("true", "1", "yes")
 
         # Read optional explicit context_length override for the auxiliary
         # compression model. Custom endpoints often cannot report this via
@@ -8302,12 +8352,8 @@ class AIAgent:
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
             return self._try_activate_fallback()  # skip invalid, try next
-        if fb_provider == "copilot-acp" and os.getenv("HERMES_ENABLE_COPILOT_ACP_FALLBACK", "").strip().lower() not in {"1", "true", "yes", "on"}:
-            logging.warning(
-                "Skipping copilot-acp fallback because it is not explicitly verified/enabled; "
-                "set HERMES_ENABLE_COPILOT_ACP_FALLBACK=1 after validating the local ACP command."
-            )
-            return self._try_activate_fallback()  # try next in chain
+        if not _fallback_candidate_allowed(fb_provider, fb_model):
+            return self._try_activate_fallback()
 
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()
@@ -8343,24 +8389,6 @@ class AIAgent:
                 fb_model = normalize_model_for_provider(fb_model, fb_provider)
             except Exception:
                 pass
-            if fb_provider in {"copilot", "copilot-acp"}:
-                try:
-                    from hermes_cli.models import provider_model_ids
-
-                    supported_models = {
-                        str(model_id).strip()
-                        for model_id in provider_model_ids(fb_provider)
-                        if str(model_id).strip()
-                    }
-                except Exception:
-                    supported_models = set()
-                if supported_models and fb_model not in supported_models:
-                    logging.warning(
-                        "Skipping fallback %s via %s: model is not in provider catalog",
-                        fb_model,
-                        fb_provider,
-                    )
-                    return self._try_activate_fallback()  # try next in chain
 
             # Determine api_mode from provider / base URL / model
             fb_api_mode = "chat_completions"
@@ -9896,13 +9924,16 @@ class AIAgent:
         """
         return self.api_mode != "codex_responses"
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None) -> tuple:
+    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", focus_topic: str = None, allow_prune_only: bool = False) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
         Args:
             focus_topic: Optional focus string for guided compression — the
                 summariser will prioritise preserving information related to
                 this topic.  Inspired by Claude Code's ``/compact <focus>``.
+            allow_prune_only: Automatic threshold calls may skip summarization
+                when configured pruning suffices. Manual and error-recovery
+                calls leave this False so a rough estimate cannot prevent them.
 
         Returns:
             (compressed_messages, new_system_prompt) tuple
@@ -9922,12 +9953,35 @@ class AIAgent:
             except Exception:
                 pass
 
-        try:
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
-        except TypeError:
-            # Plugin context engine with strict signature that doesn't accept
-            # focus_topic — fall back to calling without it.
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+        # Only the built-in engine implements prune-only compression. Plugins
+        # retain their existing contract (including the legacy focus fallback).
+        prune_only = (
+            allow_prune_only and not focus_topic
+            and getattr(self, "_compression_prune_before_summary", False)
+            and type(self.context_compressor) is ContextCompressor
+        )
+        if prune_only:
+            overhead = estimate_request_tokens_rough(
+                [], system_prompt=self._cached_system_prompt or "",
+                tools=self.tools or None,
+            )
+            compressed = self.context_compressor.compress(
+                messages, current_tokens=approx_tokens, focus_topic=focus_topic,
+                request_overhead_tokens=overhead, prune_only_if_fits=True,
+            )
+        else:
+            try:
+                compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+            except TypeError:
+                # Older plugin context engines may not accept focus_topic.
+                compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+
+        if prune_only and self.context_compressor._last_compression_skipped is True:
+            logger.info(
+                "Compression skipped for session %s: pruning sufficed; "
+                "session and system prompt retained.", self.session_id,
+            )
+            return compressed, self._cached_system_prompt
 
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
         if summary_error:
@@ -11722,7 +11776,7 @@ class AIAgent:
                     _orig_len = len(messages)
                     messages, active_system_prompt = self._compress_context(
                         messages, system_message, approx_tokens=_preflight_tokens,
-                        task_id=effective_task_id,
+                        task_id=effective_task_id, allow_prune_only=True,
                     )
                     if len(messages) >= _orig_len:
                         break  # Cannot compress further
@@ -14544,12 +14598,13 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
                             approx_tokens=self.context_compressor.last_prompt_tokens,
-                            task_id=effective_task_id,
+                            task_id=effective_task_id, allow_prune_only=True,
                         )
                         # Compression created a new session — clear history so
                         # _flush_messages_to_session_db writes compressed messages
                         # to the new session (see preflight compression comment).
-                        conversation_history = None
+                        if getattr(_compressor, "_last_compression_skipped", False) is not True:
+                            conversation_history = None
                     
                     # Save session log incrementally (so progress is visible even if interrupted)
                     self._session_messages = messages
