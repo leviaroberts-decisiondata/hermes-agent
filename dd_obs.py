@@ -273,10 +273,13 @@ def log_generation(
     if run_id:
         payload["run_id"] = run_id
     if provider:
-        # provider is not a top-level GenerationRequest field; encode in cwd-adjacent
-        # fields the schema accepts. The agent_class + ingest_source is enough to
-        # identify Hermes; provider lives on agent_runs (set by /log_spawn).
-        pass
+        # provider IS a top-level GenerationRequest field (additive since the
+        # phase-2 migration: mc-api sql/phase2_local_inference_observability.sql,
+        # GenerationRequest.provider in ingest_api.py). An earlier comment here
+        # claimed otherwise from a stale phase-1 read and DISCARDED the value —
+        # 7,217 hermes-gateway generations in one 30-day window carried
+        # provider NULL because of it (WTS 298bdde6 baseline).
+        payload["provider"] = provider
     if completed_at:
         payload["completed_at"] = completed_at
     if latency_ms is not None:
@@ -340,6 +343,11 @@ def log_generation_sync(
     }
     if run_id:
         payload["run_id"] = run_id
+    if provider:
+        # Same contract as log_generation above (WTS 298bdde6): provider is a
+        # real GenerationRequest field; this sync variant accepted the kwarg
+        # and silently never sent it.
+        payload["provider"] = provider
     if completed_at:
         payload["completed_at"] = completed_at
     if latency_ms is not None:

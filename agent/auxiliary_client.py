@@ -3259,7 +3259,7 @@ def _validate_llm_response(response: Any, task: str = None) -> Any:
     return response
 
 
-def call_llm(
+def _call_llm_impl(
     task: str = None,
     *,
     provider: str = None,
@@ -3593,7 +3593,7 @@ def extract_content_or_reasoning(response) -> str:
     return ""
 
 
-async def async_call_llm(
+async def _async_call_llm_impl(
     task: str = None,
     *,
     provider: str = None,
@@ -3817,3 +3817,115 @@ async def async_call_llm(
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
         raise
+
+
+# ── Auxiliary telemetry (WTS 298bdde6 W3) ────────────────────────────────────
+# The auxiliary subsystem (compression, vision, session_search,
+# title_generation, approval, web_extract, skills_hub, mcp) fires on every
+# long Hermes session and was fully invisible in the observability store —
+# the 2026-09-01 fleet census's highest-value uncaptured class. call_llm /
+# async_call_llm are the single chokepoint, so the public names are now thin
+# wrappers that emit one fire-and-forget /log_api_call per call. Telemetry
+# must NEVER delay, block, or fail the provider call: emission runs in a
+# daemon thread with a 3s timeout and swallows every error.
+
+_AUX_OBS_URL = os.environ.get(
+    "DECISIONDATA_OBSERVABILITY_URL", "http://127.0.0.1:8511"
+).rstrip("/") + "/log_api_call"
+
+_AUX_PROVIDER_PREFIXES = (
+    ("claude", "anthropic"),
+    ("gpt", "openai"),
+    ("o1", "openai"),
+    ("o3", "openai"),
+    ("codex", "openai"),
+    ("gemini", "google"),
+)
+
+
+def _aux_provider_label(resolved_provider, model_str):
+    """Best-known provider label. Explicit resolution wins; else a
+    conservative model-prefix map; else 'unknown' — NEVER a false default
+    (the ingest field defaults to 'anthropic' when omitted)."""
+    if resolved_provider and resolved_provider not in ("custom", "auto"):
+        return str(resolved_provider)
+    m = (model_str or "").lower()
+    for prefix, label in _AUX_PROVIDER_PREFIXES:
+        if m.startswith(prefix):
+            return label
+    return "unknown"
+
+
+def _emit_aux_telemetry(task, provider, model, duration_ms, response, error):
+    # Under pytest the client is a MagicMock and two mock 'model' strings
+    # already leaked into live llm_calls — tests must never POST into the
+    # observability store (same contract as the runner's recording emitters).
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return
+
+    def _post():
+        try:
+            import urllib.request as _rq
+            usage = getattr(response, "usage", None)
+            in_tok = int(getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0)
+            out_tok = int(getattr(usage, "completion_tokens", 0) or getattr(usage, "output_tokens", 0) or 0)
+            details = getattr(usage, "prompt_tokens_details", None)
+            cache_read = int(getattr(details, "cached_tokens", 0) or getattr(usage, "cache_read_input_tokens", 0) or 0)
+            cache_write = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+            model_str = str(getattr(response, "model", None) or model or "unknown")
+            body = json.dumps({
+                "service": "hermes-auxiliary",
+                "action": str(task or "call"),
+                "model": model_str,
+                "provider": _aux_provider_label(provider, model_str),
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                # Cost deliberately 0: auxiliary spans many providers with
+                # per-provider pricing owned by readers; tokens are the data.
+                "cost_usd": 0.0,
+                "duration_ms": int(duration_ms),
+                "status": "error" if error else "ok",
+                "error_msg": (str(error)[:300] or None) if error else None,
+            }).encode()
+            req = _rq.Request(_AUX_OBS_URL, data=body,
+                              headers={"Content-Type": "application/json"}, method="POST")
+            _rq.urlopen(req, timeout=3).read()
+        except Exception:
+            pass  # instrumentation must never surface
+
+    try:
+        threading.Thread(target=_post, daemon=True).start()
+    except Exception:
+        pass
+
+
+def call_llm(task: str = None, **kwargs) -> Any:
+    """Public entry — see _call_llm_impl for full documentation."""
+    _p, _m, _b, _k, _mode = _resolve_task_provider_model(
+        task, kwargs.get("provider"), kwargs.get("model"),
+        kwargs.get("base_url"), kwargs.get("api_key"))
+    _t0 = time.monotonic()
+    try:
+        resp = _call_llm_impl(task, **kwargs)
+    except Exception as e:
+        _emit_aux_telemetry(task, _p, _m, (time.monotonic() - _t0) * 1000, None, e)
+        raise
+    _emit_aux_telemetry(task, _p, _m, (time.monotonic() - _t0) * 1000, resp, None)
+    return resp
+
+
+async def async_call_llm(task: str = None, **kwargs) -> Any:
+    """Public async entry — see _call_llm_impl for full documentation."""
+    _p, _m, _b, _k, _mode = _resolve_task_provider_model(
+        task, kwargs.get("provider"), kwargs.get("model"),
+        kwargs.get("base_url"), kwargs.get("api_key"))
+    _t0 = time.monotonic()
+    try:
+        resp = await _async_call_llm_impl(task, **kwargs)
+    except Exception as e:
+        _emit_aux_telemetry(task, _p, _m, (time.monotonic() - _t0) * 1000, None, e)
+        raise
+    _emit_aux_telemetry(task, _p, _m, (time.monotonic() - _t0) * 1000, resp, None)
+    return resp
