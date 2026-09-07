@@ -903,14 +903,18 @@ def _build_hermes_context_usage_payload(
     *,
     canonical_usage: Any,
     model: str,
+    context_length: Optional[int] = None,
+    compression_threshold: Optional[int] = None,
+    compression_enabled: bool = True,
 ) -> Dict[str, Any]:
     """Build the MC `hermes_context_usage` payload from a normalised usage object.
 
     Total context tokens is the full provider-reported prefill the model saw:
     ``input_tokens + cache_read_tokens + cache_write_tokens``. Output tokens are
     recorded in ``components`` for debugging but excluded from the bar count.
-    Limit/floor come from the same env vars mc-api reads, so a single source of
-    truth controls bar scale on both sides.
+    The active context engine supplies the model budget and compression threshold.
+    Legacy callers retain environment-based display limits, explicitly labeled
+    as fallback rather than authoritative runtime capacity.
     """
     from datetime import datetime as _dt, timezone as _tz
 
@@ -920,8 +924,19 @@ def _build_hermes_context_usage_payload(
     _cache_write = int(getattr(canonical_usage, "cache_write_tokens", 0) or 0)
     total = _input + _cache_read + _cache_write
 
-    bar_limit = int(os.environ.get("HERMES_CONTEXT_LIMIT", 400_000))
-    floor = int(os.environ.get("HERMES_CONTEXT_FLOOR", 320_000))
+    runtime_budget = isinstance(context_length, int) and not isinstance(context_length, bool) and context_length > 0
+    threshold = None
+    if runtime_budget:
+        bar_limit = context_length
+        if (compression_enabled and isinstance(compression_threshold, int)
+                and not isinstance(compression_threshold, bool) and compression_threshold > 0):
+            threshold = min(compression_threshold, bar_limit)
+        floor = threshold if threshold is not None else max(1, int(bar_limit * 0.8))
+        budget_source = "active_context_engine"
+    else:
+        bar_limit = int(os.environ.get("HERMES_CONTEXT_LIMIT", 400_000))
+        floor = int(os.environ.get("HERMES_CONTEXT_FLOOR", 320_000))
+        budget_source = "legacy_display_fallback"
     pct = round(total / bar_limit * 100, 2) if bar_limit else 0.0
     floor_pct = round(floor / bar_limit * 100, 2) if bar_limit else 0.0
     if total >= floor:
@@ -942,6 +957,8 @@ def _build_hermes_context_usage_payload(
         "found": True,
         "estimated": False,
         "source": "provider_usage",
+        "budget_source": budget_source,
+        "compression_threshold": threshold,
         "model": model or "",
         "updated_at": _dt.now(tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "components": {
@@ -4829,7 +4846,7 @@ class AIAgent:
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
-    
+
     def _write_deadline_marker(self, name: str) -> None:
         """Drop a deadline lifecycle marker into the supervising run_dir.
 
@@ -12803,6 +12820,9 @@ class AIAgent:
                             self._last_context_usage = _build_hermes_context_usage_payload(
                                 canonical_usage=canonical_usage,
                                 model=self.model,
+                                context_length=getattr(self.context_compressor, "context_length", None),
+                                compression_threshold=getattr(self.context_compressor, "threshold_tokens", None),
+                                compression_enabled=self.compression_enabled,
                             )
                         except Exception:
                             pass  # never block the agent loop
