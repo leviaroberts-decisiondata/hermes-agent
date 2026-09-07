@@ -114,7 +114,12 @@ def _get_subagent_approval_callback():
 # toolset to request explicitly — the correct mechanism for nested
 # delegation is role='orchestrator', which re-adds "delegation" in
 # _build_child_agent regardless of this exclusion.
-_EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "moa", "rl"})
+# "p1-dispatch" (route_to_lane/wts_bind/chain_status) is excluded alongside
+# "delegation" (2026-06-16 split): these tools were members of "delegation"
+# before the split, so excluding p1-dispatch preserves the prior behavior —
+# delegated sub-agents are not advertised/granted lane-dispatch capability
+# (separation of duties: only the parent P1 routes to lanes).
+_EXCLUDED_TOOLSET_NAMES = frozenset({"debugging", "safe", "delegation", "p1-dispatch", "moa", "rl"})
 _SUBAGENT_TOOLSETS = sorted(
     name
     for name, defn in TOOLSETS.items()
@@ -384,6 +389,45 @@ def _get_child_timeout() -> float:
         except (TypeError, ValueError):
             pass
     return float(DEFAULT_CHILD_TIMEOUT)
+
+
+def _get_closeout_fraction() -> float:
+    """Fraction of the child's hard budget before the closeout fuse trips.
+
+    delegation.closeout_fraction (config) / DELEGATION_CLOSEOUT_FRACTION
+    (env); default 0.8 — i.e. the approved "mandatory closeout at 8 min of
+    a 10-min ceiling".  Clamped to [0.5, 0.95] so a bad value can neither
+    disable investigation nor erase the closeout window.
+    """
+    cfg = _load_config()
+    val = cfg.get("closeout_fraction")
+    if val is None:
+        val = os.getenv("DELEGATION_CLOSEOUT_FRACTION")
+    try:
+        frac = float(val) if val is not None else 0.8
+    except (TypeError, ValueError):
+        frac = 0.8
+    return min(0.95, max(0.5, frac))
+
+
+def _get_collect_grace_secs() -> float:
+    """Extra seconds the parent waits PAST the child's hard deadline to
+    collect the structured result the deadline fuse forces the child to
+    produce.  This is collection slack, not extra work budget — the child
+    stops on its own clock; racing it at exactly t=deadline discards the
+    closeout synthesis it just wrote (the 2026-07-09 delegate lost 11
+    calls of work exactly this way).  delegation.collect_grace_seconds /
+    DELEGATION_COLLECT_GRACE_SECONDS; default 30, clamped to [5, 120].
+    """
+    cfg = _load_config()
+    val = cfg.get("collect_grace_seconds")
+    if val is None:
+        val = os.getenv("DELEGATION_COLLECT_GRACE_SECONDS")
+    try:
+        grace = float(val) if val is not None else 30.0
+    except (TypeError, ValueError):
+        grace = 30.0
+    return min(120.0, max(5.0, grace))
 
 
 def _get_max_spawn_depth() -> int:
@@ -1434,6 +1478,25 @@ def _run_single_child(
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
         child_timeout = _get_child_timeout()
+        # ── Execution-deadline contract (WTS ac4bcb05) ─────────────────
+        # The parent supervisor owns ONE absolute deadline for the child:
+        # hard ceiling = child_timeout (default 600s = the approved 10-min
+        # personal ceiling), closeout fuse at closeout_fraction (default
+        # 0.8 ⇒ 8 min).  The child is in-process, so the contract is
+        # handed over as an attribute; its run loop stops investigation at
+        # the fuse and returns a final-or-PARTIAL result before the hard
+        # deadline.  The parent's future.result() below therefore normally
+        # completes BEFORE child_timeout; the extra collection grace only
+        # covers a child whose last in-flight call is being torn down.
+        _closeout_fraction = _get_closeout_fraction()
+        try:
+            from agent.deadline import ExecutionDeadline as _ExecutionDeadline
+            child.execution_deadline = _ExecutionDeadline.from_budget(
+                child_timeout, closeout_fraction=_closeout_fraction
+            )
+        except Exception:
+            logger.warning("Could not attach execution deadline to subagent %d", task_index)
+        _collect_grace = _get_collect_grace_secs()
         _timeout_executor = ThreadPoolExecutor(
             max_workers=1,
             # Install a non-interactive approval callback in the worker thread
@@ -1456,7 +1519,7 @@ def _run_single_child(
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
-            result = _child_future.result(timeout=child_timeout)
+            result = _child_future.result(timeout=child_timeout + _collect_grace)
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -1537,10 +1600,41 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
+            # ── Partial-evidence harvest (WTS ac4bcb05 AC5) ────────────
+            # The 2026-07-09 delegate discarded 11 completed calls with
+            # summary=None.  Even when the worker thread never returns,
+            # the child agent object is in-process — harvest what exists
+            # so the parent (and the user) receive truthful partial
+            # evidence instead of a bare timeout.
+            partial_evidence: Dict[str, Any] = {}
+            try:
+                _act = child.get_activity_summary()
+                if isinstance(_act, dict):
+                    partial_evidence["api_calls"] = _act.get("api_call_count")
+                    partial_evidence["last_activity"] = _act.get(
+                        "last_activity_description"
+                    ) or _act.get("current_tool")
+            except Exception:
+                pass
+            try:
+                _streamed = getattr(child, "_current_streamed_assistant_text", "") or ""
+                if _streamed.strip():
+                    partial_evidence["last_assistant_text"] = _streamed[-4000:]
+            except Exception:
+                pass
+            try:
+                _sid = getattr(child, "session_id", None)
+                if _sid:
+                    partial_evidence["child_session_id"] = str(_sid)
+            except Exception:
+                pass
+
             return {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
+                "terminal_state": "timed_out" if is_timeout else "failed",
                 "summary": None,
+                "partial_evidence": partial_evidence or None,
                 "error": _err,
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
@@ -1567,15 +1661,41 @@ def _run_single_child(
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
 
+        # Fleet-repair 0.2 (WTS 7e1d32e9): "has a summary" is not "completed".
+        # _handle_max_iterations ALWAYS produces a summary, so a child that ran
+        # out of budget mid-task reported completed/green-check; a hard API
+        # failure's error text also counted as a summary. Status now follows
+        # how the run actually ended.
         if interrupted:
             status = "interrupted"
-        elif summary:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif result.get("failed"):
+            # final_response is the ERROR TEXT of a hard API failure, not output.
+            status = "failed"
+        elif summary and completed:
             status = "completed"
+        elif summary:
+            # Budget exhausted (max_iterations): usable output exists but the
+            # task did not run to completion — a truthful PARTIAL.
+            status = "partial"
         else:
             status = "failed"
+
+        # ── Deadline projection → typed terminal state (WTS ac4bcb05) ──
+        # The child's run loop reports how it ended against the execution
+        # deadline; a closeout-forced result is a truthful PARTIAL, never
+        # presented as a full completion (AC7).
+        deadline_state = result.get("deadline_state")
+        if deadline_state == "partial" and status == "completed":
+            status = "partial"
+        terminal_state = {
+            "completed": "completed",
+            "partial": "partial",
+            "failed": "failed",
+            "interrupted": "cancelled",
+        }.get(status, "failed")
+        if deadline_state == "timed_out":
+            status = "timeout"
+            terminal_state = "timed_out"
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -1616,6 +1736,12 @@ def _run_single_child(
         # Determine exit reason
         if interrupted:
             exit_reason = "interrupted"
+        elif result.get("failed"):
+            exit_reason = "error"
+        elif deadline_state == "timed_out":
+            exit_reason = "deadline"
+        elif deadline_state == "partial":
+            exit_reason = "closeout"
         elif completed:
             exit_reason = "completed"
         else:
@@ -1629,10 +1755,14 @@ def _run_single_child(
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "status": status,
+            "terminal_state": terminal_state,
+            "closeout_entered": bool(result.get("closeout_entered")),
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            # 0.4: surface any mid-run model degradation on the child's entry.
+            "fallback_events": list(getattr(child, "_fallback_events", None) or []),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2097,7 +2227,10 @@ def delegate_task(
                     )
                     dur = entry.get("duration_seconds", 0)
                     status = entry.get("status", "?")
-                    icon = "✓" if status == "completed" else "✗"
+                    # 0.2: a budget-exhausted child must not render a green
+                    # check — partial gets its own glyph.
+                    icon = ("✓" if status == "completed"
+                            else "◐" if status == "partial" else "✗")
                     remaining = n_tasks - completed_count
                     completion_line = f"{icon} [{idx+1}/{n_tasks}] {label}  ({dur}s)"
                     if spinner_ref:

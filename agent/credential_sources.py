@@ -232,7 +232,8 @@ def _clear_auth_store_provider(provider: str) -> bool:
         providers_dict = auth_store.get("providers")
         if isinstance(providers_dict, dict) and provider in providers_dict:
             del providers_dict[provider]
-            _save_auth_store(auth_store)
+            # Explicit credential removal — permitted to empty the providers map.
+            _save_auth_store(auth_store, allow_provider_clear=True)
             return True
     return False
 

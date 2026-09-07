@@ -678,6 +678,58 @@ class TestChatCompletionsEndpoint:
                 assert "Hello!" in body
 
     @pytest.mark.asyncio
+    async def test_stream_direct_caller_owns_decisiondata_lifecycle(self, adapter):
+        """Direct stream=true calls must appear as live MC Hermes runs.
+
+        Without caller-supplied X-DD-Run-Id, api_server owns /log_spawn,
+        keepalive, per-call generation metadata, and /log_complete even for
+        streaming completions. Otherwise MC Live has zero running Hermes rows
+        while the agent is actively working.
+        """
+        keepalive = MagicMock()
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                assert kwargs.get("dd_obs_meta") is not None
+                assert kwargs["dd_obs_meta"]["run_id"]
+                assert kwargs["dd_obs_meta"]["session_key"].startswith("agent:hermes:api_server:")
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("Hello")
+                return (
+                    {"final_response": "Hello", "messages": [], "api_calls": 1},
+                    {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                )
+
+            with (
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+                patch("dd_obs.log_spawn") as log_spawn,
+                patch("dd_obs.KeepaliveLoop", return_value=keepalive) as keepalive_cls,
+                patch("dd_obs.log_complete") as log_complete,
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+
+                log_spawn.assert_called_once()
+                keepalive_cls.assert_called_once()
+                keepalive.start.assert_called_once()
+                keepalive.stop.assert_called_once()
+                log_complete.assert_called_once()
+                complete_kwargs = log_complete.call_args.kwargs
+                assert complete_kwargs["status"] == "done"
+                assert complete_kwargs["input_tokens"] == 7
+                assert complete_kwargs["output_tokens"] == 3
+
+    @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
         """Idle SSE streams should send keepalive comments while tools run silently."""
         import asyncio
@@ -2569,6 +2621,331 @@ class TestSessionIdHeader:
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
 
+    @pytest.mark.asyncio
+    async def test_resume_follows_compression_fork(self, auth_adapter):
+        """A resume of a compressed/forked session loads the child's transcript.
+
+        The history-load id is routed through resolve_resume_session_id (which
+        follows compression forks), while the new turn's writes still use the
+        caller-supplied session_id unchanged.
+        """
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        child_history = [
+            {"role": "user", "content": "msg in forked child"},
+            {"role": "assistant", "content": "reply in forked child"},
+        ]
+        mock_db = MagicMock()
+        # Parent was compressed: its messages live in the descendant child.
+        mock_db.resolve_resume_session_id.return_value = "child-session-456"
+        mock_db.get_messages_as_conversation.return_value = child_history
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "parent-session-123", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Continue"}]},
+                )
+
+            assert resp.status == 200
+            # Fork-follow was consulted with the caller-supplied id...
+            mock_db.resolve_resume_session_id.assert_called_once_with("parent-session-123")
+            # ...and the history load used the redirected child id.
+            mock_db.get_messages_as_conversation.assert_called_once_with("child-session-456")
+            call_kwargs = mock_run.call_args.kwargs
+            # History comes from the child; new-turn writes stay on the caller's id.
+            assert call_kwargs["conversation_history"] == child_history
+            assert call_kwargs["session_id"] == "parent-session-123"
+            assert resp.headers.get("X-Hermes-Session-Id") == "parent-session-123"
+
+
+# ---------------------------------------------------------------------------
+# V0 strict resume: a fabricated X-Hermes-Session-Id FAILS (default OFF)
+# ---------------------------------------------------------------------------
+class TestStrictResume:
+    """When strict_resume is enabled, resuming a session that does not exist
+    returns 404 instead of silently starting fresh. Default (off) is unchanged.
+    """
+
+    def _strict_adapter(self):
+        config = PlatformConfig(enabled=True, extra={"key": "sk-secret", "strict_resume": True})
+        return APIServerAdapter(config)
+
+    @pytest.mark.asyncio
+    async def test_default_off_unknown_session_starts_fresh(self, auth_adapter):
+        """Default (strict OFF): an unknown session id loads empty history and
+        proceeds with 200 — byte-identical to pre-V0 behavior."""
+        assert auth_adapter._strict_resume is False
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = None  # unknown session
+        mock_db.resolve_resume_session_id.return_value = "ghost"
+        mock_db.get_messages_as_conversation.return_value = []
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "OK", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "ghost", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                )
+            assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_strict_on_unknown_session_returns_404(self):
+        """Strict ON: a fabricated session id is rejected with 404 and the agent
+        is never invoked."""
+        adapter = self._strict_adapter()
+        assert adapter._strict_resume is True
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = None  # fabricated id
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "fabricated-xyz", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                )
+            assert resp.status == 404
+            body = await resp.json()
+            assert "fabricated-xyz" in body["error"]["message"]
+            mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_strict_on_known_session_resumes(self):
+        """Strict ON: a real session still resumes (history loaded, 200)."""
+        adapter = self._strict_adapter()
+        db_history = [
+            {"role": "user", "content": "stored 1"},
+            {"role": "assistant", "content": "reply 1"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "real-session"}  # exists
+        mock_db.resolve_resume_session_id.return_value = "real-session"
+        mock_db.get_messages_as_conversation.return_value = db_history
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "OK", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "real-session", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Continue"}]},
+                )
+            assert resp.status == 200
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["conversation_history"] == db_history
+            assert resp.headers.get("X-Hermes-Session-Id") == "real-session"
+
+    @pytest.mark.asyncio
+    async def test_resume_reconstructs_tool_history_same_session(self):
+        """V0 acceptance (gateway half): resuming session X reconstructs the
+        prior TOOL history into the agent turn and echoes the SAME id back —
+        not a fresh api-<hash> session. This is what 'reconstructed tool history
+        present' means at the gateway boundary the dispatcher forwards through.
+        """
+        adapter = self._strict_adapter()
+        # A transcript that includes a tool call + tool result, exactly the shape
+        # get_messages_as_conversation reconstructs for a resumed agent.
+        tool_history = [
+            {"role": "user", "content": "what's 2+2"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "calc", "arguments": "{\"x\":\"2+2\"}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "tool_name": "calc", "content": "4"},
+            {"role": "assistant", "content": "4"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "real-X"}
+        mock_db.resolve_resume_session_id.return_value = "real-X"
+        mock_db.get_messages_as_conversation.return_value = tool_history
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "8", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "real-X", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent",
+                          "messages": [{"role": "user", "content": "now double it"}]},
+                )
+            assert resp.status == 200
+            ch = mock_run.call_args.kwargs["conversation_history"]
+            # Tool history is present and reconstructed verbatim (not from request body).
+            assert ch == tool_history
+            assert any(m["role"] == "tool" for m in ch), "tool history was not reconstructed"
+            assert any(m.get("tool_calls") for m in ch), "tool_calls were not reconstructed"
+            # Same session resumed — not a fresh derived api-<hash> id.
+            echoed = resp.headers.get("X-Hermes-Session-Id")
+            assert echoed == "real-X"
+            assert not echoed.startswith("api-")
+
+    @pytest.mark.asyncio
+    async def test_strict_db_error_allows_through(self):
+        """Strict ON but the existence check raises: do NOT 404 on infra trouble —
+        fall through to the best-effort load path (200, empty history)."""
+        adapter = self._strict_adapter()
+        mock_db = MagicMock()
+        mock_db.get_session.side_effect = Exception("db down")
+        mock_db.resolve_resume_session_id.return_value = "x"
+        mock_db.get_messages_as_conversation.return_value = []
+        adapter._session_db = mock_db
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = ({"final_response": "OK", "messages": [], "api_calls": 1},
+                                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "x", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "Hi"}]},
+                )
+            assert resp.status == 200
+
+
+# ---------------------------------------------------------------------------
+# Per-request + config reasoning_effort resolution (_create_agent precedence)
+# ---------------------------------------------------------------------------
+class TestReasoningEffortResolution:
+    """_create_agent resolves reasoning_config with precedence:
+    per-request value > config agent.reasoning_effort > None (codex default).
+    """
+
+    def _make_adapter(self):
+        config = PlatformConfig(enabled=True)
+        return APIServerAdapter(config)
+
+    def _capture_reasoning_config(self, *, request_effort, config_effort):
+        """Invoke _create_agent and return the reasoning_config passed to AIAgent.
+
+        AIAgent and all heavy gateway helpers are patched so the call is a pure
+        unit test of the precedence/resolution logic.
+        """
+        from hermes_constants import parse_reasoning_effort
+
+        adapter = self._make_adapter()
+        captured = {}
+
+        def _fake_aiagent(*args, **kwargs):
+            captured["reasoning_config"] = kwargs.get("reasoning_config")
+            return MagicMock()
+
+        cfg_value = parse_reasoning_effort(config_effort) if config_effort else None
+
+        with patch("run_agent.AIAgent", side_effect=_fake_aiagent), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}), \
+             patch("gateway.run._resolve_gateway_model", return_value="gpt-5.5"), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value=set()), \
+             patch("gateway.run.GatewayRunner._load_fallback_model", return_value=None), \
+             patch("gateway.run.GatewayRunner._load_reasoning_config", return_value=cfg_value), \
+             patch.object(adapter, "_ensure_session_db", return_value=None):
+            adapter._create_agent(reasoning_effort=request_effort)
+        return captured["reasoning_config"]
+
+    def test_request_value_wins_over_config(self):
+        # request=low, config=medium → low
+        rc = self._capture_reasoning_config(request_effort="low", config_effort="medium")
+        assert rc == {"enabled": True, "effort": "low"}
+
+    def test_config_used_when_no_request_value(self):
+        # request=None, config=medium → medium
+        rc = self._capture_reasoning_config(request_effort=None, config_effort="medium")
+        assert rc == {"enabled": True, "effort": "medium"}
+
+    def test_none_when_neither_set(self):
+        # request=None, config=None → None (codex transport applies its default)
+        rc = self._capture_reasoning_config(request_effort=None, config_effort=None)
+        assert rc is None
+
+    def test_invalid_request_value_falls_through_to_config(self):
+        # request="bogus" (invalid) → ignored → config medium
+        rc = self._capture_reasoning_config(request_effort="bogus", config_effort="medium")
+        assert rc == {"enabled": True, "effort": "medium"}
+
+    def test_none_effort_disables_reasoning(self):
+        # request="none" → {"enabled": False}
+        rc = self._capture_reasoning_config(request_effort="none", config_effort="medium")
+        assert rc == {"enabled": False}
+
+
+class TestReasoningEffortRequestParsing:
+    """_handle_chat_completions extracts reasoning_effort from body or the
+    X-Hermes-Reasoning header, validates it, and threads it to _run_agent.
+    """
+
+    def _make_request(self, body, headers=None):
+        req = MagicMock()
+        req.json = AsyncMock(return_value=body)
+        req.headers = headers or {}
+        return req
+
+    async def _invoke_capture(self, body, headers=None):
+        config = PlatformConfig(enabled=True)
+        adapter = APIServerAdapter(config)
+        captured = {}
+
+        async def _fake_run_agent(*args, **kwargs):
+            captured["reasoning_effort"] = kwargs.get("reasoning_effort")
+            return ({"role": "assistant", "content": "ok"},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+
+        req = self._make_request(body, headers)
+        with patch.object(adapter, "_check_auth", return_value=None), \
+             patch.object(adapter, "_run_agent", side_effect=_fake_run_agent), \
+             patch.object(adapter, "_resolve_session_id", return_value=(None, None)) \
+                 if hasattr(adapter, "_resolve_session_id") else patch("builtins.id", side_effect=id):
+            try:
+                await adapter._handle_chat_completions(req)
+            except Exception:
+                # Response assembly past _run_agent isn't under test; the
+                # captured reasoning_effort is what matters.
+                pass
+        return captured.get("reasoning_effort")
+
+    @pytest.mark.asyncio
+    async def test_body_field_low(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"})
+        assert eff == "low"
+
+    @pytest.mark.asyncio
+    async def test_header_alt_when_no_body_field(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Hermes-Reasoning": "high"})
+        assert eff == "high"
+
+    @pytest.mark.asyncio
+    async def test_body_field_beats_header(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "low"},
+            headers={"X-Hermes-Reasoning": "high"})
+        assert eff == "low"
+
+    @pytest.mark.asyncio
+    async def test_invalid_value_ignored(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "bogus"})
+        assert eff is None
+
+    @pytest.mark.asyncio
+    async def test_absent_is_none(self):
+        eff = await self._invoke_capture(
+            {"messages": [{"role": "user", "content": "hi"}]})
+        assert eff is None
+
 
 # ---------------------------------------------------------------------------
 # X-Hermes-Session-Key header (long-term memory scoping)
@@ -2582,6 +2959,44 @@ class TestSessionKeyHeader:
     channel and rotates session_id on /new, matching the native
     gateway's session_key / session_id split.
     """
+
+    @pytest.mark.asyncio
+    async def test_rotated_transcript_keeps_memory_key_and_completes_lifecycle(self, auth_adapter):
+        """Compression rotates the transcript without losing memory scope or DD closeout."""
+        keepalive = MagicMock()
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+                patch("dd_obs.log_spawn") as log_spawn,
+                patch("dd_obs.KeepaliveLoop", return_value=keepalive),
+                patch("dd_obs.log_complete") as log_complete,
+            ):
+                mock_run.return_value = (
+                    {"final_response": "ok", "session_id": "compressed-child", "messages": []},
+                    {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Key": "webui:stable-channel",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={"messages": [{"role": "user", "content": "hi"}]},
+                )
+                assert resp.status == 200
+                assert resp.headers["X-Hermes-Session-Id"] == "compressed-child"
+                assert resp.headers["X-Hermes-Session-Key"] == "webui:stable-channel"
+                assert mock_run.call_args.kwargs["gateway_session_key"] == "webui:stable-channel"
+                run_id = mock_run.call_args.kwargs["dd_obs_meta"]["run_id"]
+                log_spawn.assert_called_once()
+                assert log_spawn.call_args.kwargs["run_id"] == run_id
+                keepalive.start.assert_called_once()
+                keepalive.stop.assert_called_once()
+                log_complete.assert_called_once_with(
+                    run_id=run_id, status="done", result_summary="ok",
+                    input_tokens=7, output_tokens=3,
+                )
 
     @pytest.mark.asyncio
     async def test_session_key_passed_to_agent_and_echoed(self, auth_adapter):
@@ -2749,4 +3164,3 @@ class TestSessionKeyHeader:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
-

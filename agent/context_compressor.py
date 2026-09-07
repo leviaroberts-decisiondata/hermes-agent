@@ -889,6 +889,19 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())
+            # Fleet-repair hardening (WTS 7e1d32e9): preservation of the
+            # obligation sections was best-effort LLM output with NO
+            # verification — nothing checked that '## Active Task' (the
+            # template's "single most important field") survived. Verify and
+            # log LOUDLY; a summary missing its obligations is how a
+            # compressed session silently forgets what it owes the user.
+            _required = ("## Active Task",)
+            _missing = [s for s in _required if s not in summary]
+            if _missing:
+                logging.error(
+                    "context compression summary DROPPED obligation section(s) "
+                    "%s — the compressed session may no longer know its active "
+                    "task. Summary len=%d.", _missing, len(summary))
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0

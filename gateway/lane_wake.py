@@ -1,0 +1,869 @@
+"""Lane-result ACTIVE WAKE bridge (WTS 331b65f8).
+
+Why this exists
+---------------
+A detached specialist-lane run is reaped by ``dd-lane-reaper`` and its closeout
+is *mirrored* into the caller's gateway session via
+``gateway.mirror.mirror_to_session`` — a PASSIVE transcript append. That mirror
+lets P1 *see* the result in history, but it does NOT trigger a new P1 reasoning
+turn: P1 only continues after an inbound event (a user message). So a lane that
+finished while P1 was idle sat un-continued until Levi nudged.
+
+This module is the ACTIVE half — kept strictly SEPARATE from the passive mirror
+(do not change ``mirror_to_session`` semantics). A lane-result producer (the
+reaper or the chain driver) calls :func:`emit_wake_event` to drop a small JSON
+event onto a durable file queue. The gateway runs a standing background drain
+(``GatewayRunner._drain_lane_wake_queue``) that consumes the queue and injects a
+REAL internal ``MessageEvent(internal=True)`` — the same proven wake path the
+in-process background-process watcher uses (``_inject_watch_notification``) — so
+P1 wakes and reconciles the result autonomously.
+
+Design invariants
+-----------------
+* PASSIVE MIRROR and ACTIVE WAKE are independent. The mirror still fires exactly
+  as before; the wake is additive and FLAG-GATED (``DD_LANE_WAKE_ENABLED``, the
+  emit side; the drain side reads the same flag). Either can be turned off.
+* IDEMPOTENT. Each event carries a stable ``idempotency_key`` (lane-run id +
+  wts_task + kind). The writer refuses to enqueue a key it has already enqueued;
+  the drain refuses to inject a key it has already processed. A reaper re-run or
+  a duplicate reap therefore never double-wakes P1 (→ never double-dispatches QA
+  or double-closes).
+* DURABLE + CROSS-PROCESS. The queue is a directory of one-file-per-event JSON
+  under ``$HERMES_HOME/dd-lanes/wake-queue/``; the producer (a separate process)
+  and the gateway never share memory. Writes are atomic (tmp + os.replace).
+* FAIL-SOFT. A wake failure NEVER breaks the producer or the mirror — the result
+  still reached the human and the transcript. The wake is best-effort recovery
+  of the *autonomous-continuation* property, not a delivery guarantee.
+
+The event is data only — it carries no secret. The structured P1 continuation
+prompt is built here (:func:`build_continuation_prompt`) so the contract lives in
+one tested place, and it explicitly forbids unauthorized deploy/restart/push/
+merge/Slack-canary actions (req 5).
+"""
+
+from __future__ import annotations
+
+import calendar
+import json
+import os
+import re
+import sys
+import time
+import hashlib
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+
+def hermes_home() -> Path:
+    return Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+# ── GOVERNOR ADMISSION (WTS 319dc317, §4). Best-effort import of the ONE admission
+# authority from ~/.hermes/bin, mirroring the driver's discipline: a missing helper
+# NEVER breaks the wake. lane_wake is one of the two loops §4 names ("you wire
+# lane_wake here"). SHADOW-ONLY here: a wake for a failed lane still emits exactly
+# as today; the admission verdict is journaled + surfaced in the continuation prompt
+# so P1 sees the governor's would-stop, but the wake is NOT suppressed (enforce is a
+# separate Levi-gated decision on the P1 continuation path, not this emit).
+def _admission_bin_dir() -> str:
+    return str((hermes_home() / "bin"))
+
+
+try:
+    if _admission_bin_dir() not in sys.path:
+        sys.path.insert(0, _admission_bin_dir())
+    from dd_admission import admit_attempt as _admit_attempt  # noqa: E402
+    from dd_admission import normalize_failure_class as _admit_normalize  # noqa: E402
+    from dd_admission import convergence_fingerprint as _admit_fingerprint  # noqa: E402
+    _ADMISSION_AVAILABLE = True
+except Exception:
+    _ADMISSION_AVAILABLE = False
+
+    def _admit_attempt(*_a, **_k):  # type: ignore
+        return None
+
+    def _admit_normalize(_x):  # type: ignore
+        return "unknown"
+
+    def _admit_fingerprint(**_k):  # type: ignore
+        return ""
+
+
+# A wake carries a WORK-RETRY signal only for these terminal states / gates; a
+# clean PASS wake is a normal continuation, NOT a retry, and is not admitted.
+_RETRY_TERMINAL_STATES = frozenset({"timed_out", "orphaned", "recovery_required"})
+_RETRY_GATES = frozenset({"FAIL", "FAILED", "BLOCK", "BLOCKED", "ERROR", "STALLED",
+                          "NEEDS-YOU", "NEEDSYOU"})
+
+
+def _is_work_retry_wake(gate: str, terminal_state: Optional[str]) -> bool:
+    g = (gate or "").strip().upper()
+    ts = (terminal_state or "").strip().lower()
+    return ts in _RETRY_TERMINAL_STATES or g in _RETRY_GATES
+
+
+def shadow_admission_for_wake(*, wts_task: Optional[str], lane: str, gate: str,
+                              run_id: str, terminal_state: Optional[str],
+                              elapsed: Optional[int] = None) -> Optional[dict]:
+    """Consult the ONE admission authority for a wake that WOULD drive a work retry.
+    Returns the decision dict (also journaled) or None (not a retry wake / module
+    unavailable). SHADOW: the caller still emits the wake; it only records the
+    verdict + surfaces it. obligation_id == wts_task (the parent identity)."""
+    if not _ADMISSION_AVAILABLE:
+        return None
+    if not _is_work_retry_wake(gate, terminal_state):
+        return None
+    obligation = (wts_task or "").strip() or f"lane:{lane}"
+    fclass = _admit_normalize(terminal_state or gate or lane)
+    # stable root key so a relabel (timed_out↔orphaned on the same lane) shares
+    # one retry budget line.
+    rck = f"{obligation}:{lane}:{fclass}"
+    attempt_id = f"{obligation}:{lane}:{run_id or 'run'}"
+    fp = _admit_fingerprint(failure_class=fclass, target_surface=lane,
+                            acceptance_test=(gate or ""), root_cause_key=rck)
+    try:
+        dec = _admit_attempt(obligation, attempt_id, fclass, rck,
+                             delta=None, elapsed=elapsed,
+                             convergence=fp, mode="shadow", persist=True)
+        return dec.__dict__ if dec is not None else None
+    except Exception:
+        return None
+
+
+def wake_queue_dir() -> Path:
+    return hermes_home() / "dd-lanes" / "wake-queue"
+
+
+def quarantine_dir() -> Path:
+    """Where refused callbacks are recorded (WTS 17cbc96c).
+
+    Per-home, so each gateway's evidence stays inside its own home exactly like
+    its sessions, memory and logs already do.
+    """
+    return hermes_home() / "quarantine"
+
+
+# Keep the evidence directory bounded — this is an audit trail, not a spool. The
+# newest N files are retained; older ones are pruned on write.
+QUARANTINE_KEEP = 500
+
+# A callback older than this is stale by construction: a lane result whose
+# gateway has been down for a day should be reconciled deliberately, not woken
+# into a session that has moved on. Overridable for operations, not by a model.
+def _max_callback_age_secs() -> int:
+    try:
+        raw = int((os.getenv("DD_LANE_WAKE_MAX_AGE_SECS") or "").strip() or 0)
+    except Exception:
+        return 86400
+    return raw if raw > 0 else 86400
+
+
+def _processed_dir() -> Path:
+    return wake_queue_dir() / ".processed"
+
+
+def _enqueued_dir() -> Path:
+    return wake_queue_dir() / ".enqueued"
+
+
+# The producer (emit) side feature flag. Default ON so the canary works out of
+# the box, but it remains a real off switch: DD_LANE_WAKE_ENABLED in {0,false,off,no}.
+def wake_enabled() -> bool:
+    raw = (os.getenv("DD_LANE_WAKE_ENABLED") or "").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+def _safe_key_filename(key: str) -> str:
+    """A filesystem-safe, collision-resistant filename for an idempotency key."""
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    slug = re.sub(r"[^A-Za-z0-9._-]", "-", key)[:80]
+    return f"{slug}.{digest}"
+
+
+def make_idempotency_key(*, run_id: str, wts_task: Optional[str], kind: str) -> str:
+    """Stable dedupe key. Mirrors the packet's recommended shape
+    ``lane-result:<run>:<wts>:<kind>`` — same (run, task, kind) → same key, so a
+    reaper re-run cannot produce a second wake for the same completed run."""
+    return f"lane-result:{run_id}:{(wts_task or 'none')}:{kind}"
+
+
+def build_continuation_prompt(
+    *,
+    wts_task: Optional[str],
+    lane: str,
+    gate: str,
+    run_dir: str,
+    result_relation: Optional[str] = None,
+    result_file: Optional[str] = None,
+    result_sha: Optional[str] = None,
+    terminal_state: Optional[str] = None,
+    retry_disposition: Optional[str] = None,
+    closeout: Optional[str] = None,
+    gov_admission: Optional[dict] = None,
+) -> str:
+    """The STRUCTURED INTERNAL continuation prompt P1 receives on wake (req 5).
+
+    P1 is the workflow GOVERNOR here, not a chat responder. The prompt tells it to
+    reconcile the just-returned lane result, update WTS, then decide the next move
+    (route the next lane / hold for authorization / final synthesis) — and it
+    HARD-FORBIDS running the Slack canary, a deploy, a restart, a push, or a merge
+    without durable authorization."""
+    run_id = Path(run_dir.rstrip("/")).name if run_dir else "(unknown run)"
+    art = result_relation or result_file or "(see the lane run dir / WTS task)"
+    return (
+        "[LANE RESULT RETURNED — CONTINUE WORKFLOW]\n"
+        f"WTS: {wts_task or '(none — see safety note)'}\n"
+        f"Lane: {lane}\n"
+        f"Gate: {gate}\n"
+        + (f"Terminal state: {terminal_state}\n" if terminal_state else "")
+        + f"Run dir: {run_dir}\n"
+        f"Run id: {run_id}\n"
+        f"Result artifact: {art}"
+        + (f"  (sha {result_sha[:12]})" if result_sha else "")
+        + "\n\n"
+        "Instruction (you are the workflow governor — act now, do NOT wait for a "
+        "user message):\n"
+        "1. Reconcile this lane result against the request and your earlier HANDOFF "
+        "PENDING for this lane.\n"
+        "2. Update WTS: confirm the final (non-pending) lane result artifact is "
+        "attached to the bound task; if it is missing, attach it.\n"
+        "3. Decide the next action under policy:\n"
+        "   - route the NEXT lane (e.g. engineering PASS → QA) via route_to_lane; or\n"
+        "   - HOLD for authorization and say exactly what you are waiting on; or\n"
+        "   - emit the FINAL SYNTHESIS (owner + next action) and close out.\n"
+        "4. If the lane says no downstream handoff is needed, emit a final "
+        "hold/owner/action — do NOT go idle.\n\n"
+        "SAFETY (hard): Do NOT run the Slack canary, submit/execute a deploy, "
+        "restart any service, push, or merge as part of this continuation unless "
+        "you hold DURABLE, explicit authorization for that specific action. "
+        "Surfacing a deploy-ready state and HOLDING is correct; taking the last "
+        "mile is not. If WTS is unknown/missing, HOLD and surface that — do not "
+        "best-effort continue."
+        + (
+            "\n\nRETRY POLICY (hard, WTS ac4bcb05): this execution ended "
+            f"{terminal_state}. Do NOT re-dispatch an IDENTICAL packet on the same "
+            "rail — the runner will refuse it (RETRY_BLOCKED). Either NARROW the "
+            "scope (smaller packet), promote to the durable/background rail "
+            "(dd-lane-run --background, collect with --poll), or HOLD and "
+            "escalate to the operator with the partial evidence."
+            if terminal_state in ("timed_out", "orphaned") else ""
+        ) + (
+            (
+                "\n\n--- authoritative closeout (single source of truth; composed once by "
+                "the reaper — receipts + integrity flags included) ---\n" + closeout
+            ) if closeout else ""
+        ) + (
+            "\n\nGOVERNOR ADMISSION (§4, SHADOW — advisory this run): the mission "
+            f"governor's verdict for a retry here is **{gov_admission.get('verdict')}** "
+            f"(reason: {gov_admission.get('reason')}; root-cause retries used "
+            f"{gov_admission.get('class_retries_used')}, total {gov_admission.get('total_retries_used')}). "
+            + ("It WOULD STOP an automatic retry — prefer consolidating to a single "
+               "operator decision over re-dispatching. "
+               if gov_admission.get("would_stop") else
+               "It would admit a retry that carries a MEANINGFUL delta. ")
+            + "This is shadow guidance; enforcement is operator-gated."
+            if gov_admission else ""
+        )
+    )
+
+
+def emit_wake_event(
+    *,
+    run_dir: str,
+    lane: str,
+    gate: str,
+    session_key: str,
+    platform: str,
+    chat_id: str,
+    chat_type: str = "",
+    thread_id: Optional[str] = None,
+    wts_task: Optional[str] = None,
+    kind: str = "lane-result",
+    result_relation: Optional[str] = None,
+    result_file: Optional[str] = None,
+    result_sha: Optional[str] = None,
+    source_label: str = "dd-lane-reaper",
+    terminal_state: Optional[str] = None,
+    retry_disposition: Optional[str] = None,
+    closeout: Optional[str] = None,
+    instance: Optional[str] = None,
+    destination_instance: Optional[str] = None,
+    originating_session_id: Optional[str] = None,
+    mission_id: Optional[str] = None,
+    chain_id: Optional[str] = None,
+) -> str:
+    """Enqueue a single ACTIVE-WAKE event onto the durable file queue.
+
+    Returns a short status token (no secrets):
+      ``emitted(<key>)``          — a new event was written
+      ``skipped(disabled)``       — DD_LANE_WAKE_ENABLED is off
+      ``skipped(no-routing)``     — no session/platform/chat_id to wake
+      ``skipped(dup:<key>)``      — this idempotency key was already enqueued
+      ``skipped(processed:<key>)``— this key was already drained+injected
+      ``error(<reason>)``         — best-effort failure (never raised)
+
+    Idempotency is enforced HERE (writer side) AND in the drain (consumer side):
+    a key seen in either ``.enqueued`` or ``.processed`` is refused. The
+    ``.enqueued`` marker is removed by the drain after it processes the event, so
+    a genuinely new run (new run_id) is never blocked.
+    """
+    try:
+        if not wake_enabled():
+            return "skipped(disabled)"
+        # A wake needs a real session to target. Without platform+chat_id (or a
+        # parseable session_key) there is nothing to inject into — the mirror still
+        # delivered the substance, so this is a clean skip, not an error.
+        if not (platform and chat_id) and not session_key:
+            return "skipped(no-routing)"
+
+        run_id = Path(run_dir.rstrip("/")).name if run_dir else ""
+        key = make_idempotency_key(run_id=run_id, wts_task=wts_task, kind=kind)
+        fname = _safe_key_filename(key)
+
+        qdir = wake_queue_dir()
+        qdir.mkdir(parents=True, exist_ok=True)
+        _enqueued_dir().mkdir(parents=True, exist_ok=True)
+        _processed_dir().mkdir(parents=True, exist_ok=True)
+
+        # Idempotency gate (writer side).
+        if (_processed_dir() / fname).exists():
+            return f"skipped(processed:{key})"
+        if (_enqueued_dir() / fname).exists() or (qdir / f"{fname}.json").exists():
+            return f"skipped(dup:{key})"
+
+        # GOVERNOR ADMISSION (§4, SHADOW) — for a wake that would drive a work
+        # retry, record the would-stop verdict + surface it in the prompt. Does
+        # NOT suppress the wake (shadow); persist-before-dispatch is honored (the
+        # decision is journaled before the event is written).
+        gov = shadow_admission_for_wake(wts_task=wts_task, lane=lane, gate=gate,
+                                        run_id=run_id, terminal_state=terminal_state)
+
+        event = {
+            # lane-wake/2 adds the callback AUTHORITY fields (instance,
+            # destination_instance, originating_session_id, mission/chain) —
+            # WTS 17cbc96c. The shape is otherwise unchanged and readers accept
+            # v1 too, but a v1 event carries no instance and is therefore
+            # quarantined by the receiving gateway rather than admitted.
+            "schema": "lane-wake/2",
+            "idempotency_key": key,
+            "kind": kind,
+            "run_dir": run_dir,
+            "run_id": run_id,
+            "lane": lane,
+            "gate": gate,
+            "session_key": session_key,
+            "platform": platform,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "thread_id": thread_id or None,
+            "wts_task": (wts_task or "").strip() or None,
+            "result_relation": result_relation or None,
+            "result_file": result_file or None,
+            "result_sha": result_sha or None,
+            "source_label": source_label,
+            "terminal_state": (terminal_state or "").strip() or None,
+            "retry_disposition": (retry_disposition or "").strip() or None,
+            # §4 shadow: the governor admission verdict for this (retry) wake, or
+            # None if this wake is not a work-retry. A projection/signal only.
+            "gov_admission": ({"verdict": gov.get("decision"), "reason": gov.get("reason"),
+                               "would_stop": gov.get("would_stop"),
+                               "class_retries_used": gov.get("class_retries_used"),
+                               "total_retries_used": gov.get("total_retries_used"),
+                               "mode": gov.get("mode")} if gov else None),
+            "enqueued_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        # ── CALLBACK AUTHORITY (WTS 17cbc96c) ──
+        # Explicit args win (the producer knows); otherwise the fields are read
+        # from the run's OWN dispatch record, so the reaper's existing CLI call
+        # gains authority without an argument change. Nothing is invented: a run
+        # with no record produces an event with no authority, and the receiving
+        # gateway quarantines it. That is the designed failure mode.
+        for _field, _value in (
+            ("instance", instance),
+            ("destination_instance", destination_instance),
+            ("originating_session_id", originating_session_id),
+            ("mission_id", mission_id),
+            ("chain_id", chain_id),
+        ):
+            _clean = (_value or "").strip() if isinstance(_value, str) else _value
+            if _clean:
+                event[_field] = _clean
+        try:
+            from tools import dispatch_authority as _da
+
+            _da.stamp_event_authority(event, run_dir=run_dir)
+        except Exception:
+            pass
+        # Exactly-once delivery (board 2026-07-15): the wake embeds the reaper's
+        # closeout so the injected turn IS the authoritative receipt — no second
+        # composition, no reinject double-delivery. Keep the tail (receipts +
+        # integrity flags live at the end) when truncating.
+        _co = (closeout or "").strip()
+        if _co and len(_co) > 8000:
+            _co = "…[head truncated]\n" + _co[-8000:]
+        event["closeout_embedded"] = bool(_co)
+        event["prompt"] = build_continuation_prompt(
+            wts_task=event["wts_task"],
+            lane=lane,
+            gate=gate,
+            run_dir=run_dir,
+            result_relation=result_relation,
+            result_file=result_file,
+            result_sha=result_sha,
+            terminal_state=event["terminal_state"],
+            retry_disposition=event["retry_disposition"],
+            closeout=_co or None,
+            gov_admission=event["gov_admission"],
+        )
+
+        # Atomic write: tmp in the same dir, then os.replace.
+        fd, tmp = tempfile.mkstemp(dir=str(qdir), prefix=".wake-", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(event, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, str(qdir / f"{fname}.json"))
+        # Mark enqueued so a same-tick duplicate emit is refused even before the
+        # drain runs. (Removed by the drain once consumed.)
+        try:
+            (_enqueued_dir() / fname).write_text(event["enqueued_at"], encoding="utf-8")
+        except Exception:
+            pass
+        return f"emitted({key})"
+    except Exception as exc:  # never raise into the producer
+        return f"error({type(exc).__name__})"
+
+
+def list_pending_events() -> list[dict]:
+    """Return queued (un-processed) wake events, oldest first. Drain side."""
+    qdir = wake_queue_dir()
+    if not qdir.is_dir():
+        return []
+    events = []
+    for p in sorted(qdir.glob("*.json"), key=lambda x: x.stat().st_mtime):
+        try:
+            ev = json.loads(p.read_text(encoding="utf-8"))
+            ev["_path"] = str(p)
+            events.append(ev)
+        except Exception:
+            # A malformed event file is moved aside so it can't wedge the drain.
+            try:
+                p.rename(p.with_suffix(".json.bad"))
+            except Exception:
+                pass
+    return events
+
+
+def already_processed(idempotency_key: str) -> bool:
+    """True iff this key was already drained+injected (consumer-side dedupe)."""
+    return (_processed_dir() / _safe_key_filename(idempotency_key)).exists()
+
+
+# ─────────────────────────── ADMISSION + QUARANTINE ──────────────────────────
+# WTS 17cbc96c. A wake event re-enters the gateway HERE, and the drain's next act
+# is to inject an internal MessageEvent — i.e. to start a model turn that will
+# read the event's prompt and act on it (WTS writes, attachments, further lane
+# dispatch). Everything below runs BEFORE that, and its only two outcomes are
+# "inject" and "write evidence and stop".
+#
+# The 2026-08-10 crossover is the reason: destination was resolved from
+# (platform, chat_id), which is identical across all five bots, so P1's shared
+# reaper delivered PTG's and Azul's lane results into P1's session.
+
+_SUPPORTED_EVENT_SCHEMAS = ("lane-wake/1", "lane-wake/2")
+
+# Stable reason codes. They are written into quarantine evidence and logged, so
+# treat them as an interface, not as prose.
+QUARANTINE_REASONS = (
+    "schema_unsupported",      # event shape this gateway does not understand
+    "unidentified_receiver",   # this gateway cannot name its own instance
+    "authority_absent",        # event carries no authority fields at all
+    "missing_instance",        # legacy callback — must NOT default to P1
+    "missing_session",         # no exact originating session
+    "run_dir_absent",          # the callback names no run directory at all
+    "run_dir_escape",          # run_dir is not a real path inside this lane tree
+    "dispatch_footprint_absent",  # the directory carries no evidence of a dispatch
+    "run_id_mismatch",         # directory name, sidecar and callback disagree
+    "no_dispatch_record",      # nothing to check the claim against
+    "record_incomplete",       # dispatch record exists but names no authority
+    "instance_mismatch",       # different Hermes instance dispatched this
+    "destination_mismatch",    # this gateway is not the intended destination
+    "session_mismatch",        # right instance, wrong session
+    "run_mismatch",
+    "wts_mismatch",
+    "mission_mismatch",
+    "chain_mismatch",
+    "route_mismatch",
+    "stale",                   # older than the callback freshness window
+    "replayed",                # this idempotency key was already delivered
+)
+
+
+# The processed-marker outcome written when a callback is REFUSED. It is read
+# back cross-process by ~/.hermes/bin/dd-lane-reaper (wake_injection_proof), which
+# used to wrap ANY non-empty outcome as `wake=gateway-accepted(<outcome>,<key>)`,
+# log "gateway drain injected the P1 continuation (canonical proof)" and grade the
+# run orch=DONE. A quarantine was therefore reported as the strongest possible
+# success signal the rail has.
+#
+# So the token leads with `refused-`: it cannot be read as acceptance by anything
+# that pattern-matches it, present or future, and it is unambiguous to a human
+# reading a reap marker. The reaper patch in bin/patches/ keys on the `refused-`
+# prefix (and still recognises the older `quarantined:` markers already on disk).
+WAKE_OUTCOME_REFUSED = "refused-quarantine"
+
+
+def refused_outcome(reason: str) -> str:
+    """The processed-marker outcome for a quarantined callback. One definition."""
+    reason = str(reason or "").strip() or "unspecified"
+    return f"{WAKE_OUTCOME_REFUSED}:{reason}"
+
+
+class Admission:
+    """Verdict for one callback. ``ok`` is the ONLY thing that authorises entry."""
+
+    __slots__ = ("ok", "reason", "detail", "receiving_instance", "record")
+
+    def __init__(self, ok: bool, reason: str = "", detail: str = "",
+                 receiving_instance: str = "", record: Optional[dict] = None):
+        self.ok = ok
+        self.reason = reason
+        self.detail = detail
+        self.receiving_instance = receiving_instance
+        self.record = record
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"Admission(ok={self.ok}, reason={self.reason!r})"
+
+
+def _event_age_secs(event: dict) -> Optional[int]:
+    """Seconds since the event was enqueued. ``enqueued_at`` is UTC ("…Z").
+
+    Uses :func:`calendar.timegm`, the inverse of :func:`time.gmtime` and the only
+    correct way to turn a UTC struct back into an epoch. The previous
+    ``time.mktime(parsed) + time.timezone`` interpreted the UTC struct as LOCAL
+    time and then corrected with the STANDARD offset, so it was wrong by exactly
+    one hour for the whole of daylight saving. Measured 2026-08-11 in MDT: a
+    just-enqueued event reported age=3600s instead of 0. At the 86400s default
+    that is invisible; with DD_LANE_WAKE_MAX_AGE_SECS tightened under an hour it
+    quarantines every fresh callback — in summer only, which is the worst kind of
+    bug to be holding a security gate.
+    """
+    raw = str(event.get("enqueued_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = time.strptime(raw, "%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+    return int(time.time() - calendar.timegm(parsed))
+
+
+def admit_callback(event: dict, *, receiving_instance: Optional[str] = None,
+                   max_age_secs: Optional[int] = None) -> Admission:
+    """Decide whether a wake event may enter this gateway. NO side effects.
+
+    Runs before the model is invoked, before any Telegram injection, before any
+    WTS mutation, chain advance or lane dispatch. Returns a verdict; the caller
+    performs the (single) side effect of writing quarantine evidence.
+
+    Checked in order — schema, the run directory's structural containment, claimed
+    authority against the dispatch record, run identity, then freshness and replay
+    — so the first failure is the most fundamental one and is the reason code that
+    gets recorded.
+
+    Containment runs BEFORE the sidecar is read, deliberately: an event that names
+    a directory outside P1's lane tree does not get to have a file read from that
+    directory and interpreted as authority.
+    """
+    try:
+        from tools import dispatch_authority as da
+    except Exception as exc:  # pragma: no cover - defensive
+        # We cannot verify authority, therefore we cannot admit. Fail closed.
+        return Admission(False, "authority_absent",
+                         f"authority module unavailable ({type(exc).__name__})")
+
+    receiver = receiving_instance if receiving_instance is not None else da.active_instance()
+
+    if not isinstance(event, dict) or not event:
+        return Admission(False, "schema_unsupported", "event is not a mapping",
+                         receiving_instance=receiver)
+
+    schema = str(event.get("schema") or "").strip()
+    if schema not in _SUPPORTED_EVENT_SCHEMAS:
+        return Admission(False, "schema_unsupported", f"schema={schema or '(absent)'}",
+                         receiving_instance=receiver)
+
+    # STRUCTURAL CONTAINMENT. The dispatch record is only worth comparing when the
+    # directory it describes is genuinely one of this home's lane runs: reachable
+    # under $HERMES_HOME/dd-lanes/<lane>/runs/<run_id> without a symlink or a ".."
+    # escape, and carrying a real dispatch footprint. A reviewer's hand-written
+    # wake event plus a matching hand-written sidecar in a scratch directory was
+    # ADMITTED before this check existed. It is containment, NOT authentication —
+    # see the threat model in tools/dispatch_authority.py.
+    run_dir = event.get("run_dir") or ""
+    reason = da.run_dir_containment(run_dir, lane_root=hermes_home() / da.LANE_TREE_DIRNAME)
+    if reason:
+        return Admission(False, reason, f"run_dir={run_dir or '(absent)'}",
+                         receiving_instance=receiver)
+
+    record = da.authority_for_run(run_dir)
+    claim = da.claim_from_event(event)
+    reason = da.authority_mismatch(record, claim, receiving_instance=receiver)
+    if reason:
+        return Admission(False, reason, "", receiving_instance=receiver, record=record)
+
+    # The run id is anchored to the directory name — the one value a fabricated
+    # record cannot choose freely now that the directory is pinned to a real
+    # dispatch. The sidecar and the callback must both agree with it.
+    reason = da.run_identity_mismatch(run_dir, record, claim)
+    if reason:
+        return Admission(False, reason, "", receiving_instance=receiver, record=record)
+
+    # Freshness. A stale callback is not evidence of an attack, but waking a
+    # session a day later with "continue this workflow" is its own hazard.
+    limit = max_age_secs if max_age_secs is not None else _max_callback_age_secs()
+    age = _event_age_secs(event)
+    if age is not None and limit > 0 and age > limit:
+        return Admission(False, "stale", f"age={age}s limit={limit}s",
+                         receiving_instance=receiver, record=record)
+
+    # Replay. The drain also dedupes, but admission must be able to answer this
+    # on its own so a replayed event cannot be admitted by a different caller.
+    key = str(event.get("idempotency_key") or "").strip()
+    if key and already_processed(key):
+        return Admission(False, "replayed", "", receiving_instance=receiver, record=record)
+
+    return Admission(True, "", "", receiving_instance=receiver, record=record)
+
+
+def _prune_quarantine(keep: int = QUARANTINE_KEEP) -> None:
+    try:
+        files = sorted(quarantine_dir().glob("*.json"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-keep] if len(files) > keep else []:
+            old.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def quarantine_callback(event: dict, admission: "Admission") -> "Path | None":
+    """Record a refused callback as structured, NON-SECRET evidence.
+
+    Writes exactly one file and does nothing else: no model invocation, no
+    Telegram injection, no WTS mutation, no attachment, no chain advance, no
+    lane dispatch, no retry. Contains reason code + metadata only — never the
+    continuation prompt, the closeout, the transcript, a token, or the raw chat
+    id (recorded as a fingerprint instead).
+    """
+    try:
+        from tools import dispatch_authority as da
+
+        payload = {
+            "schema": "lane-callback-quarantine/1",
+            "reason": admission.reason,
+            "detail": admission.detail,
+            "receiving_instance": admission.receiving_instance,
+            "quarantined_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "wts": "17cbc96c-a70f-46e7-af23-1458d04b5368",
+            "evidence": da.summarize_for_evidence(event, admission.record),
+        }
+        qdir = quarantine_dir()
+        qdir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(qdir, 0o700)
+        except Exception:
+            pass
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        digest = hashlib.sha256(
+            f"{event.get('idempotency_key') or ''}:{admission.reason}".encode("utf-8")
+        ).hexdigest()[:12]
+        target = qdir / f"{stamp}-{admission.reason or 'refused'}-{digest}.json"
+        fd, tmp = tempfile.mkstemp(dir=str(qdir), prefix=".quarantine-", suffix=".json")
+        try:
+            os.fchmod(fd, 0o600)
+        except Exception:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, str(target))
+        _prune_quarantine()
+        return target
+    except Exception:
+        # Evidence is best-effort; REFUSAL is not. A failed write must never
+        # become an admission.
+        return None
+
+
+def list_quarantined() -> list[dict]:
+    """Quarantine evidence, oldest first (operator/audit surface, no secrets)."""
+    out: list[dict] = []
+    qdir = quarantine_dir()
+    if not qdir.is_dir():
+        return out
+    for p in sorted(qdir.glob("*.json"), key=lambda x: x.stat().st_mtime):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+            rec["_path"] = str(p)
+            out.append(rec)
+        except Exception:
+            continue
+    return out
+
+
+def _processed_marker_payload(event: dict, *, outcome: str) -> str:
+    key = event.get("idempotency_key") or ""
+    return json.dumps(
+        {
+            "idempotency_key": key,
+            "outcome": outcome,
+            "run_id": event.get("run_id"),
+            "wts_task": event.get("wts_task"),
+            "processed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+    )
+
+
+def remove_event_file(event: dict) -> None:
+    """Remove a queue file fail-soft; used by losing consumers too."""
+    path = event.get("_path")
+    if path:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def claim_processed(event: dict, *, outcome: str = "claimed") -> bool:
+    """Atomically claim an event's idempotency key for at-most-once injection.
+
+    Returns True only for the process that created the processed marker with
+    O_CREAT|O_EXCL. Losing consumers must skip injection.
+    """
+    key = event.get("idempotency_key") or ""
+    if not key:
+        return True
+    fname = _safe_key_filename(key)
+    marker = _processed_dir() / fname
+    try:
+        _processed_dir().mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(marker), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_processed_marker_payload(event, outcome=outcome))
+        (_enqueued_dir() / fname).unlink(missing_ok=True)
+        return True
+    except FileExistsError:
+        remove_event_file(event)
+        return False
+    except Exception:
+        return False
+
+
+def mark_processed(event: dict, *, outcome: str = "injected") -> None:
+    """Record that an event was consumed: write/update a durable processed marker,
+    drop the .enqueued marker, and remove the queue file. Idempotent and fail-soft."""
+    key = event.get("idempotency_key") or ""
+    fname = _safe_key_filename(key) if key else None
+    try:
+        _processed_dir().mkdir(parents=True, exist_ok=True)
+        if fname:
+            marker = _processed_dir() / fname
+            if not marker.exists():
+                claim_processed(event, outcome=outcome)
+            else:
+                marker.write_text(_processed_marker_payload(event, outcome=outcome), encoding="utf-8")
+                (_enqueued_dir() / fname).unlink(missing_ok=True)
+    except Exception:
+        pass
+    # Remove the queue file last (the processed marker is the source of truth).
+    remove_event_file(event)
+
+
+# ── tiny CLI so the bash producers (dd-lane-reaper / dd-chain-driver) can emit ──
+# without re-implementing the schema/idempotency. Prints the status token.
+def _main(argv: list[str]) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="lane_wake", description="emit a lane-result wake event")
+    ap.add_argument("--emit", action="store_true", help="enqueue a wake event")
+    ap.add_argument("--closeout-file", default="")
+    ap.add_argument("--run-dir", default="")
+    ap.add_argument("--lane", default="")
+    ap.add_argument("--gate", default="")
+    ap.add_argument("--session-key", default="")
+    ap.add_argument("--platform", default="")
+    ap.add_argument("--chat-id", default="")
+    ap.add_argument("--chat-type", default="")
+    ap.add_argument("--thread-id", default="")
+    ap.add_argument("--wts-task", default="")
+    ap.add_argument("--kind", default="lane-result")
+    ap.add_argument("--result-relation", default="")
+    ap.add_argument("--result-file", default="")
+    ap.add_argument("--result-sha", default="")
+    ap.add_argument("--source-label", default="dd-lane-reaper")
+    ap.add_argument("--terminal-state", default="", help="typed terminal state (terminal-state/1)")
+    ap.add_argument("--retry-disposition", default="", help="typed retry disposition (terminal-state/1)")
+    # Callback authority (WTS 17cbc96c). OPTIONAL: when omitted the fields are
+    # read from the run's dispatch-authority / wake-target sidecar, so existing
+    # producers keep working unchanged.
+    ap.add_argument("--instance", default="", help="dispatching Hermes instance id")
+    ap.add_argument("--destination-instance", default="", help="instance the callback must return to")
+    ap.add_argument("--session-id", default="", help="exact originating gateway session id")
+    ap.add_argument("--mission-id", default="")
+    ap.add_argument("--chain-id", default="")
+    ap.add_argument("--list", action="store_true", help="print pending events (no secrets)")
+    ap.add_argument("--list-quarantine", action="store_true",
+                    help="print quarantined callbacks (reason codes + metadata, no secrets)")
+    args = ap.parse_args(argv)
+
+    if args.list:
+        for ev in list_pending_events():
+            print(json.dumps({k: v for k, v in ev.items() if k != "prompt"}, ensure_ascii=False))
+        return 0
+
+    if args.list_quarantine:
+        for rec in list_quarantined():
+            print(json.dumps(rec, ensure_ascii=False))
+        return 0
+
+    if args.emit:
+        _closeout = None
+        if args.closeout_file:
+            try:
+                _closeout = Path(args.closeout_file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                _closeout = None
+        token = emit_wake_event(
+            closeout=_closeout,
+            run_dir=args.run_dir,
+            lane=args.lane,
+            gate=args.gate,
+            session_key=args.session_key,
+            platform=args.platform,
+            chat_id=args.chat_id,
+            chat_type=args.chat_type,
+            thread_id=args.thread_id or None,
+            wts_task=args.wts_task or None,
+            kind=args.kind,
+            result_relation=args.result_relation or None,
+            result_file=args.result_file or None,
+            result_sha=args.result_sha or None,
+            source_label=args.source_label,
+            terminal_state=args.terminal_state or None,
+            retry_disposition=args.retry_disposition or None,
+            instance=args.instance or None,
+            destination_instance=args.destination_instance or None,
+            originating_session_id=args.session_id or None,
+            mission_id=args.mission_id or None,
+            chain_id=args.chain_id or None,
+        )
+        print(token)
+        # Exit 0 on a clean emit/skip; 9 only on a real error (so bash can log it).
+        return 0 if not token.startswith("error(") else 9
+
+    ap.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(_main(sys.argv[1:]))

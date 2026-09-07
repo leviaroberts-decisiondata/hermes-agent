@@ -25,6 +25,12 @@ from hermes_cli.auth import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_shared_auth_env(monkeypatch):
+    """Keep Codex auth tests pinned to their temp HERMES_HOME store by default."""
+    monkeypatch.delenv("HERMES_AUTH_STORE_PATH", raising=False)
+
+
 def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):
     """Write Codex tokens into the Hermes auth store."""
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -123,6 +129,35 @@ def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
 
     assert called["count"] == 1
     assert resolved["api_key"] == "access-forced"
+
+
+def test_resolve_codex_runtime_credentials_uses_refresh_mutex(tmp_path, monkeypatch):
+    import hermes_cli.auth as auth
+
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-current", refresh_token="refresh-old")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    called = {"count": 0}
+
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        return {"access_token": "should-not-happen", "refresh_token": "refresh-new"}
+
+    class _BusyRefreshLock:
+        def __enter__(self):
+            raise TimeoutError("busy refresh lock")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(auth, "_codex_refresh_lock", lambda **_kwargs: _BusyRefreshLock())
+    monkeypatch.setattr(auth, "_refresh_codex_auth_tokens", _fake_refresh)
+
+    with pytest.raises(TimeoutError, match="busy refresh lock"):
+        resolve_codex_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
+
+    assert called["count"] == 0
 
 
 def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):

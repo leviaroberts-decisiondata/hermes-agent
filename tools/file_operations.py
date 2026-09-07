@@ -1274,6 +1274,14 @@ class ShellFileOperations(FileOperations):
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
 
+        if not result.stdout.strip():
+            # Zero-result rescue (2026-07-08): the hidden-dir exclusion hides
+            # real files under dot-trees like ~/.hermes. Retry once without it
+            # (still skipping .git) before reporting zero.
+            cmd_rescue = f"find {self._escape_shell_arg(path)} -not -path '*/.git/*' -type f -name {self._escape_shell_arg(search_pattern)} " \
+                         f"2>/dev/null | head -n {limit + offset} | tail -n +{offset + 1}"
+            result = self._exec(cmd_rescue, timeout=60)
+
         files = []
         for line in result.stdout.strip().split('\n'):
             if not line:
@@ -1339,6 +1347,22 @@ class ShellFileOperations(FileOperations):
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
+            all_files = [f for f in result.stdout.strip().split('\n') if f]
+
+        if not all_files:
+            # Zero-result rescue (2026-07-08): rg's default hidden-dir +
+            # .gitignore filtering silently returns total_count=0 for real
+            # files under dot-trees like ~/.hermes — agents read that as
+            # "file doesn't exist" and spin. Retry once with filtering off
+            # (still skipping .git/node_modules) before reporting zero.
+            cmd_rescue = (
+                f"rg --files --hidden --no-ignore "
+                f"-g '!**/.git/**' -g '!**/node_modules/**' "
+                f"-g {self._escape_shell_arg(glob_pattern)} "
+                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"| head -n {fetch_limit}"
+            )
+            result = self._exec(cmd_rescue, timeout=60)
             all_files = [f for f in result.stdout.strip().split('\n') if f]
 
         page = all_files[offset:offset + limit]

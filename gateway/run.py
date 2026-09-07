@@ -26,10 +26,13 @@ import signal
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -852,6 +855,231 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _utc_iso() -> str:
+    """Return a compact UTC ISO-8601 timestamp for observability payloads."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _truthy_config_value(value: Any, *, default: bool = False) -> bool:
+    """Parse common bool-ish config/env values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+
+def _dd_observability_config(config: dict | None = None) -> dict:
+    """Resolve DecisionData observability settings for gateway runs.
+
+    The integration is best-effort and intentionally local by default: if the
+    ingest service is absent, calls time out quickly and Hermes continues.
+    """
+    cfg = config if config is not None else _load_gateway_config()
+    obs_cfg = cfg.get("observability", {}) if isinstance(cfg, dict) else {}
+    dd_cfg = {}
+    if isinstance(obs_cfg, dict):
+        dd_cfg = obs_cfg.get("decisiondata", {}) or obs_cfg.get("mc_live", {}) or {}
+    if not isinstance(dd_cfg, dict):
+        dd_cfg = {}
+
+    enabled_raw = os.getenv("HERMES_DECISIONDATA_OBSERVABILITY_ENABLED")
+    enabled = _truthy_config_value(
+        enabled_raw if enabled_raw is not None else dd_cfg.get("enabled"),
+        default=True,
+    )
+    endpoint = (
+        os.getenv("HERMES_DECISIONDATA_OBSERVABILITY_URL")
+        or os.getenv("DECISIONDATA_OBSERVABILITY_URL")
+        or dd_cfg.get("url")
+        or dd_cfg.get("endpoint")
+        or "http://127.0.0.1:8511"
+    )
+    try:
+        timeout = float(
+            os.getenv("HERMES_DECISIONDATA_OBSERVABILITY_TIMEOUT")
+            or dd_cfg.get("timeout")
+            or 1.0
+        )
+    except Exception:
+        timeout = 1.0
+    return {
+        "enabled": bool(enabled),
+        "url": str(endpoint).rstrip("/"),
+        "timeout": max(0.1, min(timeout, 10.0)),
+    }
+
+
+def _dd_observability_post(path: str, payload: dict, config: dict | None = None) -> bool:
+    """Best-effort POST to DecisionData observability ingest.
+
+    Never raises: observability must not break user-facing Hermes turns.
+    """
+    obs = _dd_observability_config(config)
+    if not obs["enabled"]:
+        return False
+    try:
+        data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        req = urllib.request.Request(
+            obs["url"] + path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=obs["timeout"]) as resp:
+            resp.read()
+        return True
+    except Exception as exc:
+        logger.debug("DecisionData observability POST %s failed: %s", path, exc)
+        return False
+
+
+def _dd_observability_run_id(session_id: str | None, generation: Optional[int] = None) -> str:
+    """Build a non-sensitive Hermes observability run id."""
+    base = re.sub(r"[^A-Za-z0-9_.:-]+", "-", session_id or "session").strip("-")[:80]
+    suffix = f"g{generation}" if generation is not None else uuid.uuid4().hex[:8]
+    return f"hermes-{base}-{suffix}"
+
+
+def _dd_observability_active_profile() -> str:
+    """Return the active Hermes profile name, or "" for the default gateway.
+
+    Best-effort: never raises into the emit path. "default"/"custom"/unknown
+    all map to "" so the default gateway keeps the legacy un-segmented key.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        prof = get_active_profile_name()
+    except Exception:
+        return ""
+    if not prof or prof == "default" or prof == "custom":
+        return ""
+    return prof
+
+
+def _dd_observability_session_key(session_id: str | None) -> str:
+    """Build the MC Live grouping key expected by the Hermes tree mapper.
+
+    Specialist profile gateways encode their profile as a dedicated segment —
+    ``agent:hermes:gateway:<profile>:<session>`` — so MC /live can split them
+    into per-profile cards. The default gateway keeps the legacy
+    ``agent:hermes:gateway:<session>`` form (non-breaking). Profile names are
+    colon-free, so positional parsing on the MC side stays unambiguous.
+    """
+    base = re.sub(r"[^A-Za-z0-9_.:-]+", "-", session_id or "session").strip("-")[:96]
+    base = base or uuid.uuid4().hex[:8]
+    profile = _dd_observability_active_profile()
+    if profile:
+        return f"agent:hermes:gateway:{profile}:{base}"
+    return f"agent:hermes:gateway:{base}"
+
+
+def _attach_dd_context_for_turn(
+    agent: Any,
+    *,
+    run_id: str,
+    session_key: str,
+    parent_run_id: Optional[str] = None,
+    wts_task_id: Optional[str] = None,
+    route_key: Optional[str] = None,
+    gateway_session_id: Optional[str] = None,
+) -> dict:
+    """Attach the per-turn DecisionData identity context to a (cached) AIAgent.
+
+    Hermes caches AIAgent instances per session_key; the same instance
+    can be reused across turns. Each turn must overwrite the agent's
+    DD identity AND replace the context dict so a stale
+    ``per_call_generation_emitted=True`` from the prior turn cannot
+    cause the gateway to skip the synthetic completion fallback when
+    the new turn never emitted a per-call row.
+
+    Returns the fresh context dict so the caller can inspect
+    ``per_call_generation_emitted`` after ``run_conversation`` returns
+    to decide whether to write the synthetic summary.
+    """
+    ctx = {
+        "run_id": run_id,
+        "session_key": session_key,
+        "parent_run_id": parent_run_id,
+        "wts_task_id": wts_task_id,
+        "agent_class": "Hermes",
+        "ingest_source": "hermes-gateway",
+        "per_call_generation_emitted": False,
+    }
+    agent._dd_run_id = run_id
+    agent._dd_session_key = session_key
+    # The reaper's result-return needs the *routing* session key
+    # (``agent:main:{platform}:{chat_type}:{chat_id}`` — build_session_key
+    # output) to mirror a detached lane's closeout back to THIS conversation.
+    # ``session_key`` above is the non-sensitive MC-Live observability grouping
+    # key (``agent:hermes:gateway:…``), which carries no chat_id, so route_to_lane
+    # must read this separate attribute. Keep both: observability stays scrubbed.
+    agent._dd_route_key = route_key or session_key
+    # The EXACT originating session id + this gateway's instance identity
+    # (WTS 17cbc96c). A detached lane's callback may only re-enter the session
+    # that dispatched it, on the instance that dispatched it — and neither can be
+    # recovered from the routing key, whose chat id is identical across all five
+    # bots. Both are trusted process/runtime facts, never model arguments.
+    agent._dd_gateway_session_id = gateway_session_id or ""
+    try:
+        from hermes_cli.profiles import get_active_home_id
+
+        agent._dd_home_id = get_active_home_id() or ""
+    except Exception:
+        agent._dd_home_id = ""
+    agent._dd_parent_run_id = parent_run_id
+    agent._dd_wts_task_id = wts_task_id
+    agent._dd_context = ctx
+    return ctx
+
+
+def _is_system_a_messaging_turn(
+    *,
+    user_config: dict,
+    platform: Any,
+    enabled_toolsets: "list | set | tuple",
+) -> bool:
+    """Decide whether a messaging-platform turn is the System-A coordinator turn.
+
+    This is the messaging-path analogue of api_server._classify_system_principal:
+    that function authenticates the System-A principal by the HTTP Bearer key;
+    this one authenticates it by *trusted in-process provenance* — which gateway
+    process is running and on which surface — because a messaging turn carries no
+    request and no Bearer token.
+
+    It is the SINGLE place that answers "is this messaging turn System A". It is
+    fail-closed by AND-composition; the decision is a property of the process and
+    the inbound surface, never of model- or caller-supplied data:
+
+      1. ``dd_system_a_principal`` is true in THIS gateway's loaded config — only
+         the default P1 coordinator gateway sets it; specialist profile gateways
+         do not (absent → false). Cross-process boundary.
+      2. The surface is Telegram (P1's coordinator surface). Other platforms on
+         the same process do not get System-A. Cross-surface boundary.
+      3. The ``deploy`` toolset is actually enabled for this surface — couples the
+         capability mint to the toolset registration so the two can never drift
+         (a turn with no deploy tools never needs, and never gets, the credential).
+
+    A True result authorizes minting via the unchanged, fail-closed
+    capability_issuer.mint_for_turn(system="A", ...). False → no mint → the turn
+    runs uncredentialed and protected resources default-deny, exactly as today.
+
+    See reviews/specs/p1-deploy-telegram-systema-design-2026-06-03.md §3-§4.
+    """
+    try:
+        from gateway.config import Platform
+        if not bool(user_config.get("dd_system_a_principal", False)):
+            return False
+        if platform != Platform.TELEGRAM:
+            return False
+        if "deploy" not in (enabled_toolsets or ()):
+            return False
+        return True
+    except Exception:
+        # Any failure resolving the gate → fail closed (no System-A).
+        return False
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -984,6 +1212,127 @@ def _normalize_empty_agent_response(
 
     return response
 
+# ── Fleet-repair 1.2 (WTS 7e1d32e9): the gateway clarify transport ──────────
+class _GatewayClarifyTransport:
+    """Callable ``clarify_callback`` for gateway turns.
+
+    Posts the agent's question (plus up to 4 choices) to the operator's own
+    chat/thread, PARKS the agent worker thread — touching activity on every
+    wait slice so the inactivity watchdog never counts the park as a stall —
+    and resumes with the operator's next non-command message in that session
+    (routed by ``GatewayRunner._handle_message``).
+
+    Contract (operator decisions 2026-07-30):
+      * bounded wait (``DD_CLARIFY_WAIT_SECS``, default 900s); on timeout the
+        tool result instructs the agent to state its assumption explicitly and
+        proceed — "asked, unanswered, proceeded on X" belongs in the receipt;
+      * ONE clarify per turn — further calls are told to proceed on stated
+        assumptions (intent questions are cheap, question-spam is not);
+      * a recognized slash command from the operator cancels the wait and then
+        dispatches normally (/new must never be swallowed as an answer);
+      * any execution deadline is extended by the parked time on resume.
+
+    Must be wired at AIAgent CONSTRUCTION — run_agent strips the clarify tool
+    from the serialized list when no callback is present (fleet-repair 1.1).
+    If two turns in one session park simultaneously (rare: a background task
+    plus the main turn), the later question wins the registry and the earlier
+    waiter times out to its stated-assumption path.
+    """
+
+    WAIT_SLICE_SECS = 20.0
+
+    def __init__(self, runner, source):
+        self.runner = runner
+        self.source = source
+        self.session_key = runner._session_key_for_source(source)
+        self.agent = None          # attached right after AIAgent construction
+        self.used_this_turn = False
+
+    def reset_for_turn(self) -> None:
+        self.used_this_turn = False
+
+    def _send_threadsafe(self, loop, adapter, text: str, timeout: float = 30.0):
+        metadata = ({"thread_id": self.source.thread_id}
+                    if getattr(self.source, "thread_id", None) else None)
+        fut = asyncio.run_coroutine_threadsafe(
+            adapter.send(self.source.chat_id, text, metadata=metadata), loop)
+        return fut.result(timeout=timeout)
+
+    def __call__(self, question: str, choices=None) -> str:
+        import threading as _threading
+        if self.used_this_turn:
+            return ("[clarify already used this turn — proceed on your stated "
+                    "assumption and record it in your receipt]")
+        self.used_this_turn = True
+        loop = getattr(self.runner, "_main_loop", None)
+        adapter = self.runner.adapters.get(self.source.platform)
+        if loop is None or adapter is None or not loop.is_running():
+            return json.dumps({"error": "Clarify transport unavailable "
+                                        "(no adapter/event loop for this platform)."})
+        opts = [str(c).strip() for c in (choices or []) if str(c).strip()][:4]
+        lines = ["❓ " + (question or "").strip()]
+        for i, c in enumerate(opts, 1):
+            lines.append(f"  {i}. {c}")
+        lines.append("Reply with a number or your own answer."
+                     if opts else "Reply in this chat to continue the turn.")
+        evt = _threading.Event()
+        pending = {"event": evt, "answer": None, "cancelled": None,
+                   "choices": opts, "question": question,
+                   "asked_at": time.time()}
+        self.runner._pending_clarifies[self.session_key] = pending
+        try:
+            self._send_threadsafe(loop, adapter, "\n".join(lines))
+        except Exception as exc:
+            self.runner._pending_clarifies.pop(self.session_key, None)
+            return json.dumps({"error": f"Clarify question could not be posted: {exc}"})
+
+        wait_total = float(os.environ.get("DD_CLARIFY_WAIT_SECS", "900"))
+        waited, answered = 0.0, False
+        while waited < wait_total:
+            slice_s = min(self.WAIT_SLICE_SECS, wait_total - waited)
+            if evt.wait(slice_s):
+                answered = True
+                break
+            waited += slice_s
+            if self.agent is not None:
+                try:
+                    self.agent._touch_activity(
+                        "parked: awaiting operator answer (clarify)")
+                except Exception:
+                    pass
+        self.runner._pending_clarifies.pop(self.session_key, None)
+
+        # The parked time never counts against an execution deadline.
+        parked = time.time() - pending["asked_at"]
+        dl = getattr(self.agent, "execution_deadline", None) if self.agent else None
+        if dl is not None:
+            for attr in ("deadline_ts", "_deadline_ts", "closeout_ts", "_closeout_ts"):
+                try:
+                    if hasattr(dl, attr) and isinstance(getattr(dl, attr), (int, float)):
+                        setattr(dl, attr, getattr(dl, attr) + parked)
+                except Exception:
+                    pass
+
+        if answered and pending.get("cancelled"):
+            return (f"[clarify cancelled: {pending['cancelled']} — proceed on "
+                    f"your stated assumption and record it in your receipt]")
+        if answered and (pending.get("answer") or "").strip():
+            ans = pending["answer"].strip()
+            if opts and ans.isdigit() and 1 <= int(ans) <= len(opts):
+                ans = opts[int(ans) - 1]
+            return f"Operator answered: {ans}"
+        try:
+            self._send_threadsafe(
+                loop, adapter,
+                "(no answer in %dm — proceeding on my stated assumption; "
+                "it will be recorded in the receipt)" % max(1, int(wait_total // 60)))
+        except Exception:
+            pass
+        return ("[clarify timeout: no operator answer after %.0fs. State the "
+                "assumption you are proceeding on EXPLICITLY in your response "
+                "and record 'asked, unanswered, proceeded on <assumption>' in "
+                "your receipt/WTS note.]" % wait_total)
+
 
 class GatewayRunner:
     """
@@ -1012,6 +1361,11 @@ class GatewayRunner:
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        # Fleet-repair 1.2: session_key -> pending clarify dict (see
+        # _GatewayClarifyTransport). _main_loop is stamped per message in
+        # _handle_message so worker threads can post questions thread-safely.
+        self._pending_clarifies: Dict[str, dict] = {}
+        self._main_loop = None
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -3134,6 +3488,14 @@ class GatewayRunner:
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
+        # Start the lane-result ACTIVE WAKE drain (WTS 331b65f8). A detached lane
+        # run reaped by dd-lane-reaper enqueues a wake event onto a durable file
+        # queue; this drain injects it as a real internal MessageEvent so P1
+        # continues the workflow autonomously (separate from the passive transcript
+        # mirror). Flag-gated by DD_LANE_WAKE_ENABLED (default on) so it can be
+        # turned off without code changes.
+        asyncio.create_task(self._drain_lane_wake_queue())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -4652,6 +5014,14 @@ class GatewayRunner:
         """
         source = event.source
 
+        # Fleet-repair 1.2: worker threads (clarify transport) need the live
+        # loop to post questions; stamp it on every message so it is always
+        # the running loop even across restarts of the async runtime.
+        try:
+            self._main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
@@ -4860,6 +5230,33 @@ class GatewayRunner:
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
             _slash_confirm_mod.clear_if_stale(_quick_key)
+
+        # ── Fleet-repair 1.2 (WTS 7e1d32e9): pending-clarify answer routing ──
+        # A parked turn is waiting on exactly this operator's next message in
+        # this session. Non-command text resolves the wait and must NOT
+        # dispatch a new turn (the parked turn produces the reply). A
+        # recognized slash command cancels the wait, then dispatches normally
+        # — /new and friends must never be swallowed as answers. This sits
+        # BEFORE the busy-session handling: a parked turn IS a running agent.
+        _pending_clarify = getattr(self, "_pending_clarifies", {}).get(_quick_key)
+        if _pending_clarify is not None and not is_internal:
+            _cl_cmd = event.get_command()
+            _cl_recognized = None
+            if _cl_cmd:
+                try:
+                    from hermes_cli.commands import resolve_command as _resolve_cl
+                    _cl_def = _resolve_cl(_cl_cmd)
+                    _cl_recognized = _cl_def.name if _cl_def else None
+                except Exception:
+                    _cl_recognized = None
+            if _cl_recognized:
+                _pending_clarify["cancelled"] = f"/{_cl_recognized} from operator"
+                _pending_clarify["event"].set()
+                # fall through — the command executes normally below
+            else:
+                _pending_clarify["answer"] = (event.text or "").strip()
+                _pending_clarify["event"].set()
+                return None  # the parked turn's own reply is the response
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -8947,6 +9344,8 @@ class GatewayRunner:
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            # Fleet-repair 1.2: built on the loop thread, used from the worker.
+            _bg_clarify_transport = _GatewayClarifyTransport(self, source)
 
             def run_sync():
                 agent = AIAgent(
@@ -8976,7 +9375,11 @@ class GatewayRunner:
                     thread_id=source.thread_id,
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
+                    # Fleet-repair 1.2: background tasks can ask too — the
+                    # answer routes back via the same chat's session key.
+                    clarify_callback=_bg_clarify_transport,
                 )
+                _bg_clarify_transport.agent = agent
                 try:
                     return agent.run_conversation(
                         user_message=prompt,
@@ -8991,13 +9394,27 @@ class GatewayRunner:
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
+            # Fleet-repair (WTS 7e1d32e9, review §3.3 #3): the header must
+            # reflect how the run actually ended. The old literal ✅ rendered
+            # a hard API failure identically to a success.
+            def _bg_header(res, preview_text):
+                if not res or res.get("failed"):
+                    return f'❌ Background task FAILED\nPrompt: "{preview_text}"\n\n'
+                _ds = res.get("deadline_state")
+                if _ds == "timed_out":
+                    return f'⏱️ Background task timed out\nPrompt: "{preview_text}"\n\n'
+                if _ds == "partial" or not res.get("completed", True):
+                    return ('◐ Background task PARTIAL (ended before completion)'
+                            f'\nPrompt: "{preview_text}"\n\n')
+                return f'✅ Background task complete\nPrompt: "{preview_text}"\n\n'
+
             # Extract media files from the response
             if response:
                 media_files, response = adapter.extract_media(response)
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                header = _bg_header(result, preview)
 
                 if text_content:
                     await adapter.send(
@@ -9038,7 +9455,7 @@ class GatewayRunner:
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 await adapter.send(
                     chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    content=_bg_header(result, preview) + "(No response generated)",
                     metadata=_thread_metadata,
                 )
 
@@ -11477,6 +11894,9 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            # per-turn canonical WTS task (from X-DD-WTS-Task-Id) -> surfaced to shell
+            # tools as DD_TURN_WTS_TASK so `dd-delivery ship` binds the exact task.
+            wts_task_id=str(getattr(self, "_dd_wts_task_id", "") or ""),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -11771,6 +12191,185 @@ class GatewayRunner:
             await adapter.handle_message(synth_event)
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
+
+    async def _drain_lane_wake_queue(self, interval: float = 5.0) -> None:
+        """Standing drain for the lane-result ACTIVE WAKE queue (WTS 331b65f8).
+
+        A detached specialist-lane run, once reaped by ``dd-lane-reaper`` (or
+        advanced by ``dd-chain-driver``), enqueues a small JSON wake event onto
+        ``$HERMES_HOME/dd-lanes/wake-queue/`` via ``gateway.lane_wake``. This task
+        consumes the queue and injects each event as a REAL internal
+        ``MessageEvent(internal=True)`` — the SAME proven wake path used by the
+        in-process background-process watcher (``_inject_watch_notification``) —
+        so P1 starts a continuation turn autonomously, with no user message.
+
+        This is the ACTIVE half of the bridge and is deliberately kept SEPARATE
+        from the passive transcript mirror (``gateway.mirror.mirror_to_session``),
+        which still fires unchanged on the producer side. Idempotency lives in
+        ``lane_wake`` (a durable per-key processed marker), so a reaper re-run or a
+        duplicate enqueue never double-wakes P1 → never double-dispatches QA or
+        double-closes. Flag-gated by ``DD_LANE_WAKE_ENABLED`` (default on); when
+        off, the drain idles without consuming so events are not silently dropped.
+        Fail-soft throughout: a drain error never kills the loop or the gateway.
+        """
+        try:
+            from gateway import lane_wake
+        except Exception as exc:
+            logger.warning("lane-wake drain unavailable (import failed): %s", exc)
+            return
+
+        await asyncio.sleep(45)  # initial delay — let adapters finish connecting
+        logger.info("Lane-wake drain started (interval=%.0fs)", interval)
+        while self._running:
+            try:
+                if not lane_wake.wake_enabled():
+                    # OFF switch: idle WITHOUT consuming, so flipping it back on
+                    # processes anything that queued while it was off.
+                    await asyncio.sleep(interval)
+                    continue
+                for event in lane_wake.list_pending_events():
+                    key = event.get("idempotency_key") or ""
+                    # Consumer-side idempotency: skip a key already injected.
+                    if key and lane_wake.already_processed(key):
+                        lane_wake.mark_processed(event, outcome="already-processed")
+                        continue
+                    # ── ADMISSION (WTS 17cbc96c) ── FIRST, before the routing
+                    # source is built, before any injection, and therefore before
+                    # the model runs. A callback that does not carry authority
+                    # matching its dispatch record — wrong instance, wrong
+                    # session, wrong run/WTS/chain, missing identity, stale or
+                    # replayed — is recorded as evidence and dropped HERE. It
+                    # never becomes a turn, so it cannot inject into Telegram,
+                    # mutate WTS, attach a file, advance a chain or dispatch a
+                    # lane. On 2026-08-10 the absence of this check is what let
+                    # PTG's and Azul's lane results land in P1's session.
+                    admission = lane_wake.admit_callback(event)
+                    if not admission.ok:
+                        evidence = lane_wake.quarantine_callback(event, admission)
+                        logger.warning(
+                            "Lane-wake QUARANTINED (%s): callback for lane=%s run=%s "
+                            "wts=%s claimed instance=%r session=%r, this gateway is %r "
+                            "— NOT injected, no model turn, no WTS/chain/dispatch side "
+                            "effect. evidence=%s",
+                            admission.reason, event.get("lane"), event.get("run_id"),
+                            event.get("wts_task"), event.get("instance"),
+                            event.get("originating_session_id"),
+                            admission.receiving_instance, evidence or "(unwritten)",
+                        )
+                        # Consume it: a refused callback must not be retried
+                        # noisily, and must never fall back to another session.
+                        #
+                        # The outcome token is `refused-quarantine:<reason>` and
+                        # NOT `quarantined:<reason>` — the reaper reads this
+                        # marker back cross-process and used to wrap any non-empty
+                        # outcome as `wake=gateway-accepted(...)`, log it as the
+                        # canonical injection proof, and grade the run orch=DONE.
+                        # A refusal reported as the rail's strongest success
+                        # signal is worse than no signal (WTS 17cbc96c).
+                        lane_wake.mark_processed(
+                            event, outcome=lane_wake.refused_outcome(admission.reason)
+                        )
+                        continue
+                    source = self._build_process_event_source(event)
+                    if not source:
+                        logger.warning(
+                            "Lane-wake: dropping event with no routing metadata "
+                            "(run=%s wts=%s)",
+                            event.get("run_id"), event.get("wts_task"),
+                        )
+                        lane_wake.mark_processed(event, outcome="dropped-no-routing")
+                        continue
+                    platform_name = (
+                        source.platform.value
+                        if hasattr(source.platform, "value")
+                        else str(source.platform)
+                    )
+                    adapter = None
+                    for p, a in self.adapters.items():
+                        if p.value == platform_name:
+                            adapter = a
+                            break
+                    if not adapter:
+                        # No adapter for this platform on THIS gateway — leave the
+                        # event queued (do NOT mark processed); another gateway /
+                        # a later connect may own it. Avoid a hot loop on it.
+                        #
+                        # Item 4b (2026-06-14): a wake with no adapter is a
+                        # VISIBILITY STALL — the operator's continuation never fires
+                        # and, at debug level, the stall was effectively silent. Log
+                        # it LOUDLY (warning) with the run/wts/lane so a routing gap
+                        # is operator-recoverable instead of invisibly queued. We
+                        # still leave the event queued (another gateway may own it) —
+                        # this only raises the signal, it does not change at-most-once
+                        # delivery. Bounded de-dup: only warn once per (key) so a
+                        # genuinely cross-gateway event does not spam the log each
+                        # drain tick.
+                        _stall_seen = getattr(self, "_lane_wake_stall_warned", None)
+                        if _stall_seen is None:
+                            _stall_seen = set()
+                            self._lane_wake_stall_warned = _stall_seen
+                        if key not in _stall_seen:
+                            _stall_seen.add(key)
+                            logger.warning(
+                                "Lane-wake STALL: no adapter for platform=%s on this "
+                                "gateway — continuation for lane=%s wts=%s run=%s is "
+                                "QUEUED but NOT delivered here; another gateway must "
+                                "own it or the operator continuation will not fire. "
+                                "Leaving event queued (at-most-once preserved).",
+                                platform_name,
+                                event.get("lane"),
+                                event.get("wts_task"),
+                                event.get("run_id"),
+                            )
+                        else:
+                            logger.debug(
+                                "Lane-wake: no adapter for platform=%s; event still "
+                                "queued (already warned)",
+                                platform_name,
+                            )
+                        continue
+                    synth_text = event.get("prompt") or lane_wake.build_continuation_prompt(
+                        wts_task=event.get("wts_task"),
+                        lane=event.get("lane") or "lane",
+                        gate=event.get("gate") or "",
+                        run_dir=event.get("run_dir") or "",
+                        result_relation=event.get("result_relation"),
+                        result_file=event.get("result_file"),
+                        result_sha=event.get("result_sha"),
+                    )
+                    try:
+                        synth_event = MessageEvent(
+                            text=synth_text,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            internal=True,
+                        )
+                        logger.info(
+                            "Lane-wake: injecting continuation for %s chat=%s "
+                            "lane=%s gate=%s wts=%s run=%s",
+                            platform_name, source.chat_id,
+                            event.get("lane"), event.get("gate"),
+                            event.get("wts_task"), event.get("run_id"),
+                        )
+                        # Atomically claim BEFORE injecting so a crash mid-turn cannot
+                        # cause a re-inject loop and parallel drains cannot both
+                        # inject the same lane result. The result is already durable
+                        # in WTS + the transcript mirror, so wake delivery is
+                        # intentionally at-most-once.
+                        if not lane_wake.claim_processed(event, outcome="claimed"):
+                            logger.info(
+                                "Lane-wake: skipping already-claimed event key=%s run=%s wts=%s",
+                                key, event.get("run_id"), event.get("wts_task"),
+                            )
+                            continue
+                        await adapter.handle_message(synth_event)
+                        lane_wake.mark_processed(event, outcome="injected")
+                    except Exception as inj_exc:
+                        lane_wake.mark_processed(event, outcome="injection-error")
+                        logger.error("Lane-wake injection error: %s", inj_exc)
+            except Exception as loop_exc:
+                logger.error("Lane-wake drain loop error: %s", loop_exc)
+            await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
@@ -12227,6 +12826,14 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+        # Fleet-repair 1.2: one clarify per TURN — reset the transport's
+        # used-flag when a cached agent starts a fresh turn.
+        _cb = getattr(agent, "clarify_callback", None)
+        if _cb is not None and hasattr(_cb, "reset_for_turn"):
+            try:
+                _cb.reset_for_turn()
+            except Exception:
+                pass
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
@@ -12734,6 +13341,58 @@ class GatewayRunner:
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
+        # ── Option-3 capability credential — messaging-path System-A principal ──
+        # The HTTP path (api_server.py) mints the per-turn capability after
+        # classifying the Bearer principal. The messaging path has no request /
+        # Bearer token, so the System-A principal here is proven by *which gateway
+        # process is running*: the default P1 coordinator gateway sets
+        # ``dd_system_a_principal: true`` in its own config; specialist profile
+        # gateways do NOT (fail-closed default). We mint System-A ONLY for this
+        # gateway's genuine Telegram coordinator turn, AND only when the deploy
+        # toolset is actually enabled for the surface (couples B to A). Any other
+        # caller (other platform, profile gateway, lane/delivery via HTTP, a
+        # child dispatched out-of-process) does not satisfy the AND-gate and gets
+        # no mint → contextvar unset → resources default-deny, exactly as today.
+        # This extends the single principal model with one more *trusted-process*
+        # source; the A/B→caps mapping stays singular and fail-closed in
+        # capability_issuer.mint_for_turn. See
+        # reviews/specs/p1-deploy-telegram-systema-design-2026-06-03.md.
+        # The credential is bound to the task-local capability_context contextvar;
+        # because run_conversation runs via _run_in_executor_with_context (which
+        # copy_context()s), a credential set here propagates into the tool egress.
+        # Cleared in the finally (clear_credential) to prevent cross-turn bleed on
+        # the cached event loop / reused AIAgent instance.
+        #
+        # Review advisory (1): the "needs clearing" flag is set the moment we
+        # DECIDE to mint — BEFORE the mint call — so the finally-clear is
+        # unconditional with respect to the mint. If mint_for_turn binds the
+        # credential and then raises before any post-mint statement runs, the
+        # finally still clears it. clear_credential() is a safe no-op when nothing
+        # was bound, so over-clearing is harmless; under-clearing (a leak) is not.
+        _dd_capability_clear_needed = False
+        try:
+            if _is_system_a_messaging_turn(
+                user_config=user_config,
+                platform=source.platform,
+                enabled_toolsets=enabled_toolsets,
+            ):
+                from gateway import capability_issuer
+                # Arm the finally-clear BEFORE minting: from here on, any path that
+                # could have bound the contextvar is guaranteed to be cleared.
+                _dd_capability_clear_needed = True
+                # mint_for_turn binds the credential into the capability_context
+                # contextvar itself. Returns None (and binds nothing) if the
+                # signer key is absent — fail-closed.
+                capability_issuer.mint_for_turn(system="A", session_id=session_id)
+        except Exception as _cap_err:
+            # Capability minting must NEVER block a turn (same posture as
+            # api_server.py). On any failure the turn proceeds uncredentialed and
+            # protected resources default-deny — the correct fail-closed outcome.
+            # We deliberately leave _dd_capability_clear_needed as-is: if it was
+            # armed before the mint raised, the finally will still clear any
+            # partially-bound credential.
+            logger.debug("messaging-path capability mint skipped: %s", _cap_err)
+
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
             display_config = {}
@@ -13108,6 +13767,14 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
+
+        # DecisionData / MC Live observability for real Hermes gateway runs.
+        # Use a non-sensitive synthetic grouping key instead of the raw platform
+        # session key, which can contain chat/user identifiers.
+        _dd_run_id = _dd_observability_run_id(session_id, run_generation)
+        _dd_session_key = _dd_observability_session_key(session_id)
+        _dd_generation_logged = False
+        _dd_context: dict | None = None
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -13167,7 +13834,7 @@ class GatewayRunner:
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, _dd_generation_logged, _dd_context
 
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
@@ -13327,6 +13994,27 @@ class GatewayRunner:
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
+            _dd_provider = (turn_route.get("runtime") or {}).get("provider") or runtime_kwargs.get("provider")
+            _dd_model = turn_route.get("model") or model
+            _dd_profile = _dd_observability_active_profile()
+            _dd_observability_post("/log_spawn", {
+                "run_id": _dd_run_id,
+                "session_key": _dd_session_key,
+                "task_prompt": str(message)[:1000],
+                "label": (f"Hermes {_dd_profile} turn" if _dd_profile
+                          else f"Hermes {platform_key} turn"),
+                "profile": _dd_profile or "default",
+                "model": _dd_model,
+                "provider": _dd_provider,
+                "spawned_at": _utc_iso(),
+                "channel": "hermes",
+                "spawn_context": json.dumps({
+                    "platform": platform_key,
+                    "history_messages": len(history or []),
+                    "source": "hermes_gateway",
+                }, ensure_ascii=False),
+            }, user_config)
+
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
@@ -13356,7 +14044,10 @@ class GatewayRunner:
                         logger.debug("Reusing cached agent for session %s", session_key)
 
             if agent is None:
-                # Config changed or first message — create fresh agent
+                # Config changed or first message — create fresh agent.
+                # Fleet-repair 1.2: the clarify transport must be wired at
+                # CONSTRUCTION (1.1 strips the tool when no callback exists).
+                _clarify_transport = _GatewayClarifyTransport(self, source)
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -13365,6 +14056,8 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+
+                    clarify_callback=_clarify_transport,
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
@@ -13388,6 +14081,9 @@ class GatewayRunner:
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                # 1.2: the transport touches agent activity while parked and
+                # extends its deadline by the parked time on resume.
+                _clarify_transport.agent = agent
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         _cache[session_key] = (agent, _sig)
@@ -13396,6 +14092,16 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
+            # DecisionData identity must be re-attached per turn so a cached
+            # agent reused across turns never inherits the prior turn's run_id
+            # or its per_call_generation_emitted flag (#hermes-mc-live-handoff).
+            _dd_context = _attach_dd_context_for_turn(
+                agent,
+                run_id=_dd_run_id,
+                session_key=_dd_session_key,
+                route_key=session_key,
+                gateway_session_id=session_id,
+            )
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
@@ -13757,6 +14463,31 @@ class GatewayRunner:
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
+            def _log_dd_generation_once(stop_reason: str | None = None) -> None:
+                nonlocal _dd_generation_logged
+                if _dd_generation_logged:
+                    return
+                _dd_generation_logged = True
+                _dd_observability_post("/log_generation", {
+                    "generation_id": f"{_dd_run_id}:generation:1",
+                    "session_id": _dd_session_key,
+                    "run_id": _dd_run_id,
+                    "agent_id": "hermes-gateway",
+                    "model": _resolved_model or _dd_model or "unknown",
+                    "requested_at": _utc_iso(),
+                    "stop_reason": stop_reason,
+                    "tool_count": len(tools_holder[0] or []),
+                    "input_message_count": len(agent_history) + 1,
+                }, user_config)
+
+            # Skip the synthetic completion-time generation when the agent's
+            # per-API-call logger has already emitted at least one row for
+            # this turn — otherwise we double-count tokens/cost. The
+            # synthetic row only fires as a fallback for turns that never
+            # reached a successful provider response.
+            if not (isinstance(_dd_context, dict) and _dd_context.get("per_call_generation_emitted")):
+                _log_dd_generation_once("completed" if final_response else "empty_response")
+
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
                 return {
@@ -14027,6 +14758,25 @@ class GatewayRunner:
 
         _notify_task = asyncio.create_task(_notify_long_running())
 
+        try:
+            _dd_keepalive_interval = float(os.getenv("HERMES_DECISIONDATA_KEEPALIVE_INTERVAL", "10"))
+        except Exception:
+            _dd_keepalive_interval = 10.0
+        _dd_keepalive_interval = max(1.0, _dd_keepalive_interval)
+
+        async def _dd_keepalive_loop():
+            while True:
+                await asyncio.sleep(_dd_keepalive_interval)
+                await asyncio.to_thread(
+                    _dd_observability_post,
+                    "/log_keepalive",
+                    {"run_id": _dd_run_id},
+                    user_config,
+                )
+
+        _dd_keepalive_task = asyncio.create_task(_dd_keepalive_loop())
+
+        response = None
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -14425,11 +15175,49 @@ class GatewayRunner:
                     channel_prompt=next_channel_prompt,
                 )
         finally:
-            # Stop progress sender, interrupt monitor, and notification task
+            # Clear any per-turn System-A capability credential bound for this
+            # messaging turn so it never bleeds into the next turn that reuses
+            # this cached AIAgent / event-loop context. Armed before the mint
+            # (review advisory 1), so this runs even if mint_for_turn bound the
+            # credential and then raised. No-op if nothing was minted.
+            if _dd_capability_clear_needed:
+                try:
+                    from gateway import capability_context as _cap_ctx
+                    _cap_ctx.clear_credential()
+                except Exception:
+                    pass
+
+            # Complete the MC Live run before tearing down keepalive.
+            try:
+                _result_obj = response if isinstance(response, dict) else (result_holder[0] or {})
+                _failed = bool(_result_obj.get("failed")) if isinstance(_result_obj, dict) else False
+                _interrupted = bool(_result_obj.get("interrupted")) if isinstance(_result_obj, dict) else False
+                _status = "error" if _failed else "interrupted" if _interrupted else "done"
+                _summary = ""
+                if isinstance(_result_obj, dict):
+                    _summary = str(_result_obj.get("final_response") or _result_obj.get("error") or "")[:1000]
+                await asyncio.to_thread(
+                    _dd_observability_post,
+                    "/log_complete",
+                    {
+                        "run_id": _dd_run_id,
+                        "status": _status,
+                        "result_summary": _summary,
+                        "input_tokens": _result_obj.get("input_tokens") if isinstance(_result_obj, dict) else None,
+                        "output_tokens": _result_obj.get("output_tokens") if isinstance(_result_obj, dict) else None,
+                        "completed_at": _utc_iso(),
+                    },
+                    user_config,
+                )
+            except Exception as _dd_complete_err:
+                logger.debug("DecisionData observability complete failed: %s", _dd_complete_err)
+
+            # Stop progress sender, interrupt monitor, notification, and keepalive tasks
             if progress_task:
                 progress_task.cancel()
             interrupt_monitor.cancel()
             _notify_task.cancel()
+            _dd_keepalive_task.cancel()
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
@@ -14457,7 +15245,7 @@ class GatewayRunner:
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task]:
+            for task in [progress_task, interrupt_monitor, tracking_task, _notify_task, _dd_keepalive_task]:
                 if task:
                     try:
                         await task

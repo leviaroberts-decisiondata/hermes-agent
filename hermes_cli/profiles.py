@@ -809,6 +809,107 @@ def get_active_profile_name() -> str:
     return "custom"
 
 
+# Independent Hermes homes live BESIDE the default home as ``~/.hermes-<slug>``
+# (Personal/Classic, PTG, Azul, Hyperscience). ``get_active_profile_name`` maps
+# every one of them to "custom", which is correct for its own callers but is not
+# an identity — three homes answering "custom" cannot be told apart.
+_HOME_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def get_active_home_id() -> str:
+    """Stable, non-secret identity for the Hermes instance running this process.
+
+    Derived from HERMES_HOME — trusted runtime configuration, never a model
+    argument — and stable across ordinary gateway restarts.
+
+        ``~/.hermes``                  -> "default"
+        ``~/.hermes/profiles/<name>``  -> "<name>"
+        ``~/.hermes-<slug>``           -> "<slug>"
+        anything else                  -> ""   (unknown; callers MUST fail closed)
+
+    Deliberately SEPARATE from :func:`get_active_profile_name`, which must keep
+    returning "custom" for sibling homes. That function has 17 non-test callers,
+    including the honcho memory plugin, which uses its return value to namespace
+    agent memory — widening it would re-namespace the memory of every live
+    sibling-home agent. This function adds an identity without moving that one.
+
+    Returns "" rather than guessing. An empty result is never P1: callers treat
+    it as "unidentified caller" and refuse, so a misconfigured or unrecognised
+    home fails closed instead of inheriting P1's authority (WTS 17cbc96c).
+    """
+    from hermes_constants import get_hermes_home
+    try:
+        resolved = get_hermes_home().resolve()
+        # The NATIVE root, deliberately not get_default_hermes_root(): that helper
+        # returns HERMES_HOME itself for any home outside ~/.hermes, so every
+        # sibling home would compare equal to "the default" and answer "default".
+        # That is exactly the bug this function exists to close — measured
+        # 2026-08-10, get_active_profile_name() returns "default" (not "custom")
+        # for .hermes-classic/-ptg/-azul/-hyperscience for that reason.
+        native_root = (Path.home() / ".hermes").resolve()
+    except Exception:
+        return ""
+
+    if resolved == native_root:
+        return "default"
+
+    try:
+        rel = resolved.relative_to(native_root / "profiles")
+        if len(rel.parts) == 1 and _PROFILE_ID_RE.match(rel.parts[0]):
+            return rel.parts[0]
+    except (ValueError, OSError):
+        pass
+
+    # Sibling home: ``~/.hermes-<slug>`` beside the native root.
+    if resolved.parent == native_root.parent:
+        prefix = native_root.name + "-"
+        if resolved.name.startswith(prefix):
+            slug = resolved.name[len(prefix):]
+            if _HOME_SLUG_RE.match(slug):
+                return slug
+
+    # Unrecognised layout (including Docker roots outside ~). Fail closed.
+    return ""
+
+
+def is_canonical_p1_home() -> bool:
+    """True for P1 and for P1's OWN specialist profiles.
+
+    The authority test for P1-only dispatch capabilities (WTS 17cbc96c).
+
+    The trust boundary is the ``~/.hermes`` TREE, not the single default home.
+    ``~/.hermes/profiles/<name>`` gateways — dd-pmo, qa-review, dd-design,
+    architect-standards and the rest — are P1's own delegated specialists: they
+    live inside P1's home, share its config root, and dispatching lanes is their
+    normal job. The crossover this guard exists to stop came from SIBLING homes
+    (``~/.hermes-ptg``, ``~/.hermes-azul``, ``~/.hermes-hyperscience``), which are
+    independent installs with their own bots and clients.
+
+    An earlier revision tested ``== "default"`` and refused all 12 specialist
+    profiles, breaking a capability they have used across 500+ recorded
+    sessions. Fails closed exactly as before for siblings and for any home whose
+    identity cannot be resolved.
+    """
+    return is_p1_internal_home()
+
+
+def is_p1_internal_home() -> bool:
+    """True when HERMES_HOME is ``~/.hermes`` or one of its own profiles."""
+    from hermes_constants import get_hermes_home
+    try:
+        resolved = get_hermes_home().resolve()
+        native_root = (Path.home() / ".hermes").resolve()
+    except Exception:
+        return False
+    if resolved == native_root:
+        return True
+    try:
+        rel = resolved.relative_to(native_root / "profiles")
+    except (ValueError, OSError):
+        return False
+    return len(rel.parts) == 1 and bool(_PROFILE_ID_RE.match(rel.parts[0]))
+
+
 # ---------------------------------------------------------------------------
 # Export / Import
 # ---------------------------------------------------------------------------

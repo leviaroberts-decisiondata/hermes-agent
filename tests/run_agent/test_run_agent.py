@@ -758,6 +758,10 @@ class TestInit:
                 base_url="https://openrouter.ai/api/v1",
                 quiet_mode=True,
                 skip_context_files=True,
+                # load_soul_identity=True so this is NOT a P2 delivery build —
+                # otherwise the System A/B boundary strips "terminal" (see
+                # test_delivery_identity.py). Here we only assert name population.
+                load_soul_identity=True,
                 skip_memory=True,
             )
             assert a.valid_tool_names == {"web_search", "terminal"}
@@ -2004,6 +2008,7 @@ class TestConcurrentToolExecution:
                 session_id=agent.session_id,
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
+                caller_origin="system_b",
             )
             assert result == "result"
 
@@ -3608,6 +3613,17 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "device_code_exhausted"
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
+
+    def test_extract_api_error_context_parses_quota_reset_delay(self, agent, monkeypatch):
+        monkeypatch.setattr("run_agent.time.time", lambda: 1000.0)
+        error = SimpleNamespace(
+            body={"error": {"message": "rate limited quotaResetDelay: 2500ms"}},
+            response=SimpleNamespace(headers={}),
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reset_at"] == 1002.5
 
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")

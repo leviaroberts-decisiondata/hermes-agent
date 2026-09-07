@@ -1,0 +1,47 @@
+--- a/bin/dd-lane-run
++++ b/bin/dd-lane-run
+@@ -1615,6 +1615,7 @@
+   DD_WT_RUN_DIR="$run_dir" DD_WT_SESSION_KEY="$session_key" DD_WT_LANE="$lane" \
+   DD_WT_RUN_ID="$lane_run_id" DD_WT_WTS_TASK="$wts_task" DD_WT_IDEM_KEY="$idem_key" \
+   DD_WT_RECEIPT_ID="${idem_target_commit:-}" \
++  DD_WT_INSTANCE="${DD_CALLER_INSTANCE:-}" DD_WT_SESSION_ID="${DD_CALLER_SESSION_ID:-}" \
+   python3 - <<'PY_WAKE_TARGET' || true
+ import json, os
+ sk = os.environ.get("DD_WT_SESSION_KEY", "")
+@@ -1623,8 +1624,23 @@
+ if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+     platform, chat_type, chat_id = parts[2], parts[3], parts[4]
+     thread_id = parts[5] if len(parts) > 5 else ""
++    # WTS 17cbc96c: schema bumped to wake-target/2, which adds the callback
++    # AUTHORITY the reaper/gateway need to route a result back to the EXACT
++    # originating instance + session. Levi's Telegram chat id is identical
++    # across all five bots, so platform+chat_id is not an authority; on
++    # 2026-08-10 that is how PTG's and Azul's lane results were injected into
++    # P1's session. Readers MUST tolerate wake-target/1 (every historical run
++    # on disk) and treat its missing fields as UNKNOWN — never as P1.
++    #
++    # instance/session come from the DISPATCHING process via env, not from
++    # HERMES_HOME: route_to_lane pins HERMES_HOME to the shared DecisionData
++    # home before invoking the wrapper, so deriving identity here would label
++    # every caller "default". Absent env => the fields are omitted and the
++    # callback is quarantined on return, which is the intended failure mode.
++    instance = (os.environ.get("DD_WT_INSTANCE") or "").strip()
++    session_id = (os.environ.get("DD_WT_SESSION_ID") or "").strip()
+     env = {
+-        "schema": "wake-target/1",
++        "schema": "wake-target/2",
+         "session_key": sk,
+         "platform": platform,
+         "chat_type": chat_type,
+@@ -1636,6 +1652,11 @@
+         "idempotency_key": os.environ.get("DD_WT_IDEM_KEY", "") or None,
+         "expected_result_route": platform,  # the transport P1's result is expected on
+     }
++    if instance:
++        env["instance"] = instance
++        env["destination_instance"] = instance
++    if session_id:
++        env["session_id"] = session_id
+     rd = os.environ["DD_WT_RUN_DIR"]
+     path = os.path.join(rd, "wake-target")
+     # Restrictive perms: this sidecar carries the raw chat_id (the only sensitive leg).

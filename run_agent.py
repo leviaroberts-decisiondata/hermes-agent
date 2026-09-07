@@ -318,6 +318,36 @@ class IterationBudget:
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
+
+def _is_manifest_bookkeeping_call(tool_call) -> bool:
+    """Fleet-repair 3.1 (WTS 7e1d32e9): True only for a terminal call whose
+    ENTIRE command is a single dd-lane-manifest invocation. The closeout fuse
+    exists to stop new investigation, not to stop a run from recording what it
+    found — but the exemption must be smuggle-proof: any shell chaining,
+    substitution, redirect, or newline disqualifies the call (a refused
+    bookkeeping write still has the daemon-harvest fallback; a smuggled
+    investigation has no backstop)."""
+    try:
+        if tool_call.function.name != "terminal":
+            return False
+        args = json.loads(tool_call.function.arguments or "{}")
+        cmd = (args.get("command") or "") if isinstance(args, dict) else ""
+        if not cmd or "$(" in cmd:
+            return False
+        if any(ch in cmd for ch in ";|&`><\n"):
+            return False
+        import shlex
+        tokens = shlex.split(cmd)
+        if not tokens:
+            return False
+        head = os.path.basename(tokens[0])
+        if head == "dd-lane-manifest":
+            return True
+        return (head in ("python", "python3") and len(tokens) > 1
+                and os.path.basename(tokens[1]) == "dd-lane-manifest")
+    except Exception:
+        return False
+
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
@@ -869,6 +899,324 @@ def _pool_may_recover_from_rate_limit(
     return len(pool.entries()) > 1
 
 
+def _build_hermes_context_usage_payload(
+    *,
+    canonical_usage: Any,
+    model: str,
+) -> Dict[str, Any]:
+    """Build the MC `hermes_context_usage` payload from a normalised usage object.
+
+    Total context tokens is the full provider-reported prefill the model saw:
+    ``input_tokens + cache_read_tokens + cache_write_tokens``. Output tokens are
+    recorded in ``components`` for debugging but excluded from the bar count.
+    Limit/floor come from the same env vars mc-api reads, so a single source of
+    truth controls bar scale on both sides.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    _input = int(getattr(canonical_usage, "input_tokens", 0) or 0)
+    _output = int(getattr(canonical_usage, "output_tokens", 0) or 0)
+    _cache_read = int(getattr(canonical_usage, "cache_read_tokens", 0) or 0)
+    _cache_write = int(getattr(canonical_usage, "cache_write_tokens", 0) or 0)
+    total = _input + _cache_read + _cache_write
+
+    bar_limit = int(os.environ.get("HERMES_CONTEXT_LIMIT", 400_000))
+    floor = int(os.environ.get("HERMES_CONTEXT_FLOOR", 320_000))
+    pct = round(total / bar_limit * 100, 2) if bar_limit else 0.0
+    floor_pct = round(floor / bar_limit * 100, 2) if bar_limit else 0.0
+    if total >= floor:
+        status = "red"
+    elif total >= floor * 0.5:
+        status = "yellow"
+    else:
+        status = "green"
+
+    return {
+        "tokens": total,
+        "limit": bar_limit,
+        "floor": floor,
+        "remaining": max(0, floor - total),
+        "pct": pct,
+        "floor_pct": floor_pct,
+        "status": status,
+        "found": True,
+        "estimated": False,
+        "source": "provider_usage",
+        "model": model or "",
+        "updated_at": _dt.now(tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "components": {
+            "input_tokens": _input,
+            "cache_read_input_tokens": _cache_read,
+            "cache_creation_input_tokens": _cache_write,
+            "output_tokens": _output,
+            "total_context_tokens": total,
+        },
+    }
+
+
+def _dd_obs_json(value: Any) -> Optional[str]:
+    """JSON-encode observability content without failing the agent loop."""
+    if value is None:
+        return None
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        try:
+            return json.dumps(str(value), ensure_ascii=False)
+        except Exception:
+            return None
+
+
+def _dd_obj_to_plain(value: Any) -> Any:
+    """Best-effort object → JSON-ish conversion for provider SDK objects."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _dd_obj_to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_dd_obj_to_plain(v) for v in value]
+    for attr in ("model_dump", "dict", "to_dict"):
+        fn = getattr(value, attr, None)
+        if callable(fn):
+            try:
+                return _dd_obj_to_plain(fn())
+            except Exception:
+                pass
+    if hasattr(value, "__dict__"):
+        try:
+            return {
+                str(k): _dd_obj_to_plain(v)
+                for k, v in vars(value).items()
+                if not str(k).startswith("_")
+            }
+        except Exception:
+            pass
+    return str(value)
+
+
+def _dd_response_content_blocks(response_obj: Any) -> list:
+    """Normalize provider response content into MC generation_content blocks."""
+    if response_obj is None:
+        return []
+    try:
+        # Anthropic Messages: response.content is already a list of content blocks.
+        content = getattr(response_obj, "content", None)
+        if isinstance(content, list):
+            return _dd_obj_to_plain(content)
+        if isinstance(content, str) and content:
+            return [{"type": "text", "text": content}]
+
+        # OpenAI Chat Completions-compatible responses.
+        choices = getattr(response_obj, "choices", None)
+        if choices:
+            choice0 = choices[0]
+            message = getattr(choice0, "message", None)
+            if message is not None:
+                blocks = []
+                msg_content = getattr(message, "content", None)
+                if msg_content:
+                    blocks.append({"type": "text", "text": msg_content})
+                reasoning = getattr(message, "reasoning", None) or getattr(message, "reasoning_content", None)
+                if reasoning:
+                    blocks.append({"type": "thinking", "thinking": reasoning})
+                tool_calls = getattr(message, "tool_calls", None) or []
+                for tc in tool_calls:
+                    fn = getattr(tc, "function", None)
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": getattr(tc, "id", None),
+                        "name": getattr(fn, "name", None) if fn else None,
+                        "input": getattr(fn, "arguments", None) if fn else _dd_obj_to_plain(tc),
+                    })
+                return blocks
+
+        # OpenAI Responses/Codex style.
+        output = getattr(response_obj, "output", None)
+        if output:
+            blocks = []
+            for item in output:
+                plain = _dd_obj_to_plain(item)
+                if isinstance(plain, dict) and plain.get("content"):
+                    for c in plain.get("content") or []:
+                        blocks.append(c if isinstance(c, dict) else {"type": "text", "text": str(c)})
+                else:
+                    blocks.append(plain if isinstance(plain, dict) else {"type": "text", "text": str(plain)})
+            return blocks
+        output_text = getattr(response_obj, "output_text", None)
+        if output_text:
+            return [{"type": "text", "text": output_text}]
+    except Exception:
+        pass
+    return [{"type": "raw_response", "text": str(_dd_obj_to_plain(response_obj))}]
+
+
+def _emit_dd_per_call_generation(
+    *,
+    dd_obs_module,
+    run_id: Optional[str],
+    session_key: Optional[str],
+    session_id_fallback: Optional[str],
+    model: str,
+    provider: Optional[str],
+    requested_at: str,
+    completed_at: Optional[str],
+    latency_ms: Optional[int],
+    canonical_usage: Any,
+    cost_amount_usd: Optional[float],
+    dd_context: Optional[dict],
+    request_messages: Any = None,
+    response_obj: Any = None,
+    system_prompt: Optional[str] = None,
+) -> None:
+    """Emit a per-API-call /log_generation row for a Hermes gateway turn.
+
+    Caller MUST pass identity (run_id/session_key/dd_context) via kwargs
+    after capturing them into locals at API-call start, NOT by reading
+    ``self._dd_*`` at write time. This keeps turn N from writing under
+    turn N+1's run_id when the cached AIAgent is reused across turns.
+
+    Uses ``log_generation_sync`` so the helper has a real accepted/failed
+    signal from obs-ingest. The flag is flipped ONLY on a 2xx response so
+    that a transport/registry/schema failure leaves the synthetic
+    fallback row intact (otherwise MC Live would lose both rows). Any
+    exception is swallowed — observability must never block the agent
+    loop — but a False return likewise leaves the flag untouched.
+    """
+    try:
+        import uuid as _uuid
+
+        _input = int(getattr(canonical_usage, "input_tokens", 0) or 0)
+        _output = int(getattr(canonical_usage, "output_tokens", 0) or 0)
+        _cache_read = int(getattr(canonical_usage, "cache_read_tokens", 0) or 0)
+        _cache_write = int(getattr(canonical_usage, "cache_write_tokens", 0) or 0)
+        _cost = float(cost_amount_usd) if cost_amount_usd is not None else 0.0
+        _latency = int(latency_ms) if latency_ms is not None else None
+        _request_messages_json = _dd_obs_json(request_messages)
+        _content_blocks_json = _dd_obs_json(_dd_response_content_blocks(response_obj))
+        ok = dd_obs_module.log_generation_sync(
+            generation_id=_uuid.uuid4().hex,
+            session_id=session_key or session_id_fallback or "",
+            run_id=run_id,
+            model=model,
+            provider=provider,
+            requested_at=requested_at,
+            input_tokens=_input,
+            output_tokens=_output,
+            cache_read_tokens=_cache_read,
+            cache_creation_tokens=_cache_write,
+            cost_total_usd=_cost,
+            completed_at=completed_at,
+            latency_ms=_latency,
+            request_messages=_request_messages_json,
+            content_blocks=_content_blocks_json,
+            system_prompt=system_prompt,
+        )
+        if ok and isinstance(dd_context, dict):
+            dd_context["per_call_generation_emitted"] = True
+    except Exception:
+        # Never block the agent loop; leave per_call_generation_emitted
+        # untouched so the gateway still writes its synthetic fallback.
+        pass
+
+
+_DD_TOOL_PREVIEW_LIMIT = 4000
+_DD_TOOL_SUMMARY_LIMIT = 500
+_DD_SECRET_KEY_RE = re.compile(r"(?i)(api[_-]?key|token|secret|password|passwd|authorization|cookie|credential)")
+_DD_SECRET_VALUE_RE = re.compile(
+    r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}|"
+    r"(sk-[A-Za-z0-9._-]{12,})|"
+    r"(xox[baprs]-[A-Za-z0-9-]{12,})|"
+    r"([A-Za-z0-9_]*api[_-]?key[A-Za-z0-9_]*\s*[:=]\s*)['\"]?[^'\"\s,}]{8,}"
+)
+
+
+def _dd_safe_tool_value(value: Any, *, limit: int = _DD_TOOL_PREVIEW_LIMIT) -> str:
+    """Bound and redact tool telemetry previews before sending to MC.
+
+    Tool calls can include command output, environment-ish strings, or file
+    snippets. MC needs enough to operate, not raw unbounded payloads. This keeps
+    sensitive-looking keys/values out of observability and caps payload size.
+    """
+    try:
+        def _scrub(obj):
+            if isinstance(obj, dict):
+                return {
+                    str(k): ("[REDACTED]" if _DD_SECRET_KEY_RE.search(str(k)) else _scrub(v))
+                    for k, v in obj.items()
+                }
+            if isinstance(obj, list):
+                return [_scrub(v) for v in obj[:50]]
+            if isinstance(obj, tuple):
+                return tuple(_scrub(v) for v in obj[:50])
+            return obj
+
+        if isinstance(value, (dict, list, tuple)):
+            text = json.dumps(_scrub(value), ensure_ascii=False, default=str)
+        else:
+            text = str(value or "")
+    except Exception:
+        text = str(value or "")
+    text = _DD_SECRET_VALUE_RE.sub(lambda m: (m.group(1) or m.group(4) or "") + "[REDACTED]", text)
+    if len(text) > limit:
+        text = text[:limit] + "…[truncated]"
+    return text
+
+
+def _dd_iso_from_epoch(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    try:
+        from datetime import timezone as _tz
+        return datetime.fromtimestamp(float(ts), tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _emit_dd_tool_call(
+    *,
+    dd_obs_module,
+    run_id: Optional[str],
+    session_key: Optional[str],
+    session_id_fallback: Optional[str],
+    tool_name: str,
+    tool_args: Any,
+    tool_result: Any,
+    tool_call_id: Optional[str],
+    started_at_epoch: Optional[float],
+    completed_at_epoch: Optional[float],
+    is_error: bool = False,
+) -> None:
+    """Emit a bounded DecisionData /log_tool row for a Hermes tool call.
+
+    This intentionally does not return a success signal: tool observability is
+    useful for MC parity but must never alter Hermes execution flow.
+    """
+    try:
+        if not run_id or not tool_name or not hasattr(dd_obs_module, "log_tool"):
+            return
+        input_preview = _dd_safe_tool_value(tool_args, limit=_DD_TOOL_PREVIEW_LIMIT)
+        output_preview = _dd_safe_tool_value(tool_result, limit=_DD_TOOL_PREVIEW_LIMIT)
+        error_text = output_preview[:_DD_TOOL_SUMMARY_LIMIT] if is_error else None
+        dd_obs_module.log_tool(
+            run_id=run_id,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            started_at=_dd_iso_from_epoch(started_at_epoch),
+            completed_at=_dd_iso_from_epoch(completed_at_epoch),
+            input_summary=input_preview[:_DD_TOOL_SUMMARY_LIMIT],
+            output_summary=output_preview[:_DD_TOOL_SUMMARY_LIMIT],
+            error=error_text,
+            session_id=session_key or session_id_fallback or "",
+            # obs-ingest spans store tool_input/tool_output in JSON columns.
+            # Keep summaries human-readable, but make full-fidelity fields valid
+            # JSON so /log_tool sidecar reliably writes spans.
+            tool_input=json.dumps({"preview": input_preview}, ensure_ascii=False),
+            tool_output=json.dumps({"preview": output_preview}, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+
+
 def _qwen_portal_headers() -> dict:
     """Return default HTTP headers required by Qwen Portal API."""
     import platform as _plat
@@ -1021,6 +1369,19 @@ class AIAgent:
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+        # ── Execution deadline (WTS ac4bcb05) ──────────────────────────
+        # One absolute wall-clock contract for the whole run.  Sources:
+        # env (HERMES_DEADLINE_TS/HERMES_CLOSEOUT_TS — set by dd-lane-run
+        # for detached `hermes -z` specialists) or a direct attribute
+        # assignment by delegate_tool for in-process children.  None
+        # (gateway turns, plain CLI, short tasks) ⇒ zero behavior change.
+        try:
+            from agent.deadline import ExecutionDeadline as _ExecutionDeadline
+            self.execution_deadline = _ExecutionDeadline.from_env()
+        except Exception:
+            self.execution_deadline = None
+        self._closeout_active = False
+        self._deadline_expired = False
         self.tool_delay = tool_delay
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
@@ -1600,6 +1961,11 @@ class AIAgent:
             self._fallback_chain = []
         self._fallback_index = 0
         self._fallback_activated = getattr(self, "_fallback_activated", False)
+        # Fleet-repair 0.4 (WTS 7e1d32e9): durable record of every fallback
+        # activation this session — a degraded turn must never be visually
+        # identical to a good one. Never reset on primary-restore; this is a
+        # history of what happened, not current state.
+        self._fallback_events: list = []
         # Legacy attribute kept for backward compat (tests, external callers)
         self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
         if self._fallback_chain and not self.quiet_mode:
@@ -1616,7 +1982,48 @@ class AIAgent:
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
         )
-        
+
+        # P2 — System A/B boundary (capability removal, parsing-free).
+        # A delivery turn is built with skip_context_files=True AND
+        # load_soul_identity=False (the §4 replace_identity path); it is
+        # System B and must not be able to dispatch into System A. route_to_lane
+        # is the *direct* A-dispatch tool — removing it from the delivery toolset
+        # means the model has no tool to express a lane handoff, so there is
+        # nothing to parse and nothing to evade. This is parsing-free by
+        # construction; the caller_origin pre-tool block is defense-in-depth.
+        #
+        # NOTE: terminal / execute_code are *indirect* A-vectors (the gateway
+        # terminal tool can exec ~/.hermes/bin/dd-lane-run). They are deliberately
+        # NOT stripped here: the live delivery persona (slack-project-agent) is a
+        # producer that relies on shell to build deliverables. Closing that vector
+        # is pending a separate decision (strip vs. gate the lane-spawn resource);
+        # see .wip-quarantine/p2-full-strip-terminal-execute_code.md.
+        _is_delivery_build = bool(self.skip_context_files and not self.load_soul_identity)
+        self._delivery_stripped_tools: tuple = ()
+        if _is_delivery_build and self.tools:
+            _strip = {"route_to_lane", "wts_bind"}
+            _before = {t["function"]["name"] for t in self.tools}
+            self.tools = [t for t in self.tools if t["function"]["name"] not in _strip]
+            self._delivery_stripped_tools = tuple(sorted(_before & _strip))
+
+        # Fleet-repair 1.1 (WTS 7e1d32e9): never advertise a dead capability.
+        # With no platform callback wired, clarify hard-errors ("not available
+        # in this execution context") — yet every gateway turn advertised it,
+        # so agents burned a call on the error and then guessed. No callback ⇒
+        # clarify is omitted from the serialized tool list, and the agent puts
+        # its question in its answer instead. Transport implementers (items
+        # 1.2/1.3): pass clarify_callback at CONSTRUCTION — attaching it after
+        # __init__ will not restore the stripped tool.
+        if self.clarify_callback is None and self.tools:
+            _pre = len(self.tools)
+            self.tools = [t for t in self.tools if t["function"]["name"] != "clarify"]
+            if len(self.tools) != _pre:
+                logging.info(
+                    "%sclarify omitted from tool list: no clarify_callback wired "
+                    "for platform %r (fleet-repair 1.1 — a dead affordance must "
+                    "not be advertised).", self.log_prefix, self.platform,
+                )
+
         # Show tool configuration and store valid tool names for validation
         self.valid_tool_names = set()
         if self.tools:
@@ -1675,7 +2082,16 @@ class AIAgent:
         self.logs_dir = hermes_home / "sessions"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.session_log_file = self.logs_dir / f"session_{self.session_id}.json"
-        
+
+        # DecisionData observability — populated by gateway (api_server) when
+        # X-DD-Run-Id / X-DD-Parent-Run-Id headers are present on the request.
+        # When _dd_run_id is set, every API call emits /log_generation to
+        # obs-ingest (fire-and-forget, never blocks).
+        self._dd_run_id: Optional[str] = None
+        self._dd_parent_run_id: Optional[str] = None
+        self._dd_session_key: Optional[str] = None
+        self._dd_wts_task_id: Optional[str] = None
+
         # Track conversation messages for session logging
         self._session_messages: List[Dict[str, Any]] = []
         self._memory_write_origin = "assistant_tool"
@@ -2127,7 +2543,9 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
-        
+
+        self._last_context_usage: Optional[Dict[str, Any]] = None
+
         # ── Ollama num_ctx injection ──
         # Ollama defaults to 2048 context regardless of the model's capabilities.
         # When running against an Ollama server, detect the model's max context
@@ -2268,7 +2686,9 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
-        
+
+        self._last_context_usage = None
+
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
 
@@ -4188,7 +4608,7 @@ class AIAgent:
         if "reset_at" not in context:
             message = context.get("message") or ""
             if isinstance(message, str):
-                delay_match = re.search(r"quotaResetDelay[:\s\"]+(\\d+(?:\\.\\d+)?)(ms|s)", message, re.IGNORECASE)
+                delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
                 if delay_match:
                     value = float(delay_match.group(1))
                     seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
@@ -4367,6 +4787,38 @@ class AIAgent:
                 "messages": cleaned,
             }
 
+            if self._last_context_usage is not None:
+                entry["context_usage"] = self._last_context_usage
+
+            # 0.4: a session that ever degraded says so in its durable record.
+            if getattr(self, "_fallback_events", None):
+                entry["fallback_events"] = list(self._fallback_events)
+                entry["served_model_degraded"] = True
+
+            # Fleet-repair 5.2 (WTS 7e1d32e9): flag a long single-threaded
+            # DELIVERY turn that never delegated — the durable signal backing
+            # the role-card rule (prompt rules are not durable controls).
+            _is_delivery = bool(getattr(self, "skip_context_files", False)
+                                and not getattr(self, "load_soul_identity", True))
+            if _is_delivery:
+                _tool_names = []
+                for _m in cleaned:
+                    if not isinstance(_m, dict):
+                        continue
+                    for _tc in (_m.get("tool_calls") or []):
+                        if isinstance(_tc, dict):
+                            _n = (_tc.get("function") or {}).get("name")
+                            if _n:
+                                _tool_names.append(_n)
+                _st_threshold = int(os.environ.get(
+                    "DD_SLACK_SINGLE_THREAD_FLAG_CALLS", "15"))
+                if (len(_tool_names) >= _st_threshold
+                        and "delegate_task" not in _tool_names):
+                    entry["single_threaded_no_delegation"] = {
+                        "tool_calls": len(_tool_names),
+                        "threshold": _st_threshold,
+                    }
+
             atomic_json_write(
                 self.session_log_file,
                 entry,
@@ -4377,6 +4829,24 @@ class AIAgent:
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
+    
+    def _write_deadline_marker(self, name: str) -> None:
+        """Drop a deadline lifecycle marker into the supervising run_dir.
+
+        dd-lane-run exports DD_RUN_DIR into detached specialist children so
+        the daemon can classify partial-vs-completed from the markers
+        ("closeout-entered", "deadline-expired").  Best-effort: no run_dir
+        (gateway turns, plain CLI, delegate children) ⇒ no-op.
+        """
+        run_dir = os.environ.get("DD_RUN_DIR", "")
+        if not run_dir or not os.path.isdir(run_dir):
+            return
+        try:
+            from datetime import datetime, timezone
+            with open(os.path.join(run_dir, name), "w", encoding="utf-8") as fh:
+                fh.write(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n")
+        except OSError:
+            pass
 
     def interrupt(self, message: str = None) -> None:
         """
@@ -4899,6 +5369,87 @@ class AIAgent:
 
 
 
+    def _context_tree_injection_enabled(self) -> bool:
+        """Whether to inject the DecisionData /context tree awareness block.
+
+        Reads `context.tree_injection` from the active profile's config.yaml
+        (HERMES_HOME-scoped, mtime-cached → hot-reloads per turn). Default False,
+        so behavior is unchanged for any profile that does not opt in. Fail-soft:
+        any error → False (no injection).
+        """
+        try:
+            from hermes_cli.config import load_config as _load_ct_cfg
+            cfg = _load_ct_cfg() or {}
+            ctx = cfg.get("context") or {}
+            val = ctx.get("tree_injection")
+            if isinstance(val, bool):
+                return val
+            return str(val).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+        except Exception:
+            return False
+
+    def _resolve_context_audience(self) -> str:
+        """WS4 S1 — resolve the context-tree audience from the live identity.
+
+        Replaces the blind default ("p1-specialists") that gave every profile the
+        coordinator role view. Resolution order (WS4 §4.1):
+          1. delivery turn (skip_context_files + not load_soul_identity, set by the
+             §4 replace_identity path) → slack-project-agent (the delivery role);
+          2. platform == slack/api_server delivery → slack-project-agent;
+          3. profile == default → p1-default (the coordinator view);
+          4. profile is one of the 10 lane profiles → that lane's own view;
+          5. fallback → p1-default (safe coordinator default; NEVER silently the
+             generic p1-specialists).
+        Fail-soft: any error → p1-default.
+        """
+        try:
+            # A delivery turn (replace_identity) wants the delivery role, not P1.
+            if getattr(self, "skip_context_files", False) and not getattr(self, "load_soul_identity", True):
+                return "slack-project-agent"
+            platform = (self.platform or "").lower().strip()
+            if platform == "slack":
+                return "slack-project-agent"
+            # Resolve the profile defensively. If get_active_profile_name() raises,
+            # fall back to the HERMES_HOME-derived profile dir name rather than
+            # losing a known-specialist signal — a specialist must NOT silently
+            # receive the coordinator view just because the profile helper threw.
+            from agent.prompt_builder import _LANE_PROFILE_AUDIENCES
+            profile = ""
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                profile = (get_active_profile_name() or "").strip()
+            except Exception:
+                import os as _os
+                home = _os.environ.get("HERMES_HOME", "")
+                # ~/.hermes/profiles/<profile> → <profile>; ~/.hermes (default) → default
+                profile = _os.path.basename(home.rstrip("/")) if "/profiles/" in home else "default"
+                logger.debug("get_active_profile_name failed; derived profile=%r from HERMES_HOME", profile)
+            if profile in _LANE_PROFILE_AUDIENCES:
+                return profile
+            if profile == "default" or not profile:
+                return "p1-default"
+            # Unknown non-lane profile → p1-default (coordinator), NEVER the generic
+            # p1-specialists. This is the WS4 §4.1 step-5 safe default.
+            #
+            # graduation P1a (WTS 2911977a): this fallback is now LOGGED at WARNING,
+            # not debug. An unknown profile falling back to the coordinator view is a
+            # real gap — the profile is either new (needs its own specialist card +
+            # a _LANE_PROFILE_AUDIENCES entry, as security-review/video-review just
+            # got) or misspelled — and it means the reader silently receives P1
+            # coordinator deploy-authority text it may not be entitled to. Surface it.
+            logger.warning(
+                "audience resolver: unknown non-lane profile %r → falling back to "
+                "p1-default (coordinator view). If this profile injects the tree it "
+                "should have its own specialists/<profile>.md card and be added to "
+                "_LANE_PROFILE_AUDIENCES; otherwise it silently carries coordinator "
+                "deploy-authority text.",
+                profile,
+            )
+            return "p1-default"
+        except Exception:
+            logger.debug("audience resolver hard-failed → p1-default", exc_info=True)
+            return "p1-default"
+
     def _build_system_prompt(self, system_message: str = None) -> str:
         """
         Assemble the full system prompt from all layers.
@@ -5042,6 +5593,51 @@ class AIAgent:
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
 
+        # DecisionData /context tree awareness injection (gateway mirror of the
+        # Slack canary). Gated by config `context.tree_injection` (default off so
+        # only profiles that opt in get it). Read-only, fail-soft: a missing tree
+        # or disabled flag yields no block and leaves the prompt unchanged.
+        if self._context_tree_injection_enabled():
+            try:
+                from agent.prompt_builder import build_context_tree_prompt
+                # WS4 S1-S3 — resolve the audience per caller (the vestigial
+                # "p1-specialists" default is gone; audience is now required).
+                # This keeps the second P1-family injection (the coordinator role
+                # view) out of specialist + delivery turns. The resolver itself is
+                # fail-soft (any error → the safe p1-default coordinator view).
+                _audience = self._resolve_context_audience()
+                _ctx_tree = build_context_tree_prompt(audience=_audience)
+                if _ctx_tree:
+                    prompt_parts.append(_ctx_tree)
+                else:
+                    # Injection is ENABLED for this profile but the tree rendered
+                    # empty — a real gap (missing/broken /context tree), not a
+                    # no-op. Do not let it pass silently.
+                    logger.warning(
+                        "context-tree injection enabled but rendered EMPTY "
+                        "(audience=%r) — this turn carries NO operating contract "
+                        "from the /context tree.", _audience,
+                    )
+            except Exception:
+                # graduation P1a (WTS 2911977a): an opted-in profile silently
+                # losing its operating contract is worth a WARNING, not a debug
+                # line that never surfaces. Still fail-soft — the turn proceeds.
+                logger.warning(
+                    "context-tree injection FAILED (enabled profile) — this turn "
+                    "carries NO operating contract from the /context tree.",
+                    exc_info=True,
+                )
+
+        # WS2 §3 — collision-awareness advisory block. PASSIVE, ADVISORY-by-default:
+        # a "## Active Work" block injected at this same WS4 seam so an agent SEES
+        # who/what else is active before it acts, every turn, with no query and no
+        # UI. Default-OFF behind ENABLE_ACTIVE_WORK_AWARENESS=1; read-only, fail-soft
+        # (a down :8510 or disabled view yields no block and leaves the prompt
+        # unchanged — awareness must never break a turn).
+        _aw = self._build_active_work_awareness()
+        if _aw:
+            prompt_parts.append(_aw)
+
         from hermes_time import now as _hermes_now
         now = _hermes_now()
         timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
@@ -5085,6 +5681,37 @@ class AIAgent:
                 pass
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+
+    def _build_active_work_awareness(self) -> str:
+        """WS2 §3 — fetch the '## Active Work' collision-awareness advisory block
+        from the Service Layer (:8510) for injection at the WS4 context seam.
+
+        PASSIVE + ADVISORY + DEFAULT-OFF (ENABLE_ACTIVE_WORK_AWARENESS=1). Fully
+        best-effort/fail-soft: a disabled flag, a down/slow :8510, or any error
+        yields '' so the prompt is unchanged. Scoped to the turn's bound WTS task
+        family when known (self._dd_wts_task_id) so the block stays relevant, not
+        noisy. Read-only — it never writes any store.
+        """
+        if os.getenv("ENABLE_ACTIVE_WORK_AWARENESS", "").strip().lower() not in ("1", "true", "yes", "on"):
+            return ""
+        try:
+            base = os.getenv("AGENT_SERVICE_URL", "http://127.0.0.1:8510").rstrip("/")
+            params = {"max_rows": "8"}
+            bound = getattr(self, "_dd_wts_task_id", None)
+            if bound:
+                params["wts_task_family"] = str(bound)
+            try:
+                import httpx
+                with httpx.Client(timeout=2.5) as client:
+                    resp = client.get(f"{base}/work-registry/awareness", params=params)
+                if resp.status_code == 200:
+                    block = (resp.json() or {}).get("block") or ""
+                    return block.strip()
+            except Exception as exc:
+                logger.debug("active-work awareness skipped (:8510 unavailable: %s)", exc)
+        except Exception:
+            logger.debug("active-work awareness skipped (error)", exc_info=True)
+        return ""
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -6522,6 +7149,10 @@ class AIAgent:
         _stale_timeout = self._compute_non_stream_stale_timeout(
             api_kwargs.get("messages", [])
         )
+        # Cap the call to the run's remaining hard budget (WTS ac4bcb05
+        # AC3): a hung provider may never outlive the execution deadline.
+        if self.execution_deadline is not None:
+            _stale_timeout = self.execution_deadline.cap(_stale_timeout)
 
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
@@ -7478,6 +8109,11 @@ class AIAgent:
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
 
+        # Cap the stream wait to the run's remaining hard budget (WTS
+        # ac4bcb05 AC3) — mirrors the non-streaming cap above.
+        if self.execution_deadline is not None:
+            _stream_stale_timeout = self.execution_deadline.cap(_stream_stale_timeout)
+
         t = threading.Thread(target=_call, daemon=True)
         t.start()
         _last_heartbeat = time.time()
@@ -7649,6 +8285,12 @@ class AIAgent:
         fb_model = (fb.get("model") or "").strip()
         if not fb_provider or not fb_model:
             return self._try_activate_fallback()  # skip invalid, try next
+        if fb_provider == "copilot-acp" and os.getenv("HERMES_ENABLE_COPILOT_ACP_FALLBACK", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            logging.warning(
+                "Skipping copilot-acp fallback because it is not explicitly verified/enabled; "
+                "set HERMES_ENABLE_COPILOT_ACP_FALLBACK=1 after validating the local ACP command."
+            )
+            return self._try_activate_fallback()  # try next in chain
 
         # Use centralized router for client construction.
         # raw_codex=True because the main agent needs direct responses.stream()
@@ -7684,6 +8326,24 @@ class AIAgent:
                 fb_model = normalize_model_for_provider(fb_model, fb_provider)
             except Exception:
                 pass
+            if fb_provider in {"copilot", "copilot-acp"}:
+                try:
+                    from hermes_cli.models import provider_model_ids
+
+                    supported_models = {
+                        str(model_id).strip()
+                        for model_id in provider_model_ids(fb_provider)
+                        if str(model_id).strip()
+                    }
+                except Exception:
+                    supported_models = set()
+                if supported_models and fb_model not in supported_models:
+                    logging.warning(
+                        "Skipping fallback %s via %s: model is not in provider catalog",
+                        fb_model,
+                        fb_provider,
+                    )
+                    return self._try_activate_fallback()  # try next in chain
 
             # Determine api_mode from provider / base URL / model
             fb_api_mode = "chat_completions"
@@ -7721,6 +8381,18 @@ class AIAgent:
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
             self._fallback_activated = True
+            # 0.4: record the degradation durably (session log + delegate
+            # entries read this).
+            try:
+                self._fallback_events.append({
+                    "from_model": old_model,
+                    "to_model": fb_model,
+                    "to_provider": fb_provider,
+                    "reason": getattr(reason, "name", None) or (str(reason) if reason else None),
+                    "at": datetime.now().isoformat(),
+                })
+            except Exception:
+                pass
 
             # Honor per-provider / per-model request_timeout_seconds for the
             # fallback target (same knob the primary client uses).  None = use
@@ -9426,6 +10098,77 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # ── Closeout fuse: no new tool calls once closeout begins ──────
+        # (WTS ac4bcb05 AC2.)  The remaining budget is reserved for
+        # synthesis + the terminal receipt; the model already received the
+        # CLOSEOUT_INSTRUCTION and must answer with text.  Every requested
+        # call gets an explicit refusal tool-result so the conversation
+        # stays well-formed for the final synthesis API call.
+        if self._closeout_active or (
+            self.execution_deadline is not None and self.execution_deadline.in_closeout()
+        ):
+            self._closeout_active = True
+            # Fleet-repair 3.1 (WTS 7e1d32e9): the RESULT CONTRACT requires
+            # dd-lane-manifest gate/blocker/provenance/next-owner writes at
+            # exactly this moment — the old blanket refusal destroyed two runs
+            # (2,287.9s) and corrupted a third's manifest on mission 87211c6c.
+            # A call whose entire command is one dd-lane-manifest invocation
+            # executes; everything else is refused as before.
+            _bookkept = 0
+            for tool_call in tool_calls:
+                if _is_manifest_bookkeeping_call(tool_call):
+                    try:
+                        _bk_args = json.loads(tool_call.function.arguments or "{}")
+                    except (ValueError, TypeError):
+                        _bk_args = {}
+                    _bk_result = self._invoke_tool(
+                        tool_call.function.name,
+                        _bk_args if isinstance(_bk_args, dict) else {},
+                        effective_task_id,
+                        tool_call_id=tool_call.id,
+                        messages=messages,
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "content": _bk_result,
+                        "tool_call_id": tool_call.id,
+                    })
+                    _bookkept += 1
+                    continue
+                messages.append({
+                    "role": "tool",
+                    "content": (
+                        "[CLOSEOUT ACTIVE — tool call refused] The execution "
+                        "budget is in its reserved closeout window; no new "
+                        "investigation may start. dd-lane-manifest bookkeeping "
+                        "calls are still permitted. Produce your final or "
+                        "PARTIAL result now from the evidence already in "
+                        "this conversation."
+                    ),
+                    "tool_call_id": tool_call.id,
+                })
+            self._touch_activity(
+                "closeout: %d manifest bookkeeping call(s) executed, rest "
+                "refused, awaiting synthesis" % _bookkept if _bookkept else
+                "closeout: refused tool batch, awaiting synthesis")
+            return
+
+        # ── Per-call budget cap (WTS ac4bcb05 AC3) ─────────────────────
+        # A tool call may never outlive the run's remaining hard budget:
+        # clamp explicit timeout arguments (terminal, web, …) so a single
+        # blocking call cannot eat the closeout window.
+        if self.execution_deadline is not None:
+            _cap = self.execution_deadline.cap(float("inf"))
+            for tool_call in tool_calls:
+                try:
+                    _args = json.loads(tool_call.function.arguments or "{}")
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(_args, dict) and isinstance(_args.get("timeout"), (int, float)):
+                    if _args["timeout"] > _cap:
+                        _args["timeout"] = int(_cap)
+                        tool_call.function.arguments = json.dumps(_args)
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
@@ -9469,12 +10212,21 @@ class AIAgent:
         its own inline invocation for backward-compatible display handling.
         """
         # Check plugin hooks for a block directive before executing anything.
+        # Per-turn System A / System B origin (delivery turn == skip_context_files
+        # and not load_soul_identity); see the sequential path for the rationale.
+        # Carried here too so the concurrent path is not a boundary bypass.
+        _is_delivery_turn = bool(
+            getattr(self, "skip_context_files", False)
+            and not getattr(self, "load_soul_identity", True)
+        )
+        _caller_origin = "system_b" if _is_delivery_turn else "system_a"
         block_message: Optional[str] = None
         if not pre_tool_block_checked:
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    caller_origin=_caller_origin,
                 )
             except Exception:
                 pass
@@ -9535,6 +10287,34 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
+        elif function_name == "route_to_lane":
+            # WS8 §4: route_to_lane needs `parent_agent` (this agent) to read the
+            # turn's bound WTS task (self._dd_wts_task_id) and default --wts-task
+            # to it. The generic registry.dispatch path does not forward
+            # parent_agent, so call the tool directly here (mirrors the
+            # delegate_task special-case) to thread the agent through.
+            from tools.route_to_lane_tool import route_to_lane as _route_to_lane
+            return _route_to_lane(
+                lane=function_args.get("lane"),
+                goal=function_args.get("goal"),
+                context=function_args.get("context"),
+                wts_task=function_args.get("wts_task"),
+                packet=function_args.get("packet"),
+                parent_agent=self,
+            )
+        elif function_name == "wts_bind":
+            # G1 (P5 review): wts_bind needs `parent_agent` to derive the Telegram
+            # chat id from this turn's routing key, same threading reason as
+            # route_to_lane. Call directly so parent_agent is forwarded.
+            from tools.wts_bind_tool import wts_bind as _wts_bind
+            return _wts_bind(
+                goal=function_args.get("goal"),
+                chat=function_args.get("chat"),
+                thread=function_args.get("thread"),
+                notes=function_args.get("notes"),
+                resolve_only=bool(function_args.get("resolve_only", False)),
+                parent_agent=self,
+            )
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -9542,6 +10322,7 @@ class AIAgent:
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
+                caller_origin=_caller_origin,
             )
 
     @staticmethod
@@ -9636,6 +10417,10 @@ class AIAgent:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 block_message = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    caller_origin=("system_b" if (
+                        getattr(self, "skip_context_files", False)
+                        and not getattr(self, "load_soul_identity", True)
+                    ) else "system_a"),
                 )
             except Exception:
                 block_message = None
@@ -9753,8 +10538,26 @@ class AIAgent:
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
-            duration = time.time() - start
+            completed = time.time()
+            duration = completed - start
             is_error, _ = _detect_tool_failure(function_name, result)
+            try:
+                import dd_obs as _dd_obs
+                _emit_dd_tool_call(
+                    dd_obs_module=_dd_obs,
+                    run_id=getattr(self, "_dd_run_id", None),
+                    session_key=getattr(self, "_dd_session_key", None),
+                    session_id_fallback=self.session_id or "",
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    tool_result=result,
+                    tool_call_id=getattr(tool_call, "id", None),
+                    started_at_epoch=start,
+                    completed_at_epoch=completed,
+                    is_error=is_error,
+                )
+            except Exception:
+                pass
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
@@ -9982,11 +10785,26 @@ class AIAgent:
                 function_args = {}
 
             # Check plugin hooks for a block directive before executing.
+            #
+            # Per-turn caller origin for the System A / System B boundary: a
+            # delivery turn is built with skip_context_files=True AND
+            # load_soul_identity=False (the §4 replace_identity path) — the SAME
+            # pair this module already treats as "the delivery role, not P1"
+            # (see _resolve_*_role around the skip_context_files check). That is
+            # System B; everything else (the P1 coordinator, specialist
+            # gateways, CLI) is System A. We pass it to the guard so a delivery
+            # turn cannot reach into a specialist/lane.
+            _is_delivery_turn = bool(
+                getattr(self, "skip_context_files", False)
+                and not getattr(self, "load_soul_identity", True)
+            )
+            _caller_origin = "system_b" if _is_delivery_turn else "system_a"
             _block_msg: Optional[str] = None
             try:
                 from hermes_cli.plugins import get_pre_tool_call_block_message
                 _block_msg = get_pre_tool_call_block_message(
                     function_name, function_args, task_id=effective_task_id or "",
+                    caller_origin=_caller_origin,
                 )
             except Exception:
                 pass
@@ -10143,6 +10961,44 @@ class AIAgent:
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('clarify', function_args, tool_duration, result=function_result)}")
+            elif function_name == "route_to_lane":
+                # WS8 §4 (sequential path): thread parent_agent so route_to_lane
+                # can default --wts-task to the turn's bound id (self._dd_wts_task_id).
+                from tools.route_to_lane_tool import route_to_lane as _route_to_lane
+                _rtl_result = None
+                try:
+                    function_result = _route_to_lane(
+                        lane=function_args.get("lane"),
+                        goal=function_args.get("goal"),
+                        context=function_args.get("context"),
+                        wts_task=function_args.get("wts_task"),
+                        packet=function_args.get("packet"),
+                        parent_agent=self,
+                    )
+                    _rtl_result = function_result
+                except Exception as tool_error:
+                    function_result = f"Error executing tool 'route_to_lane': {tool_error}"
+                    logger.error("route_to_lane raised: %s", tool_error, exc_info=True)
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('route_to_lane', function_args, tool_duration, result=_rtl_result)}")
+            elif function_name == "wts_bind":
+                # G1 (P5 review, sequential path): thread parent_agent so wts_bind
+                # can derive the Telegram chat id from this turn's routing key.
+                from tools.wts_bind_tool import wts_bind as _wts_bind
+                try:
+                    function_result = _wts_bind(
+                        goal=function_args.get("goal"),
+                        chat=function_args.get("chat"),
+                        thread=function_args.get("thread"),
+                        notes=function_args.get("notes"),
+                        resolve_only=bool(function_args.get("resolve_only", False)),
+                        parent_agent=self,
+                    )
+                except Exception as tool_error:
+                    function_result = f"Error executing tool 'wts_bind': {tool_error}"
+                    logger.error("wts_bind raised: %s", tool_error, exc_info=True)
+                tool_duration = time.time() - tool_start_time
             elif function_name == "delegate_task":
                 tasks_arg = function_args.get("tasks")
                 if tasks_arg and isinstance(tasks_arg, list):
@@ -10231,6 +11087,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        caller_origin=_caller_origin,
                     )
                     _spinner_result = function_result
                 except Exception as tool_error:
@@ -10251,6 +11108,7 @@ class AIAgent:
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
                         skip_pre_tool_call_hook=True,
+                        caller_origin=_caller_origin,
                     )
                 except Exception as tool_error:
                     function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -10274,6 +11132,25 @@ class AIAgent:
                 result_preview = function_result if self.verbose_logging else (
                     function_result[:200] if len(function_result) > 200 else function_result
                 )
+
+            try:
+                import dd_obs as _dd_obs
+                _emit_dd_tool_call(
+                    dd_obs_module=_dd_obs,
+                    run_id=getattr(self, "_dd_run_id", None),
+                    session_key=getattr(self, "_dd_session_key", None),
+                    session_id_fallback=self.session_id or "",
+                    tool_name=function_name,
+                    tool_args=function_args,
+                    tool_result=function_result,
+                    tool_call_id=getattr(tool_call, "id", None),
+                    started_at_epoch=tool_start_time,
+                    completed_at_epoch=tool_start_time + float(tool_duration or 0),
+                    is_error=_is_error_result,
+                )
+            except Exception:
+                pass
+
             if _is_error_result:
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
             else:
@@ -10954,7 +11831,43 @@ class AIAgent:
                 if not self.quiet_mode:
                     self._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
                 break
-            
+
+            # ── Execution-deadline fuse (WTS ac4bcb05) ─────────────────
+            # Hard deadline: stop starting ANYTHING — the run is over and
+            # the supervisor classifies it timed_out; whatever content the
+            # conversation already holds is the partial evidence.
+            # Closeout fuse: once past the closeout point, inject the
+            # mandatory closeout instruction exactly once; tool calls are
+            # blocked from here on (_execute_tool_calls) so the remaining
+            # budget is reserved for synthesis + terminal receipt.
+            if self.execution_deadline is not None:
+                if self.execution_deadline.expired():
+                    self._deadline_expired = True
+                    _turn_exit_reason = "deadline_expired"
+                    self._write_deadline_marker("deadline-expired")
+                    logger.warning(
+                        "Execution deadline expired after %d API call(s); "
+                        "ending run with timed_out state (closeout_entered=%s)",
+                        api_call_count, self._closeout_active,
+                    )
+                    break
+                if self.execution_deadline.in_closeout() and not self._closeout_active:
+                    self._closeout_active = True
+                    self._write_deadline_marker("closeout-entered")
+                    from agent.deadline import CLOSEOUT_INSTRUCTION
+                    messages.append({"role": "user", "content": CLOSEOUT_INSTRUCTION})
+                    self._touch_activity("closeout fuse engaged — synthesis only")
+                    logger.info(
+                        "Closeout fuse engaged: %.0fs of hard budget remain; "
+                        "tool calls disabled, forcing final synthesis",
+                        max(0.0, self.execution_deadline.remaining()),
+                    )
+                    if not self.quiet_mode:
+                        self._safe_print(
+                            "\n⏳ Closeout fuse engaged — investigation stopped, "
+                            "producing final/partial result..."
+                        )
+
             api_call_count += 1
             self._api_call_count = api_call_count
             self._touch_activity(f"starting API call #{api_call_count}")
@@ -11240,6 +12153,14 @@ class AIAgent:
                 logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
             
             api_start_time = time.time()
+            # Capture DecisionData identity locally at API-call start so a
+            # cached AIAgent reused for a subsequent turn (which mutates
+            # self._dd_run_id/_dd_session_key) cannot cause this in-flight
+            # call to write its /log_generation under the wrong run_id.
+            _dd_call_run_id = getattr(self, "_dd_run_id", None)
+            _dd_call_session_key = getattr(self, "_dd_session_key", None)
+            _dd_call_session_id = getattr(self, "session_id", None)
+            _dd_call_context = getattr(self, "_dd_context", None)
             retry_count = 0
             max_retries = self._api_max_retries
             primary_recovery_attempted = False
@@ -11878,6 +12799,14 @@ class AIAgent:
                         self.session_cache_write_tokens += canonical_usage.cache_write_tokens
                         self.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
+                        try:
+                            self._last_context_usage = _build_hermes_context_usage_payload(
+                                canonical_usage=canonical_usage,
+                                model=self.model,
+                            )
+                        except Exception:
+                            pass  # never block the agent loop
+
                         # Log API call details for debugging/observability
                         _cache_pct = ""
                         if canonical_usage.cache_read_tokens and prompt_tokens:
@@ -11930,7 +12859,38 @@ class AIAgent:
                                 )
                             except Exception:
                                 pass  # never block the agent loop
-                        
+
+                        # DecisionData obs-ingest: emit /log_generation per API
+                        # call when a gateway-provided run_id is set. Identity
+                        # was captured at api_start_time above so a cached
+                        # AIAgent reused for the next turn cannot redirect
+                        # this write to the wrong run_id.
+                        if _dd_call_run_id:
+                            try:
+                                from datetime import datetime as _dt, timezone as _tz
+                                import dd_obs
+                                _req_iso = _dt.fromtimestamp(api_start_time, tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                _comp_iso = _dt.now(tz=_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                                _emit_dd_per_call_generation(
+                                    dd_obs_module=dd_obs,
+                                    run_id=_dd_call_run_id,
+                                    session_key=_dd_call_session_key,
+                                    session_id_fallback=_dd_call_session_id,
+                                    model=self.model,
+                                    provider=self.provider,
+                                    requested_at=_req_iso,
+                                    completed_at=_comp_iso,
+                                    latency_ms=int(api_duration * 1000),
+                                    canonical_usage=canonical_usage,
+                                    cost_amount_usd=cost_result.amount_usd,
+                                    dd_context=_dd_call_context,
+                                    request_messages=api_messages,
+                                    response_obj=response,
+                                    system_prompt=active_system_prompt,
+                                )
+                            except Exception:
+                                pass  # never block the agent loop
+
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
                         
@@ -13905,7 +14865,7 @@ class AIAgent:
                     logger.error(error_msg)
                 
                 logger.debug("Outer loop error in API call #%d", api_call_count, exc_info=True)
-                
+
                 # If an assistant message with tool_calls was already appended,
                 # the API expects a role="tool" result for every tool_call_id.
                 # Fill in error results for any that weren't answered yet.
@@ -14060,6 +15020,22 @@ class AIAgent:
                 last_reasoning = msg["reasoning"]
                 break
 
+        # ── Deadline projection (WTS ac4bcb05) ─────────────────────────
+        # Classify the run against the execution-deadline contract so the
+        # supervisor (delegate_tool / dd-lane-run) can map it onto the
+        # typed terminal-state schema.  None ⇒ no deadline was configured.
+        deadline_state = None
+        if self.execution_deadline is not None:
+            if self._deadline_expired:
+                deadline_state = "timed_out"
+                completed = False
+            elif self._closeout_active:
+                # The fuse fired and we still produced output: a truthful
+                # PARTIAL — never presented as a full completion.
+                deadline_state = "partial" if final_response else "timed_out"
+            elif completed:
+                deadline_state = "completed"
+
         # Build result with interrupt info if applicable
         result = {
             "final_response": final_response,
@@ -14069,6 +15045,8 @@ class AIAgent:
             "completed": completed,
             "turn_exit_reason": _turn_exit_reason,
             "partial": False,  # True only when stopped due to invalid tool calls
+            "deadline_state": deadline_state,
+            "closeout_entered": self._closeout_active,
             "interrupted": interrupted,
             "response_previewed": getattr(self, "_response_was_previewed", False),
             "model": self.model,

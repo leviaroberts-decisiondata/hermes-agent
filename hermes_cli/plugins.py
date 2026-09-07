@@ -1205,6 +1205,7 @@ def get_pre_tool_call_block_message(
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
+    caller_origin: str = "",
 ) -> Optional[str]:
     """Check ``pre_tool_call`` hooks for a blocking directive.
 
@@ -1216,6 +1217,14 @@ def get_pre_tool_call_block_message(
     from their ``pre_tool_call`` callback.  The first valid block
     directive wins.  Invalid or irrelevant hook return values are
     silently ignored so existing observer-only hooks are unaffected.
+
+    ``caller_origin`` is the per-turn System A / System B origin
+    ("system_a" / "system_b") computed by the caller from the agent's
+    identity state.  It is a non-top-level kwarg, so ``_serialize_payload``
+    surfaces it to the hook subprocess under ``payload["extra"]`` — that is
+    where the DD pre-tool guard reads it to enforce the System A/B boundary
+    (a System B delivery turn must not invoke a System A specialist/lane).
+    Empty string when unknown; the guard treats unknown as System A.
     """
     hook_results = invoke_hook(
         "pre_tool_call",
@@ -1224,6 +1233,7 @@ def get_pre_tool_call_block_message(
         task_id=task_id,
         session_id=session_id,
         tool_call_id=tool_call_id,
+        caller_origin=caller_origin or "",
     )
 
     for result in hook_results:
