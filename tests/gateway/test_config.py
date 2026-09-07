@@ -290,6 +290,9 @@ class TestLoadGatewayConfig:
         assert config.thread_sessions_per_user is False
 
     def test_bridges_quoted_false_platform_enabled_from_config_yaml(self, tmp_path, monkeypatch):
+        # Gateway imports can populate this setting before test fixtures run.
+        # This case tests YAML coercion, with no higher-priority env override.
+        monkeypatch.delenv("API_SERVER_ENABLED", raising=False)
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"

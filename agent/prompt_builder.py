@@ -1525,9 +1525,21 @@ def _load_context_tree_node(slug: str, root: Path, audience: str) -> Optional[st
             core = _read_node_body(root / "operating-model" / "_core.md", root) or ""
             notice = _P1_FAIL_CLOSED_NOTICE % (
                 len(body), _CONTEXT_TREE_PER_NODE_CHAR_CAP, lost_txt)
-            combined = f"{core}\n\n{notice}" if core else notice
-            # The combined fallback must itself respect the cap.
-            return combined[:_CONTEXT_TREE_PER_NODE_CHAR_CAP + len(CONTRACT_TRUNCATION_MARKER) + 1]
+            # Reserve the refusal first: slicing core + notice can erase the
+            # authority revocation entirely when the core alone exceeds cap.
+            budget = _CONTEXT_TREE_PER_NODE_CHAR_CAP + len(CONTRACT_TRUNCATION_MARKER) + 1
+            if len(notice) > budget:
+                notice = (
+                    "OPERATING CONTRACT FAILED — role card WITHHELD.\n"
+                    "Do NOT exercise deploy authority or dispatch new specialist lanes.\n"
+                    "Tell the operator; dd-context-validate must pass.\n"
+                    + CONTRACT_TRUNCATION_MARKER
+                )
+            # An impossibly small configured cap must never truncate the
+            # minimum refusal. Otherwise use only the space left for the core.
+            core_budget = max(0, budget - len(notice) - 2)
+            core_excerpt = core[:core_budget]
+            return f"{core_excerpt}\n\n{notice}" if core_excerpt else notice
         logger.warning(
             "context-tree node %r OVER per-node cap (audience=%r): %d chars, cap "
             "%d — TRUNCATING and dropping %d chars (lost: %s). Injecting %s. The "

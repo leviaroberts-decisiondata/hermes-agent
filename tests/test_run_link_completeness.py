@@ -15,18 +15,27 @@ Fix: when run_dir is empty, derive a lane_run keyed on the Slack thread ts embed
 `detail` (stable + unique per dispatch), falling back to stage:dispatched_at so two
 empty-run_dir hops never collide on an empty key.
 
-Pure unit test — no PG, no network. Run under the reaper python:
-  ~/.hermes/hermes-agent/venv/bin/python \
-      ~/.hermes/hermes-agent/tests/test_run_link_completeness.py
+Pure unit test — no PG, no network. The external helper is not shipped by this
+repository. Set DD_CHAIN_PG_MODULE to an explicit reviewed dd_chain_pg.py path
+before running this proof. Missing opt-in skips pytest collection; an explicitly
+configured missing module is an error.
 """
 import importlib.util
 import os
 import sys
 
-BIN = os.path.join(os.path.dirname(__file__), "..", "..", "bin")
-sys.path.insert(0, BIN)
-spec = importlib.util.spec_from_file_location(
-    "dd_chain_pg", os.path.join(BIN, "dd_chain_pg.py"))
+# This deployment-spine helper is maintained outside the Hermes repository.
+# Never discover/import the live ~/.hermes/bin copy implicitly during repo tests.
+MODULE_PATH = os.environ.get("DD_CHAIN_PG_MODULE")
+if not MODULE_PATH:
+    reason = "external dd_chain_pg.py proof requires explicit DD_CHAIN_PG_MODULE"
+    if __name__ == "__main__":
+        raise SystemExit(reason)
+    import pytest
+    pytest.skip(reason, allow_module_level=True)
+
+# An explicitly configured missing module is an error, not an optional skip.
+spec = importlib.util.spec_from_file_location("dd_chain_pg", MODULE_PATH)
 pg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pg)
 
@@ -98,6 +107,10 @@ def main():
         return 1
     print("RESULT: ALL CHECKS PASSED — slack-surface run-link completeness closed.")
     return 0
+
+
+def test_run_link_completeness():
+    assert main() == 0
 
 
 if __name__ == "__main__":

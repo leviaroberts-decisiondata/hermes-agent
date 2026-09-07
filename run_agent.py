@@ -77,11 +77,19 @@ def _set_console_quiet_logging(quiet: bool):
     Keep the filter on console handlers only, and remove it when verbosity rises.
     """
     for handler in logging.getLogger().handlers:
-        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
-            if quiet:
-                handler.addFilter(_quiet_console_record)
-            else:
-                handler.removeFilter(_quiet_console_record)
+        # Capture/telemetry handlers can also inherit StreamHandler. Only a
+        # handler writing to a real console stream should lose quiet records.
+        is_console = (
+            isinstance(handler, logging.StreamHandler)
+            and not isinstance(handler, logging.FileHandler)
+            and any(getattr(handler, "stream", None) is stream for stream in (
+                sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__,
+            ) if stream is not None)
+        )
+        if quiet and is_console:
+            handler.addFilter(_quiet_console_record)
+        else:
+            handler.removeFilter(_quiet_console_record)
 
 
 _OPENAI_CLS_CACHE: Optional[type] = None

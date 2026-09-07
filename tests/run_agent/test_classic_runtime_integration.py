@@ -138,9 +138,10 @@ def test_prune_config_is_explicit_opt_in(setting, expected):
     assert agent._compression_prune_before_summary is expected
 
 
-def test_quiet_console_keeps_file_records_and_verbose_removes_filter(tmp_path):
+def test_quiet_console_keeps_file_records_and_verbose_removes_filter(tmp_path, monkeypatch):
     root = logging.getLogger()
     console_output = io.StringIO()
+    monkeypatch.setattr("sys.stderr", console_output)
     console = logging.StreamHandler(console_output)
     log_path = tmp_path / "agent.log"
     file_handler = logging.FileHandler(log_path)
@@ -213,3 +214,10 @@ def test_strict_plugin_signature_survives_opt_in(supports_focus):
     result, prompt = agent._compress_context(messages, None, allow_prune_only=True)
     assert result == messages[-2:]
     assert prompt == "rebuilt prompt"
+
+
+def test_quiet_logging_does_not_filter_captured_cron_warnings(caplog):
+    with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+        _set_console_quiet_logging(True)
+        logging.getLogger("cron.scheduler").warning("cron warning retained")
+    assert "cron warning retained" in caplog.text

@@ -1258,18 +1258,25 @@ class TestOperatingContractComposerAudienceMatrix:
 class TestOperatingContractTruncationIsLoud:
     """Over-cap truncation emits the explicit marker AND logs — never silent."""
 
-    def test_over_cap_node_emits_marker_and_warns(self, tmp_path, caplog, monkeypatch):
-        # A core body larger than a deliberately tiny per-node cap.
-        big_core = "# Core\n\n" + ("X" * 5000) + "\nDeploy Queue is the realization gate.\n"
+    @pytest.mark.parametrize("cap", [200, 16800])
+    def test_over_cap_node_emits_marker_and_warns(self, tmp_path, caplog, monkeypatch, cap):
+        # Exercise both the compact refusal and the full production-sized notice.
+        big_core = "# Core\n\n" + ("X" * (cap * 2)) + "\nDeploy Queue is the realization gate.\n"
         _build_operating_tree(tmp_path, core_body=big_core)
-        monkeypatch.setattr(_pb, "_CONTEXT_TREE_PER_NODE_CHAR_CAP", 200)
+        monkeypatch.setattr(_pb, "_CONTEXT_TREE_PER_NODE_CHAR_CAP", cap)
         with caplog.at_level(logging.WARNING):
             node = _load_context_tree_node("operating-model", tmp_path, audience="p1-default")
         assert node is not None
         assert node.endswith(CONTRACT_TRUNCATION_MARKER)
-        assert len(node) <= 200 + len(CONTRACT_TRUNCATION_MARKER) + 1
-        # LOUD: a warning naming the node + the incompleteness was logged.
-        assert any("OVER per-node cap" in r.message for r in caplog.records)
+        assert len(node) <= cap + len(CONTRACT_TRUNCATION_MARKER) + 1
+        # The coordinator fails closed: its role card is withheld, and a
+        # core that alone exceeds cap cannot push the refusal out of the prompt.
+        assert "role card" in node.lower() and "withheld" in node.lower()
+        assert "Do NOT exercise deploy authority" in node
+        assert "dispatch new specialist lanes" in node
+        assert "dd-context-validate" in node
+        assert "# Your role —" not in node
+        assert any("FAIL-CLOSED" in r.message for r in caplog.records)
         # And the marker text itself must NOT be the old silent "[...truncated...]".
         assert "[...node truncated" not in node
 
