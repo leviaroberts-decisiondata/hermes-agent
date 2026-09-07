@@ -974,6 +974,9 @@ def check_voice_requirements() -> Dict[str, Any]:
     stt_enabled = is_stt_enabled(stt_config)
     stt_provider = _get_provider(stt_config)
     stt_available = stt_enabled and stt_provider != "none"
+    if stt_provider == "dgx":
+        from tools.transcription_tools import DGX_WRAPPER_PATH
+        stt_available = stt_available and DGX_WRAPPER_PATH.is_file()
 
     missing: List[str] = []
     termux_capture = _termux_voice_capture_available()
@@ -997,6 +1000,11 @@ def check_voice_requirements() -> Dict[str, Any]:
 
     if not stt_enabled:
         details_parts.append("STT provider: DISABLED in config (stt.enabled: false)")
+    elif stt_provider == "dgx":
+        details_parts.append(
+            "STT provider: configured (DGX via authenticated local gateway)"
+            if stt_available else "STT provider: MISSING (DGX transcription wrapper)"
+        )
     elif stt_provider == "local":
         details_parts.append("STT provider: OK (local faster-whisper)")
     elif stt_provider == "groq":

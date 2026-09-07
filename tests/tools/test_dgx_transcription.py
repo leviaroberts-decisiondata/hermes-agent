@@ -99,3 +99,17 @@ def test_push_to_talk_cleanup_uses_outcome(audio, monkeypatch, tmp_path, mode):
     retained = list((tmp_path / "profile-audio").glob("failed-recordings/*"))
     assert bool(retained) == (mode in ("error", "exception"))
     assert not audio.exists()
+
+
+@pytest.mark.parametrize("present", [True, False])
+def test_voice_requirements_describe_dgx_without_native_install_hint(dgx, monkeypatch, present):
+    import tools.voice_mode as voice
+    if not present:
+        dgx.DGX_WRAPPER_PATH.unlink()
+    monkeypatch.setattr(voice, "_audio_available", lambda: True)
+    monkeypatch.setattr(voice, "_termux_voice_capture_available", lambda: False)
+    monkeypatch.setattr(voice, "detect_audio_environment", lambda: {"available": True, "warnings": []})
+    result = voice.check_voice_requirements()
+    assert result["stt_available"] is present
+    assert "DGX" in result["details"]
+    assert "pip install faster-whisper" not in result["details"]
