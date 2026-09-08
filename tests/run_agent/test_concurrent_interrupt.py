@@ -49,6 +49,12 @@ def _make_agent(monkeypatch):
         _active_children: list = []
 
         def __init__(self):
+            # Match real per-agent guardrail/deadline state; do not mock the
+            # guardrail decisions away while exercising interrupt fanout.
+            self._tool_guardrails = _ra.ToolCallGuardrailController()
+            self.execution_deadline = None
+            self._closeout_active = False
+            self.session_id = "concurrent-interrupt-test"
             # Instance-level (not class-level) so each test gets a fresh set.
             self._tool_worker_threads: set = set()
             self._tool_worker_threads_lock = threading.Lock()
@@ -75,6 +81,7 @@ def _make_agent(monkeypatch):
     stub = _Stub()
     # Bind the real methods under test
     stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
+    stub._append_guardrail_observation = _ra.AIAgent._append_guardrail_observation.__get__(stub)
     stub.interrupt = _ra.AIAgent.interrupt.__get__(stub)
     stub.clear_interrupt = _ra.AIAgent.clear_interrupt.__get__(stub)
     # /steer injection (added in PR #12116) fires after every concurrent
@@ -107,7 +114,7 @@ def test_concurrent_interrupt_cancels_pending(monkeypatch):
 
     original_invoke = agent._invoke_tool
 
-    def slow_tool(name, args, task_id, call_id=None):
+    def slow_tool(name, args, task_id, call_id=None, *, messages=None, pre_tool_block_checked=False):
         if name == "slow_one":
             # Block until the test sets the interrupt
             barrier.wait(timeout=10)
@@ -184,7 +191,7 @@ def test_running_concurrent_worker_sees_is_interrupted(monkeypatch):
     observed = {"saw_true": False, "poll_count": 0, "worker_tid": None}
     worker_started = threading.Event()
 
-    def polling_tool(name, args, task_id, call_id=None, messages=None):
+    def polling_tool(name, args, task_id, call_id=None, messages=None, *, pre_tool_block_checked=False):
         observed["worker_tid"] = threading.current_thread().ident
         worker_started.set()
         deadline = time.monotonic() + 5.0

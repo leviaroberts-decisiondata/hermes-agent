@@ -161,6 +161,11 @@ def _looks_like_credential(name: str) -> bool:
 # HERMES_* vars that change test behavior by being set. Unset all of these
 # unconditionally — individual tests that need them set do so explicitly.
 _HERMES_BEHAVIORAL_VARS = frozenset({
+    # The auth-store override bypasses the HERMES_HOME sandbox entirely: a test
+    # that inherits it writes the REAL shared credential store. That is exactly
+    # how the 2026-08-11 fleet outage happened (fixtures at123/rt456 landed in
+    # ~/.hermes-shared-auth/auth.json). Clear it here; auth.py refuses as well.
+    "HERMES_AUTH_STORE_PATH",
     "HERMES_YOLO_MODE",
     "HERMES_INTERACTIVE",
     "HERMES_QUIET",

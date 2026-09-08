@@ -632,6 +632,7 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        "prune_before_summary": False,  # opt in per profile; manual/error recovery still summarizes
         "threshold": 0.50,            # compress when context usage exceeds this ratio
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         "protect_last_n": 20,         # minimum recent messages to keep uncompressed
@@ -880,7 +881,7 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe)
+        "provider": "dgx",  # DecisionData: authenticated local gateway; no fallback
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force

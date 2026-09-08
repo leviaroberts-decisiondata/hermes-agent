@@ -319,6 +319,35 @@ class TestTryActivateFallback:
             assert agent._try_activate_fallback() is False
             assert agent._fallback_activated is False
 
+    def test_skips_unsupported_copilot_model_mapping(self):
+        agent = _make_agent(fallback_model=[
+            {"provider": "copilot", "model": "gpt-5.5"},
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        ])
+        good_client = _mock_resolve("https://openrouter.ai/api/v1")
+
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(good_client, "anthropic/claude-sonnet-4")) as mock_resolve,
+            patch("hermes_cli.models.provider_model_ids", return_value=["gpt-5-mini", "claude-sonnet-4"]),
+        ):
+            result = agent._try_activate_fallback()
+
+        assert result is True
+        assert agent.provider == "openrouter"
+        assert agent.model == "anthropic/claude-sonnet-4"
+        mock_resolve.assert_called_once()
+        assert mock_resolve.call_args.args[0] == "openrouter"
+        assert agent.client is good_client
+
+    def test_copilot_acp_fallback_requires_explicit_enable(self, monkeypatch):
+        monkeypatch.delenv("HERMES_ENABLE_COPILOT_ACP_FALLBACK", raising=False)
+        agent = _make_agent(fallback_model={"provider": "copilot-acp", "model": "gpt-5-mini"})
+
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            assert agent._try_activate_fallback() is False
+
+        mock_resolve.assert_not_called()
+
     def test_activates_nous_fallback(self):
         """Nous Portal fallback should use OAuth credentials and chat_completions mode."""
         agent = _make_agent(

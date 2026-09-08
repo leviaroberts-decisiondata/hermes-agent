@@ -273,3 +273,22 @@ def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_
         call_ids = [tc["id"] for tc in assistant_msg["tool_calls"]]
         following_results = [m for m in result["messages"] if m.get("role") == "tool" and m.get("tool_call_id") in call_ids]
         assert len(following_results) == len(call_ids)
+
+
+def test_parallel_pre_tool_admission_preserves_delivery_origin_once():
+    agent = _make_agent("web_search")
+    agent.skip_context_files = True
+    agent.load_soul_identity = False
+    msg = SimpleNamespace(content="", tool_calls=[_mock_tool_call("web_search", "{}", "c-origin")])
+    messages = []
+    def block_delivery(name, args, **kwargs):
+        assert kwargs["caller_origin"] == "system_b"
+        return "delivery policy blocked"
+    with (
+        patch("hermes_cli.plugins.get_pre_tool_call_block_message", side_effect=block_delivery) as gate,
+        patch("run_agent.handle_function_call") as execute,
+    ):
+        agent._execute_tool_calls_concurrent(msg, messages, "task-origin")
+    gate.assert_called_once()
+    execute.assert_not_called()
+    assert "delivery policy blocked" in messages[0]["content"]

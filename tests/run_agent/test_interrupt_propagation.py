@@ -26,6 +26,8 @@ class TestInterruptPropagationToChild(unittest.TestCase):
         """Create a bare AIAgent via __new__ with all interrupt-related attrs."""
         from run_agent import AIAgent
         agent = AIAgent.__new__(AIAgent)
+        agent.execution_deadline = None
+        agent._closeout_active = False
         agent._interrupt_requested = False
         agent._interrupt_message = None
         agent._execution_thread_id = None
@@ -88,6 +90,8 @@ class TestInterruptPropagationToChild(unittest.TestCase):
         mock_client.chat.completions.create = slow_api_call
         mock_client.close = MagicMock()
         child.client = mock_client
+        # Calls now own a request client; keep the slow fake on that path too.
+        child._create_request_openai_client = MagicMock(return_value=mock_client)
 
         # Set interrupt after 0.2s from another thread
         def set_interrupt_later():

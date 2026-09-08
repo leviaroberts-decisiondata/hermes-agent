@@ -759,32 +759,83 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # =============================================================================
 
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
+    """Return the canonical auth store path.
+
+    By default credentials live under HERMES_HOME/auth.json. Multi-gateway
+    deployments can set HERMES_AUTH_STORE_PATH to intentionally share one
+    OAuth credential store while keeping homes/sessions/logs isolated.
+    """
+    override = os.environ.get("HERMES_AUTH_STORE_PATH", "").strip()
+    if override:
+        path = Path(override).expanduser()
+    else:
+        path = get_hermes_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
     # user's auth store, refuse rather than silently corrupt it. This catches
     # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
-        try:
-            resolved = path.resolve(strict=False)
-        except Exception:
-            resolved = path
-        if resolved == real_home_auth:
-            raise RuntimeError(
-                f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
-                "via scripts/run_tests.sh for hermetic CI-parity env."
-            )
+        _refuse_if_real_auth_store(path)
     return path
+
+
+def _real_auth_store_roots() -> "list[Path]":
+    """Every directory tree under $HOME that can hold a REAL credential store.
+
+    Not one path. The 2026-08-11 incident wrote test fixtures into
+    ``~/.hermes-shared-auth/auth.json`` — the store all 16 gateways actually
+    use — and emptied ``~/.hermes/auth.json`` plus all 12
+    ``~/.hermes/profiles/*/auth.json``. The old guard compared against exactly
+    one hardcoded path, so it protected none of them.
+    """
+    home = Path.home()
+    roots = [home / ".hermes", home / ".hermes-shared-auth"]
+    try:
+        roots.extend(p for p in home.glob(".hermes-*") if p.is_dir())
+    except Exception:
+        pass
+    return roots
+
+
+def _refuse_if_real_auth_store(path: Path) -> None:
+    """Raise if `path` is a real credential store and we are under pytest.
+
+    Containment, not equality: anything inside ``~/.hermes``, ``~/.hermes-*``
+    or a profile home counts, however it was reached — including through the
+    ``HERMES_AUTH_STORE_PATH`` override, which bypasses the HERMES_HOME
+    sandbox entirely and is how the incident happened.
+    """
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    for root in _real_auth_store_roots():
+        try:
+            root_resolved = root.resolve(strict=False)
+        except Exception:
+            continue
+        if resolved == root_resolved or root_resolved in resolved.parents:
+            raise RuntimeError(
+                f"Refusing to touch a real user auth store during a test run: {path}\n"
+                f"(matched real store root: {root})\n"
+                "Point HERMES_HOME *and* HERMES_AUTH_STORE_PATH at a tmp_path in your "
+                "fixture, or run via scripts/run_tests.sh. tests/conftest.py clears "
+                "HERMES_AUTH_STORE_PATH for exactly this reason — if you are seeing "
+                "this, something re-set it or the test bypassed the hermetic fixture."
+            )
 
 
 def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
 
+def _codex_refresh_lock_path() -> Path:
+    return _auth_file_path().with_suffix(".codex-refresh.lock")
+
+
 _auth_lock_holder = threading.local()
+_codex_refresh_lock_holder = threading.local()
 
 @contextmanager
 def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
@@ -843,8 +894,72 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
                 except (OSError, IOError):
                     pass
 
+@contextmanager
+def _codex_refresh_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    """Cross-process mutex for single-use Codex refresh-token rotation.
+
+    This is intentionally separate from the auth-store lock. Callers must
+    acquire this lock *before* _auth_store_lock so pool refresh and direct
+    auth refresh paths cannot deadlock while serializing the actual OAuth
+    refresh request.
+    """
+    if getattr(_codex_refresh_lock_holder, "depth", 0) > 0:
+        _codex_refresh_lock_holder.depth += 1
+        try:
+            yield
+        finally:
+            _codex_refresh_lock_holder.depth -= 1
+        return
+
+    lock_path = _codex_refresh_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fcntl is None and msvcrt is None:
+        _codex_refresh_lock_holder.depth = 1
+        try:
+            yield
+        finally:
+            _codex_refresh_lock_holder.depth = 0
+        return
+
+    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+        lock_path.write_text(" ", encoding="utf-8")
+
+    with lock_path.open("r+" if msvcrt else "a+") as lock_file:
+        deadline = time.time() + max(1.0, timeout_seconds)
+        while True:
+            try:
+                if fcntl:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except (BlockingIOError, OSError, PermissionError):
+                if time.time() >= deadline:
+                    raise TimeoutError("Timed out waiting for Codex refresh lock")
+                time.sleep(0.05)
+
+        _codex_refresh_lock_holder.depth = 1
+        try:
+            yield
+        finally:
+            _codex_refresh_lock_holder.depth = 0
+            if fcntl:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
+
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+    if getattr(_auth_lock_holder, "depth", 0) <= 0:
+        with _auth_store_lock():
+            return _load_auth_store(auth_file)
+
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -884,9 +999,54 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
+def _save_auth_store(
+    auth_store: Dict[str, Any],
+    *,
+    allow_provider_clear: bool = False,
+) -> Path:
+    if getattr(_auth_lock_holder, "depth", 0) <= 0:
+        with _auth_store_lock():
+            return _save_auth_store(
+                auth_store,
+                allow_provider_clear=allow_provider_clear,
+            )
+
     auth_file = _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Anti-clobber guard ──────────────────────────────────────────────────
+    # Refuse to replace a non-empty ``providers`` map with an empty one unless
+    # the caller is an explicit clear/logout path (``allow_provider_clear``).
+    # On 2026-06-04 a test subprocess that did not inherit the monkeypatched
+    # HERMES_HOME resolved the store to the REAL ~/.hermes/auth.json, seeded
+    # the copilot credential pool, and saved a store whose ``providers`` map
+    # was empty — wiping the live openai-codex OAuth tokens and taking every
+    # gateway turn offline (no fallback was configured). The codex tokens
+    # could not be rehydrated without interactive re-auth. A store that holds
+    # credentials must never be silently emptied by a non-clear save; refuse
+    # and log instead so the loss is loud and recoverable.
+    new_providers = auth_store.get("providers")
+    new_is_empty = (not isinstance(new_providers, dict)) or len(new_providers) == 0
+    if new_is_empty and not allow_provider_clear:
+        try:
+            if auth_file.exists():
+                existing = json.loads(auth_file.read_text())
+                existing_providers = existing.get("providers")
+                if isinstance(existing_providers, dict) and len(existing_providers) > 0:
+                    logger.error(
+                        "auth: REFUSING to overwrite %s — on-disk store has %d "
+                        "provider(s) but the store being saved has none and this "
+                        "is not an explicit clear/logout (allow_provider_clear). "
+                        "This guards against the 2026-06-04 test-subprocess wipe. "
+                        "Pass allow_provider_clear=True from logout/clear paths.",
+                        auth_file, len(existing_providers),
+                    )
+                    return auth_file
+        except Exception as guard_exc:
+            # Never let the guard's own read failure block a legitimate save —
+            # fall through to the normal write path.
+            logger.debug("auth: anti-clobber guard read failed (%s) — proceeding", guard_exc)
+
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
@@ -1131,7 +1291,8 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
 
         if not cleared:
             return False
-        _save_auth_store(auth_store)
+        # Explicit logout/clear — permitted to empty the providers map.
+        _save_auth_store(auth_store, allow_provider_clear=True)
     return True
 
 
@@ -2464,19 +2625,24 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
-            data = _read_codex_tokens(_lock=False)
-            tokens = dict(data["tokens"])
-            access_token = str(tokens.get("access_token", "") or "").strip()
-
-            should_refresh = bool(force_refresh)
-            if (not should_refresh) and refresh_if_expiring:
-                should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
-
-            if should_refresh:
-                tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+        # The Codex refresh token is single-use/rotating. Serialize every
+        # refresh path — direct runtime resolution and credential-pool refresh
+        # — behind the same cross-process mutex, then re-read under the auth
+        # store lock so a losing process adopts the winner's freshly-persisted
+        # tokens instead of consuming a stale refresh token.
+        with _codex_refresh_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+            with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+                data = _read_codex_tokens(_lock=False)
+                tokens = dict(data["tokens"])
                 access_token = str(tokens.get("access_token", "") or "").strip()
+
+                should_refresh = bool(force_refresh)
+                if (not should_refresh) and refresh_if_expiring:
+                    should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+
+                if should_refresh:
+                    tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
+                    access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")

@@ -43,6 +43,103 @@ def _resolve_safe_cwd(cwd: str) -> str:
     return tempfile.gettempdir()
 
 
+# ── Delivery-side OS-account separation (V1.1 Track B / V2 P0) ───────────────
+# When enabled, the per-turn delivery shell is dropped to an unprivileged OS
+# account (dd-delivery) instead of inheriting the gateway's uid. That account
+# cannot traverse ~/.openclaw (0700 openclaw) to read the capability signing
+# key, and has no sudo grant, so the System A/B boundary becomes an OS-level
+# boundary rather than an in-process-only one.
+#
+# Mechanism: prefix the bash invocation with `sudo -n -u dd-delivery` (the
+# sanctioned cross-user runner shape; backed by the existing openclaw sudo
+# grant — no new sudoers entry). The child env is rebuilt from scratch with
+# `env -i` so the curated, sanitized variables are passed deterministically and
+# HOME points at the delivery account's own scratch dir (it cannot write into
+# the openclaw-owned profile HOME).
+#
+# Default OFF. Flip on via DD_DELIVERY_UID_SEPARATION=1 (per-process env) for a
+# code-free rollback path.
+_DELIVERY_ACCOUNT = os.getenv("DD_DELIVERY_ACCOUNT", "dd-delivery")
+_DELIVERY_HOME = os.getenv("DD_DELIVERY_HOME", "/Users/dd-delivery")
+
+
+def _delivery_uid_separation_enabled() -> bool:
+    """True when delivery turns should drop to the unprivileged OS account.
+
+    Read live (not cached) so the flag can be flipped via launchctl setenv +
+    gateway restart without a code change, and so tests can toggle it.
+    """
+    if _IS_WINDOWS:
+        return False
+    return os.getenv("DD_DELIVERY_UID_SEPARATION", "") in ("1", "true", "True", "yes")
+
+
+_DELIVERY_SESSION_TMP = "/tmp/dd-delivery-sessions"
+
+
+def _ensure_delivery_session_tmp() -> str | None:
+    """Create (idempotently) a sticky temp dir shared by gateway + delivery.
+
+    Session snapshot / cwd-marker files are written by the gateway (openclaw)
+    and re-read/re-dumped by the delivery account. A sticky 1777 dir (like /tmp
+    itself) lets both write while each owns its own files. Returns the path, or
+    None on failure (caller then falls back to the normal TMPDIR resolution).
+    """
+    try:
+        os.makedirs(_DELIVERY_SESSION_TMP, exist_ok=True)
+        # 1777: world read/write/execute + sticky, so dd-delivery can traverse
+        # and create files alongside openclaw-written ones.
+        os.chmod(_DELIVERY_SESSION_TMP, 0o1777)
+        return _DELIVERY_SESSION_TMP
+    except Exception:
+        return None
+
+
+def _wrap_delivery_account(args: list[str], run_env: dict) -> tuple[list[str], dict, str]:
+    """Wrap a bash argv to execute under the unprivileged delivery account.
+
+    Returns (new_args, new_env, cwd_override). The new argv is
+        sudo -n -u <acct> /usr/bin/env -i K=V ... <original argv>
+    so the child sees exactly the curated env (HOME redirected to the delivery
+    scratch dir). The Popen env is irrelevant to the child once `env -i` runs,
+    but we still hand the sanitized env to the sudo process itself.
+
+    ``cwd_override`` is always /tmp: Popen performs its chdir while still running
+    as the gateway uid (so it cannot enter the 0700 delivery HOME), then sudo
+    drops to dd-delivery (whose bash cannot getcwd in a 0700 openclaw tree). /tmp
+    is enterable by both. The real landing dir is set by the in-command
+    ``builtin cd <cwd> || cd $HOME`` that base._wrap_command emits under
+    delivery separation. Callers operating on openclaw-owned 0700 trees must
+    arrange delivery-readable paths (a known limitation, see REPORT).
+    """
+    # Curated env for the delivery child. Start from run_env (already
+    # provider-stripped by _make_run_env), then force HOME/USER/LOGNAME to the
+    # delivery account so tools (git, gh, npm) write into a dir it owns.
+    child_env = dict(run_env)
+    child_env["HOME"] = _DELIVERY_HOME
+    child_env["USER"] = _DELIVERY_ACCOUNT
+    child_env["LOGNAME"] = _DELIVERY_ACCOUNT
+    # TMPDIR under the delivery HOME avoids cross-account /tmp ownership noise.
+    child_env.setdefault("TMPDIR", os.path.join(_DELIVERY_HOME, "tmp"))
+
+    # Popen performs its chdir while still running as the *gateway* uid, then
+    # sudo drops to dd-delivery. The chdir target must therefore be enterable by
+    # the gateway uid (rules out the 0700 delivery HOME) AND let the dropped
+    # bash getcwd at startup (rules out 0700 openclaw trees). /tmp satisfies
+    # both unconditionally. The real landing dir is set by the in-command
+    # `builtin cd <cwd> || cd $HOME` that base._wrap_command emits.
+    cwd_override = "/tmp"
+
+    env_assignments = [f"{k}={v}" for k, v in child_env.items()]
+    new_args = [
+        "sudo", "-n", "-u", _DELIVERY_ACCOUNT,
+        "/usr/bin/env", "-i", *env_assignments,
+        *args,
+    ]
+    # The sudo process itself inherits run_env; the child gets child_env via env -i.
+    return new_args, run_env, cwd_override
+
+
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
 _HERMES_PROVIDER_ENV_FORCE_PREFIX = "_HERMES_FORCE_"
 
@@ -245,6 +342,18 @@ def _make_run_env(env: dict) -> dict:
     if _profile_home:
         run_env["HOME"] = _profile_home
 
+    # Per-turn canonical WTS task -> DD_TURN_WTS_TASK for `dd-delivery ship`. Sourced
+    # from the task-local session contextvar (per-turn isolated), injected into THIS
+    # subprocess env only — never into the shared gateway os.environ, so concurrent
+    # turns cannot cross-contaminate. Absent/empty on non-turn (CLI/cron) contexts.
+    try:
+        from gateway.session_context import get_session_env
+        _turn_task = get_session_env("HERMES_SESSION_WTS_TASK_ID", "")
+        if _turn_task and "DD_TURN_WTS_TASK" not in run_env:
+            run_env["DD_TURN_WTS_TASK"] = _turn_task
+    except Exception:
+        pass
+
     return run_env
 
 
@@ -357,6 +466,17 @@ class LocalEnvironment(BaseEnvironment):
         override the temp root explicitly (for example via terminal.env or a
         custom TMPDIR), then fall back to the host process environment.
         """
+        # Under delivery OS-account separation the per-session snapshot/cwd
+        # files are written by the gateway (openclaw) but re-read and re-dumped
+        # by the dropped delivery account (dd-delivery). The usual TMPDIR
+        # (/tmp/claude-502, 0700 openclaw) is not traversable by dd-delivery, so
+        # the snapshot can't be sourced and env/cwd persistence silently breaks.
+        # Route session temp files to a shared sticky dir both accounts can use.
+        if _delivery_uid_separation_enabled():
+            shared = _ensure_delivery_session_tmp()
+            if shared:
+                return shared
+
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate and candidate.startswith("/"):
@@ -387,7 +507,6 @@ class LocalEnvironment(BaseEnvironment):
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
-
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
         # (issue #17558).  Popen would otherwise raise FileNotFoundError on
@@ -403,6 +522,15 @@ class LocalEnvironment(BaseEnvironment):
             )
             self.cwd = safe_cwd
 
+        run_cwd = self.cwd
+
+        # Delivery-side OS-account separation: drop non-login (delivery) turns to
+        # the unprivileged dd-delivery account when the flag is on. Login-shell
+        # invocations (init_session env snapshot) stay on the host account — the
+        # snapshot defines the base env and is not delivery work.
+        if not login and _delivery_uid_separation_enabled():
+            args, run_env, run_cwd = _wrap_delivery_account(args, run_env)
+
         proc = subprocess.Popen(
             args,
             text=True,
@@ -413,7 +541,7 @@ class LocalEnvironment(BaseEnvironment):
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
-            cwd=self.cwd,
+            cwd=run_cwd,
         )
         if not _IS_WINDOWS:
             try:
@@ -469,10 +597,18 @@ class LocalEnvironment(BaseEnvironment):
                     if pgid is None:
                         raise
 
+                delivery = _delivery_uid_separation_enabled()
                 try:
                     os.killpg(pgid, signal.SIGTERM)
                 except ProcessLookupError:
                     return
+                except PermissionError:
+                    if not delivery:
+                        raise
+                # The gateway cannot signal delivery-owned children itself.
+                # Signal as their account even if the sudo wrapper exits first.
+                if delivery:
+                    self._kill_delivery_group(pgid, "-TERM")
 
                 # Wait on the process group, not just the shell wrapper. Under
                 # load the wrapper can exit before grandchildren do; returning
@@ -485,6 +621,11 @@ class LocalEnvironment(BaseEnvironment):
                     os.killpg(pgid, signal.SIGKILL)
                 except ProcessLookupError:
                     return
+                except PermissionError:
+                    if not delivery:
+                        raise
+                if delivery:
+                    self._kill_delivery_group(pgid, "-KILL")
                 _wait_for_group_exit(pgid, 2.0)
                 try:
                     proc.wait(timeout=0.2)
@@ -495,6 +636,30 @@ class LocalEnvironment(BaseEnvironment):
                 proc.kill()
             except Exception:
                 pass
+
+    def _delivery_cd_fallback(self) -> bool:
+        """Soft-cd to $HOME (instead of exit 126) when delivery separation is on.
+
+        Delivery turns may target openclaw-owned 0700 trees the dd-delivery
+        account cannot enter; base._wrap_command uses this to fall back to the
+        delivery scratch HOME rather than aborting the whole shell.
+        """
+        return _delivery_uid_separation_enabled()
+
+    @staticmethod
+    def _kill_delivery_group(pgid: int, sig: str = "-KILL"):
+        """Signal a process group owned by the delivery account via sudo.
+
+        ``kill <sig> -<pgid>`` targets the whole group; run as dd-delivery so it
+        can signal its own processes. Best-effort; never raises.
+        """
+        try:
+            subprocess.run(
+                ["sudo", "-n", "-u", _DELIVERY_ACCOUNT, "kill", sig, f"-{pgid}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            )
+        except Exception:
+            pass
 
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed).

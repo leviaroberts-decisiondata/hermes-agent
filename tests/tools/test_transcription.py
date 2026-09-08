@@ -63,10 +63,10 @@ class TestGetProvider:
             from tools.transcription_tools import _get_provider
             assert _get_provider({"provider": "openai"}) == "none"
 
-    def test_default_provider_is_local(self):
+    def test_default_uses_dgx_even_when_native_recognizer_is_available(self):
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True):
             from tools.transcription_tools import _get_provider
-            assert _get_provider({}) == "local"
+            assert _get_provider({}) == "dgx"
 
     def test_disabled_config_returns_none(self):
         from tools.transcription_tools import _get_provider

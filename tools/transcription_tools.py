@@ -2,9 +2,11 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with explicit provider selection:
 
-  - **local** (default, free) — faster-whisper running locally, no API key needed.
+  - **dgx** (DecisionData default) — authenticated local gateway via the shared wrapper.
+    Failure never selects another recognizer.
+  - **local** (explicit legacy choice, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
   - **groq** (free tier) — Groq Whisper API, requires ``GROQ_API_KEY``.
   - **openai** (paid) — OpenAI Whisper API, requires ``VOICE_TOOLS_OPENAI_KEY``.
@@ -78,7 +80,8 @@ _HAS_MISTRAL = _safe_find_spec("mistralai")
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_PROVIDER = "local"
+DEFAULT_PROVIDER = "dgx"
+DGX_WRAPPER_PATH = Path("/Users/openclaw/.openclaw/workspace/scripts/transcribe.sh")
 DEFAULT_LOCAL_MODEL = "base"
 DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
@@ -202,7 +205,7 @@ def _get_provider(stt_config: dict) -> str:
 
     When ``stt.provider`` is explicitly set in config, that choice is
     honoured — no silent cloud fallback.  When no provider is configured,
-    auto-detect tries: local > groq (free) > openai (paid).
+    DecisionData selects DGX, irrespective of installed local/cloud providers.
     """
     if not is_stt_enabled(stt_config):
         return "none"
@@ -270,25 +273,8 @@ def _get_provider(stt_config: dict) -> str:
 
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > mistral > xai -
-
-    if _HAS_FASTER_WHISPER:
-        return "local"
-    if _has_local_command():
-        return "local_command"
-    if _HAS_OPENAI and get_env_value("GROQ_API_KEY"):
-        logger.info("No local STT available, using Groq Whisper API")
-        return "groq"
-    if _HAS_OPENAI and _has_openai_audio_backend():
-        logger.info("No local STT available, using OpenAI Whisper API")
-        return "openai"
-    if _HAS_MISTRAL and get_env_value("MISTRAL_API_KEY"):
-        logger.info("No local STT available, using Mistral Voxtral Transcribe API")
-        return "mistral"
-    if get_env_value("XAI_API_KEY"):
-        logger.info("No local STT available, using xAI Grok STT API")
-        return "xai"
-    return "none"
+    # DecisionData defaults must not depend on installed recognizers or cloud keys.
+    return DEFAULT_PROVIDER
 
 # ---------------------------------------------------------------------------
 # Shared validation
@@ -385,6 +371,34 @@ def _load_local_whisper_model(model_name: str):
             exc,
         )
         return WhisperModel(model_name, device="cpu", compute_type="int8")
+
+
+def _transcribe_dgx(file_path: str, stt_config: dict) -> Dict[str, Any]:
+    """Use the shared authenticated gateway wrapper, with no recognizer fallback."""
+    cfg = stt_config.get("dgx") or {}
+    wrapper = DGX_WRAPPER_PATH
+    failure = {"success": False, "transcript": "", "provider": "dgx", "model": "local-transcribe"}
+    if not wrapper.is_file():
+        return {**failure, "error": "DGX transcription wrapper is missing; recording can be retried."}
+    env = os.environ.copy()
+    env.update({
+        "TRANSCRIBE_GATEWAY_URL": "http://127.0.0.1:8710",
+        "TRANSCRIBE_GATEWAY_KEY_FILE": str(cfg.get("key_file") or "/Users/openclaw/.hermes-classic/secrets/local-inference/keys/levi-primary.key"),
+        "TRANSCRIBE_MODEL": "local-transcribe",
+    })
+    try:
+        result = subprocess.run(["/bin/bash", str(wrapper), file_path],
+                                capture_output=True, text=True, env=env, timeout=1800)
+        if result.returncode:
+            return {**failure, "error": f"DGX transcription failed (exit {result.returncode}); recording can be retried."}
+        text = result.stdout.strip()
+        if not text:
+            return {**failure, "error": "DGX returned no transcript; retry or discard a blank recording."}
+        return {"success": True, "transcript": text, "provider": "dgx", "model": "local-transcribe"}
+    except subprocess.TimeoutExpired:
+        return {**failure, "error": "DGX transcription timed out; recording can be retried."}
+    except OSError as exc:
+        return {**failure, "error": f"DGX transcription could not start ({type(exc).__name__}); recording can be retried."}
 
 
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
@@ -792,7 +806,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     Provider priority:
       1. User config (``stt.provider`` in config.yaml)
-      2. Auto-detect: local faster-whisper (free) > Groq (free tier) > OpenAI (paid)
+      2. DecisionData default: authenticated gateway → DGX
 
     Args:
         file_path: Absolute path to the audio file to transcribe.
@@ -820,6 +834,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         }
 
     provider = _get_provider(stt_config)
+
+    if provider == "dgx":
+        return _transcribe_dgx(file_path, stt_config)
 
     if provider == "local":
         local_cfg = stt_config.get("local", {})

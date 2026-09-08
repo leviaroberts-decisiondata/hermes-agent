@@ -341,6 +341,7 @@ def _rpc_server_loop(
     tool_call_counter: list,   # mutable [int] so the thread can increment
     max_tool_calls: int,
     allowed_tools: frozenset,
+    caller_origin: str = "",
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -420,7 +421,8 @@ def _rpc_server_loop(
                         sys.stdout = devnull
                         sys.stderr = devnull
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name, tool_args, task_id=task_id,
+                            caller_origin=caller_origin,
                         )
                     finally:
                         sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -603,6 +605,7 @@ def _rpc_poll_loop(
     max_tool_calls: int,
     allowed_tools: frozenset,
     stop_event: threading.Event,
+    caller_origin: str = "",
 ):
     """Poll the remote filesystem for tool call requests and dispatch them.
 
@@ -694,7 +697,8 @@ def _rpc_poll_loop(
                             sys.stdout = devnull
                             sys.stderr = devnull
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name, tool_args, task_id=task_id,
+                                caller_origin=caller_origin,
                             )
                         finally:
                             sys.stdout, sys.stderr = _real_stdout, _real_stderr
@@ -740,6 +744,7 @@ def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    caller_origin: str = "",
 ) -> str:
     """Run a script on the remote terminal backend via file-based RPC.
 
@@ -808,7 +813,7 @@ def _execute_remote(
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event,
+                sandbox_tools, stop_event, caller_origin,
             ),
             daemon=True,
         )
@@ -935,6 +940,7 @@ def execute_code(
     code: str,
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    caller_origin: str = "",
 ) -> str:
     """
     Run a Python script in a sandboxed child process with RPC access
@@ -964,7 +970,7 @@ def execute_code(
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools)
+        return _execute_remote(code, task_id, enabled_tools, caller_origin=caller_origin)
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1019,6 +1025,7 @@ def execute_code(
             args=(
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools,
+                caller_origin,
             ),
             daemon=True,
         )
@@ -1614,7 +1621,8 @@ registry.register(
     handler=lambda args, **kw: execute_code(
         code=args.get("code", ""),
         task_id=kw.get("task_id"),
-        enabled_tools=kw.get("enabled_tools")),
+        enabled_tools=kw.get("enabled_tools"),
+        caller_origin=kw.get("caller_origin", "")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
     max_result_size_chars=100_000,

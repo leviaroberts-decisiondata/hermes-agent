@@ -24,6 +24,7 @@ Requires:
 """
 
 import asyncio
+import contextvars
 import hashlib
 import hmac
 import json
@@ -253,6 +254,18 @@ def _normalize_multimodal_content(content: Any) -> Any:
         return "\n".join(p["text"] for p in normalized_parts if p.get("text"))
 
     return normalized_parts
+
+
+def _as_bool(value: Any) -> bool:
+    """Parse a config/env flag into a bool using the established truthy set.
+
+    Accepts the same tokens used elsewhere in this module (``1/true/yes/on``,
+    case-insensitive). Anything else — including None and the empty string —
+    is False, so an unset flag stays OFF.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _content_has_visible_payload(content: Any) -> bool:
@@ -545,6 +558,24 @@ def _derive_chat_session_id(
     return f"api-{digest}"
 
 
+def _resolve_dd_session_key(headers, session_id: str) -> str:
+    """Resolve the DecisionData MC observability session_key for an api_server turn.
+
+    When a caller (e.g. hermes-dispatcher) supplies ``X-DD-Session-Key``,
+    use it verbatim so the spawn row's session_key matches the
+    generation rows that will be logged for the same run_id. Without
+    this, agent_runs.session_key would be ``agent:hermes:gateway:<run>``
+    (set by the dispatcher's /log_spawn) while generations.session_id
+    would be ``agent:hermes:api_server:<session>`` — splitting MC Live
+    drilldowns and breaking joins.
+
+    Falls back to the derived ``agent:hermes:api_server:<session_id>``
+    when the header is absent or blank.
+    """
+    val = (headers.get("X-DD-Session-Key") or "").strip()
+    return val or f"agent:hermes:api_server:{session_id}"
+
+
 _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
@@ -586,11 +617,29 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        # Delivery (System-B) principal key. The dispatcher presents THIS key —
+        # not the System-A key — when it builds a delivery turn. The gateway
+        # classifies the turn's System purely by which key authenticated the
+        # request (see _classify_system_principal). Distinct key → distinct
+        # principal → single authoritative source. Unset → no delivery principal
+        # is configured (delivery turns then classify as 'unknown' → System B by
+        # default-deny, which is the safe direction).
+        self._delivery_key: str = extra.get(
+            "delivery_key", os.getenv("HERMES_DELIVERY_KEY", ""),
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
         self._model_name: str = self._resolve_model_name(
             extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+        )
+        # V0 strict resume (default OFF): when enabled, an X-Hermes-Session-Id
+        # naming a session that does not exist is rejected with 404 instead of
+        # silently starting a fresh conversation. Off → byte-identical to today
+        # (a fabricated id loads empty history and proceeds). Opt-in via config
+        # `platforms.api_server.strict_resume` or env HERMES_STRICT_RESUME.
+        self._strict_resume: bool = _as_bool(
+            extra.get("strict_resume", os.getenv("HERMES_STRICT_RESUME", "")),
         )
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
@@ -690,13 +739,54 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
+            # Accept EITHER configured principal key (System-A or delivery). The
+            # two are distinguished for capability purposes by
+            # _classify_system_principal; for plain endpoint admission both are
+            # valid authenticated principals.
             if hmac.compare_digest(token, self._api_key):
-                return None  # Auth OK
+                return None  # Auth OK (System-A principal)
+            if self._delivery_key and hmac.compare_digest(token, self._delivery_key):
+                return None  # Auth OK (delivery principal)
 
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
         )
+
+    def _classify_system_principal(self, request: "web.Request") -> str:
+        """THE single authoritative source of truth for System A vs System B.
+
+        Identity is derived from exactly ONE thing: *which authenticated
+        principal (which Bearer key) validated this request* — a property of how
+        the turn entered the gateway process, not any model- or caller-supplied
+        data (no request header, no body field, no env var).
+
+        Two principals, distinguished by two keys:
+          • Bearer == API_SERVER_KEY     → "A"  (P1 / coordinator principal)
+          • Bearer == HERMES_DELIVERY_KEY → "B"  (delivery principal — the key
+                                                  the dispatcher presents when it
+                                                  builds a delivery turn)
+          • anything else (no/unknown key) → "unknown"
+
+        Returns "A" | "B" | "unknown". The capability issuer grants System-A
+        capabilities ONLY for "A"; "B" and "unknown" get producer-only. A
+        delivery turn's shell cannot forge this because it never holds either
+        key — the keys live in the trusted dispatcher/gateway boundary.
+
+        NOTE: this deliberately does NOT consult X-DD-Replace-Identity. That
+        header still drives identity-slot/SOUL construction (its original WS1 §4
+        purpose) but is NO LONGER an input to the capability decision — that was
+        the two-sources bug. Capability identity has exactly one source: the key.
+        """
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return "unknown"
+        token = auth_header[7:].strip()
+        if self._api_key and hmac.compare_digest(token, self._api_key):
+            return "A"
+        if self._delivery_key and hmac.compare_digest(token, self._delivery_key):
+            return "B"
+        return "unknown"
 
     # ------------------------------------------------------------------
     # Session header helpers
@@ -794,6 +884,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        dd_obs_meta: Optional[Dict[str, str]] = None,
+        reasoning_effort: Optional[str] = None,
+        replace_identity: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -815,7 +908,6 @@ class APIServerAdapter(BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
@@ -827,6 +919,39 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        # Reasoning effort precedence: per-request override > config
+        # (agent.reasoning_effort, same helper the chat path uses) > None
+        # (None lets the codex transport apply its medium default).
+        # parse_reasoning_effort returns a reasoning_config dict or None;
+        # an invalid request value is silently ignored (falls through to
+        # config), validated upstream in _handle_chat_completions.
+        reasoning_config = None
+        if reasoning_effort:
+            try:
+                from hermes_constants import parse_reasoning_effort
+                reasoning_config = parse_reasoning_effort(reasoning_effort)
+            except Exception:
+                reasoning_config = None
+        if reasoning_config is None:
+            try:
+                reasoning_config = GatewayRunner._load_reasoning_config()
+            except Exception:
+                reasoning_config = None
+
+        # WS1 §4 — delivery-distinct identity. When replace_identity is set, build
+        # the agent so the P1 coordinator SOUL is NOT identity slot #1:
+        #   skip_context_files=True  → skips the SOUL/AGENTS/.cursorrules block
+        #   load_soul_identity=False → does not force SOUL back in as identity
+        # Slot #1 then falls to DEFAULT_AGENT_IDENTITY and the delivery persona
+        # arrives via the appended ephemeral system message (acc-a). The second
+        # P1-family injection (the p1-specialists tree role view at
+        # run_agent.py:5230) is removed by the WS4 audience resolver in this same
+        # increment — both are required for acc-b. Default False → unchanged.
+        _identity_kwargs = (
+            {"skip_context_files": True, "load_soul_identity": False}
+            if replace_identity
+            else {}
+        )
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -834,6 +959,7 @@ class APIServerAdapter(BasePlatformAdapter):
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,
+            **_identity_kwargs,
             enabled_toolsets=enabled_toolsets,
             session_id=session_id,
             platform="api_server",
@@ -846,6 +972,20 @@ class APIServerAdapter(BasePlatformAdapter):
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
         )
+        if reasoning_config is not None:
+            logger.debug(
+                "[api_server] reasoning_config resolved: %s (request_effort=%s)",
+                reasoning_config, reasoning_effort or "<none>",
+            )
+        # DecisionData observability — propagate run lineage from caller.
+        if dd_obs_meta:
+            try:
+                agent._dd_run_id = dd_obs_meta.get("run_id")
+                agent._dd_parent_run_id = dd_obs_meta.get("parent_run_id")
+                agent._dd_session_key = dd_obs_meta.get("session_key")
+                agent._dd_wts_task_id = dd_obs_meta.get("wts_task_id")
+            except Exception:
+                pass
         return agent
 
     # ------------------------------------------------------------------
@@ -965,6 +1105,23 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = body.get("stream", False)
 
+        # Per-request reasoning override: JSON body field `reasoning_effort`
+        # (preferred) or header `X-Hermes-Reasoning` (alt). Validated here;
+        # an invalid/unknown value is ignored (None) so resolution falls
+        # through to config (agent.reasoning_effort) at _create_agent time.
+        # Precedence: request > config > codex transport default (medium).
+        _req_reasoning = body.get("reasoning_effort")
+        if not isinstance(_req_reasoning, str) or not _req_reasoning.strip():
+            _req_reasoning = request.headers.get("X-Hermes-Reasoning")
+        reasoning_effort: Optional[str] = None
+        if isinstance(_req_reasoning, str) and _req_reasoning.strip():
+            try:
+                from hermes_constants import parse_reasoning_effort
+                if parse_reasoning_effort(_req_reasoning) is not None:
+                    reasoning_effort = _req_reasoning.strip().lower()
+            except Exception:
+                reasoning_effort = None
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -1038,10 +1195,43 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
+            # V0 strict resume (default OFF): reject a session id that does not
+            # exist instead of silently starting fresh. This is what makes the
+            # "a fabricated id FAILS" contract reachable for callers that resume
+            # through the dispatcher. Only enforced when self._strict_resume is
+            # set; otherwise behavior is unchanged (empty history → fresh turn).
+            # A DB error here is non-fatal: we fall through to the normal
+            # best-effort load path rather than 404'ing on infra trouble.
+            if self._strict_resume:
+                try:
+                    _db = self._ensure_session_db()
+                    if _db is not None and _db.get_session(session_id) is None:
+                        logger.info(
+                            "Strict resume: rejecting unknown session id %s", session_id
+                        )
+                        return web.json_response(
+                            _openai_error(
+                                f"Unknown session id: {session_id}. "
+                                "Strict resume is enabled and this session does not exist.",
+                                err_type="invalid_request_error",
+                            ),
+                            status=404,
+                        )
+                except Exception as e:  # pragma: no cover - infra failure path
+                    logger.warning(
+                        "Strict resume existence check failed for %s (allowing): %s",
+                        session_id, e,
+                    )
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    # Follow compression forks: if this session was compressed,
+                    # its transcript lives in a descendant child session. Redirect
+                    # only the HISTORY LOAD to that child; new-turn writes still
+                    # use the caller-supplied session_id. Safe for non-forked ids
+                    # (returns the same id when the session already has messages).
+                    resume_id = db.resolve_resume_session_id(session_id)
+                    history = db.get_messages_as_conversation(resume_id)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -1061,6 +1251,130 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+
+        # ── DecisionData observability handshake ─────────────────────────
+        # If a caller (e.g. hermes-dispatcher) supplies X-DD-Run-Id, that
+        # caller already posted /log_spawn and will post /log_complete; we
+        # only forward the run_id so per-call /log_generation rows attribute
+        # to the right run. Otherwise, api_server owns the lifecycle and
+        # makes Hermes self-spawn for direct callers (Open WebUI, CLI, etc.).
+        _dd_run_id = (request.headers.get("X-DD-Run-Id") or "").strip()
+        _dd_parent_run_id = (request.headers.get("X-DD-Parent-Run-Id") or "").strip() or None
+        _dd_wts_task_id = (request.headers.get("X-DD-WTS-Task-Id") or "").strip() or None
+        # WTS 5c2ee467 — bind the per-turn canonical WTS task into the request's
+        # task-local context so it propagates (via _run_agent's copy_context) into
+        # the terminal tool's subprocess env as DD_TURN_WTS_TASK, letting
+        # `dd-delivery ship` inherit the exact task. Per-request isolated; never
+        # process-global. Empty header clears it for this context.
+        try:
+            from gateway.session_context import set_session_wts_task
+            set_session_wts_task(_dd_wts_task_id or "")
+        except Exception:
+            pass
+        # WS1 §4 — delivery-distinct identity. When the dispatcher marks this a
+        # delivery turn, build the agent with skip_context_files=True +
+        # load_soul_identity=False so the P1 coordinator SOUL is NOT slot #1.
+        # Absent header → False → identical to today.
+        _dd_replace_identity = (request.headers.get("X-DD-Replace-Identity") or "").strip() in ("1", "true", "yes", "on")
+        # ── Option-3 capability credential (Phase 1) ─────────────────────────
+        # Mint the per-turn capability credential at THE moment the turn's
+        # nature is decided. The System (A/B) is determined by exactly ONE
+        # authoritative source — _classify_system_principal, i.e. WHICH
+        # authenticated Bearer key validated this request — not by any
+        # caller/model-supplied header, body field, or env var (review
+        # BLOCKER #1). The credential is stored in the capability_context
+        # contextvar (NOT os.environ, NOT a turn-readable file): the delivery
+        # turn's shell never receives it. Gateway-mediated outbound calls to
+        # protected resources read it via capability_context.current_credential()
+        # and attach it as the X-DD-Capability control-plane header. Fail-soft:
+        # a missing signer key mints nothing → resources default-deny (correct).
+        try:
+            from gateway import capability_issuer
+            _dd_system = self._classify_system_principal(request)
+            capability_issuer.mint_for_turn(
+                system=_dd_system,
+                session_id=session_id,
+            )
+        except Exception:
+            pass  # capability minting must never block a turn
+        _dd_caller_supplied_run_id = bool(_dd_run_id)
+        _dd_owns_lifecycle = False
+        if not _dd_run_id:
+            _dd_run_id = uuid.uuid4().hex
+            _dd_owns_lifecycle = True
+        _dd_session_key = _resolve_dd_session_key(request.headers, session_id)
+        _dd_meta = {
+            "run_id": _dd_run_id,
+            "parent_run_id": _dd_parent_run_id,
+            "session_key": _dd_session_key,
+            "wts_task_id": _dd_wts_task_id,
+        }
+        _dd_keepalive = None
+        # Own lifecycle for direct callers in both non-streaming and streaming
+        # modes.  If a caller supplied X-DD-Run-Id (for example
+        # hermes-dispatcher), that caller owns spawn/complete and we only
+        # attach generation metadata to its existing run.
+        if _dd_owns_lifecycle:
+            try:
+                import dd_obs
+                _user_text_for_log = ""
+                if isinstance(user_message, str):
+                    _user_text_for_log = user_message
+                elif isinstance(user_message, list):
+                    for _part in user_message:
+                        if isinstance(_part, dict) and _part.get("type") == "text":
+                            _user_text_for_log = str(_part.get("text") or "")
+                            break
+                dd_obs.log_spawn(
+                    run_id=_dd_run_id,
+                    session_key=_dd_session_key,
+                    parent_run_id=_dd_parent_run_id,
+                    task_prompt=_user_text_for_log[:500],
+                    label="Hermes Worker",
+                    model=model_name or "",
+                    provider=getattr(self, "_provider", "") or "openai-codex",
+                    channel="hermes",
+                    spawn_context=(f"wts_task_id={_dd_wts_task_id}; api_server" if _dd_wts_task_id else "api_server"),
+                )
+                _dd_keepalive = dd_obs.KeepaliveLoop(run_id=_dd_run_id)
+                _dd_keepalive.start()
+            except Exception:
+                pass  # observability never blocks
+        # If X-DD-Run-Id was caller-supplied, lifecycle remains disabled here.
+
+        # ── WS1 §2: best-effort Service-Layer (:8510) session registration ───
+        # ADDITIVE + DEFAULT-OFF (ENABLE_AGENT_SERVICE_REGISTRATION). Makes this
+        # gateway session enumerable in the backbone without touching dispatch
+        # or routing. Non-fatal: a down/slow :8510 never blocks the turn. We fire
+        # for every api_server turn (idempotent on the :8510 side, keyed on
+        # session_id) so direct-caller AND dispatcher-forwarded sessions register.
+        # P5: the linked :8510 job_id for this turn, captured at registration so
+        # the turn-completion finally can write the P1-ledger status transition.
+        # None unless service registration is enabled AND :8510 returned a job_id.
+        _dd_p1_job_id: Optional[str] = None
+        try:
+            from gateway import dd_agent_service
+
+            if dd_agent_service.is_enabled():
+                # register_session_get_job_id is the same idempotent session-created
+                # POST as before, but returns the linked job_id so we can drive the
+                # P1 ledger. P5: a REAL P1 turn begins working a job here → claim it
+                # (the A-side ledger write that was previously unwired). Fail-soft:
+                # any :8510 error leaves _dd_p1_job_id None and the turn unchanged.
+                _dd_p1_job_id = dd_agent_service.register_session_get_job_id(
+                    session_id,
+                    model=model_name or "",
+                    label="Hermes gateway session",
+                    session_key=_dd_session_key,
+                )
+                if _dd_p1_job_id:
+                    dd_agent_service.p1_claim_job(
+                        _dd_p1_job_id,
+                        owner=_dd_session_key or "p1",
+                        priority="normal",
+                    )
+        except Exception:
+            pass  # registration must never block a turn
 
         if stream:
             import queue as _q
@@ -1134,6 +1448,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            # Forward dd_obs_meta for streaming whenever a real run exists.
+            # Dispatcher-supplied runs already exist upstream; direct streaming
+            # callers now self-spawn above so per-call generation/tool rows no
+            # longer become orphans.
+            _dd_meta_for_stream = _dd_meta if (_dd_caller_supplied_run_id or _dd_owns_lifecycle) else None
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -1144,12 +1463,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                dd_obs_meta=_dd_meta_for_stream,
+                reasoning_effort=reasoning_effort,
+                replace_identity=_dd_replace_identity,
             ))
 
+            _dd_lifecycle = None
+            if _dd_owns_lifecycle:
+                _dd_lifecycle = {
+                    "run_id": _dd_run_id,
+                    "keepalive": _dd_keepalive,
+                }
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                dd_lifecycle=_dd_lifecycle,
+                p1_job_id=_dd_p1_job_id,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1160,66 +1490,116 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                dd_obs_meta=_dd_meta,
+                reasoning_effort=reasoning_effort,
+                replace_identity=_dd_replace_identity,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
-        if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
-            try:
-                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
-        else:
-            try:
-                result, usage = await _compute_completion()
-            except Exception as e:
-                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
-                return web.json_response(
-                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
-                    status=500,
-                )
+        # ── DecisionData lifecycle invariant ─────────────────────────────
+        # When api_server owns the spawn/complete handshake, KeepaliveLoop
+        # MUST be stopped and /log_complete MUST fire on every exit path
+        # — including exceptions from _run_agent — otherwise MC Live shows
+        # a phantom "running" agent forever (keepalive thread alive,
+        # agent_runs.completed_at never set). The try/finally below makes
+        # that guarantee; the success branch later upgrades the status
+        # from "error" → "done" when the response is built.
+        _dd_complete_status = "error"
+        _dd_complete_summary = ""
+        _dd_input_tokens = 0
+        _dd_output_tokens = 0
+        try:
+            if idempotency_key:
+                fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+                try:
+                    result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+                except Exception as e:
+                    logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                    return web.json_response(
+                        _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                        status=500,
+                    )
+            else:
+                try:
+                    result, usage = await _compute_completion()
+                except Exception as e:
+                    logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                    return web.json_response(
+                        _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                        status=500,
+                    )
 
-        final_response = result.get("final_response", "")
-        if not final_response:
-            final_response = result.get("error", "(No response generated)")
+            final_response = result.get("final_response", "")
+            if not final_response:
+                final_response = result.get("error", "(No response generated)")
 
-        response_data = {
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_response,
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-        }
+            response_data = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": final_response,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
 
-        response_headers = {
-            "X-Hermes-Session-Id": result.get("session_id", session_id),
-        }
-        if gateway_session_key:
-            response_headers["X-Hermes-Session-Key"] = gateway_session_key
-        return web.json_response(response_data, headers=response_headers)
+            _dd_complete_status = "done"
+            _dd_complete_summary = (final_response or "")[:200]
+            _dd_input_tokens = int(usage.get("input_tokens", 0) or 0)
+            _dd_output_tokens = int(usage.get("output_tokens", 0) or 0)
+            response_headers = {
+                "X-Hermes-Session-Id": result.get("session_id", session_id),
+            }
+            if gateway_session_key:
+                response_headers["X-Hermes-Session-Key"] = gateway_session_key
+            return web.json_response(response_data, headers=response_headers)
+        finally:
+            if _dd_owns_lifecycle:
+                try:
+                    if _dd_keepalive is not None:
+                        _dd_keepalive.stop()
+                    import dd_obs
+                    dd_obs.log_complete(
+                        run_id=_dd_run_id,
+                        status=_dd_complete_status,
+                        result_summary=_dd_complete_summary,
+                        input_tokens=_dd_input_tokens,
+                        output_tokens=_dd_output_tokens,
+                    )
+                except Exception:
+                    pass  # observability never blocks
+            # P5: P1-ledger status transition on turn completion. Symmetric with
+            # the begin-of-turn p1-claim; fires only when a job was claimed
+            # (_dd_p1_job_id set). NOT gated on _dd_owns_lifecycle (that governs
+            # dd_obs, not the ledger). _dd_complete_status is "done" on success,
+            # "error" otherwise — the ledger has no "error" status, so a failed
+            # turn lands as "blocked" (honest: the work stopped, not finished).
+            if _dd_p1_job_id:
+                try:
+                    from gateway import dd_agent_service
+                    _p1_status = "done" if _dd_complete_status == "done" else "blocked"
+                    dd_agent_service.p1_set_status(_dd_p1_job_id, status=_p1_status)
+                except Exception:
+                    pass  # ledger write must never block a turn
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
         gateway_session_key: str = None,
+        dd_lifecycle: Optional[Dict[str, Any]] = None,
+        p1_job_id: Optional[str] = None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1246,6 +1626,11 @@ class APIServerAdapter(BasePlatformAdapter):
             sse_headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=sse_headers)
         await response.prepare(request)
+
+        _dd_complete_status = "error"
+        _dd_complete_summary = ""
+        _dd_input_tokens = 0
+        _dd_output_tokens = 0
 
         try:
             last_activity = time.monotonic()
@@ -1316,8 +1701,16 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
-            except Exception:
-                pass
+                if isinstance(result, dict):
+                    _dd_complete_status = "error" if result.get("failed") else "done"
+                    _dd_complete_summary = str(result.get("final_response") or result.get("error") or "")[:200]
+                else:
+                    _dd_complete_status = "done"
+                _dd_input_tokens = int(usage.get("input_tokens", 0) or 0)
+                _dd_output_tokens = int(usage.get("output_tokens", 0) or 0)
+            except Exception as _agent_err:
+                _dd_complete_status = "error"
+                _dd_complete_summary = str(_agent_err)[:200]
 
             # Finish chunk
             finish_chunk = {
@@ -1348,7 +1741,36 @@ class APIServerAdapter(BasePlatformAdapter):
                     await agent_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            _dd_complete_status = "interrupted"
+            _dd_complete_summary = "SSE client disconnected"
             logger.info("SSE client disconnected; interrupted agent task %s", completion_id)
+        finally:
+            if dd_lifecycle:
+                try:
+                    _ka = dd_lifecycle.get("keepalive")
+                    if _ka is not None:
+                        _ka.stop()
+                    import dd_obs
+                    dd_obs.log_complete(
+                        run_id=str(dd_lifecycle.get("run_id") or ""),
+                        status=_dd_complete_status,
+                        result_summary=_dd_complete_summary,
+                        input_tokens=_dd_input_tokens,
+                        output_tokens=_dd_output_tokens,
+                    )
+                except Exception:
+                    pass  # observability never blocks
+            # P5: P1-ledger status transition for STREAMING turns — symmetric with
+            # the non-stream finally. Fires only when a job was claimed at begin.
+            # An interrupted stream (client disconnect) lands as "blocked" too, not
+            # "done": the work did not complete.
+            if p1_job_id:
+                try:
+                    from gateway import dd_agent_service
+                    _p1_status = "done" if _dd_complete_status == "done" else "blocked"
+                    dd_agent_service.p1_set_status(p1_job_id, status=_p1_status)
+                except Exception:
+                    pass  # ledger write must never block a turn
 
         return response
 
@@ -2448,6 +2870,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        dd_obs_meta: Optional[Dict[str, str]] = None,
+        reasoning_effort: Optional[str] = None,
+        replace_identity: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -2471,6 +2896,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 gateway_session_key=gateway_session_key,
+                dd_obs_meta=dd_obs_meta,
+                reasoning_effort=reasoning_effort,
+                replace_identity=replace_identity,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -2493,7 +2921,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 result["session_id"] = _eff_sid
             return result, usage
 
-        return await loop.run_in_executor(None, _run)
+        # Run the agent loop under a COPY of the current context so per-turn
+        # contextvars propagate into the worker thread. run_in_executor does not
+        # copy contextvars, so without this the Option-3 capability credential
+        # (minted in _handle_chat_completions and held in capability_context) is
+        # None throughout the agent loop and every tool — a gateway-mediated
+        # egress tool could never present it. copy_context() snapshots the
+        # handler's context (credential included); the agent then runs under it.
+        _ctx = contextvars.copy_context()
+        return await loop.run_in_executor(None, _ctx.run, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

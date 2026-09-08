@@ -62,6 +62,7 @@ class TestHandleFunctionCall:
                 task_id="task-1",
                 session_id="session-1",
                 tool_call_id="call-1",
+                caller_origin="",
             ),
             call(
                 "post_tool_call",

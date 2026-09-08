@@ -113,6 +113,7 @@ class TestHTTP413Compression:
         # First call raises 413; second call succeeds after compression.
         err_413 = _make_413_error()
         ok_resp = _mock_response(content="Success after compression", finish_reason="stop")
+        agent._compression_prune_before_summary = True
         agent.client.chat.completions.create.side_effect = [err_413, ok_resp]
 
         # Prefill so there are multiple messages for compression to reduce
@@ -135,6 +136,7 @@ class TestHTTP413Compression:
             result = agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_called_once()
+        assert not mock_compress.call_args.kwargs.get("allow_prune_only", False)
         assert result["completed"] is True
         assert result["final_response"] == "Success after compression"
 
@@ -286,6 +288,7 @@ class TestHTTP413Compression:
         )
         err_400.status_code = 400
         ok_resp = _mock_response(content="Recovered after compression", finish_reason="stop")
+        agent._compression_prune_before_summary = True
         agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
 
         prefill = [
@@ -306,6 +309,7 @@ class TestHTTP413Compression:
             result = agent.run_conversation("hello", conversation_history=prefill)
 
         mock_compress.assert_called_once()
+        assert not mock_compress.call_args.kwargs.get("allow_prune_only", False)
         # Must NOT have "failed": True (which would mean the generic 4xx handler caught it)
         assert result.get("failed") is not True
         assert result["completed"] is True
@@ -418,6 +422,7 @@ class TestPreflightCompression:
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
         agent.compression_enabled = True
+        agent._compression_prune_before_summary = True
         # Set a small context so the history is "oversized", but large enough
         # that the compressed result (2 short messages) fits in a single pass.
         agent.context_compressor.context_length = 2000
@@ -455,6 +460,7 @@ class TestPreflightCompression:
         # large sessions, breaking when no further reduction is possible).
         # First pass must have received the full oversized history.
         assert mock_compress.call_count >= 1, "Preflight compression never ran"
+        assert mock_compress.call_args_list[0].kwargs["allow_prune_only"] is True
         first_call_messages = mock_compress.call_args_list[0].args[0]
         assert len(first_call_messages) >= 40, (
             f"First preflight pass should see the full history, got "

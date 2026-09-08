@@ -338,6 +338,7 @@ class ContextCompressor(ContextEngine):
         self._context_probe_persistable = False
         self._previous_summary = None
         self._last_summary_error = None
+        self._last_compression_skipped = False
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_aux_model_failure_error = None
@@ -414,6 +415,7 @@ class ContextCompressor(ContextEngine):
             MINIMUM_CONTEXT_LENGTH,
         )
         self.compression_count = 0
+        self._last_compression_skipped = False
 
         # Derive token budgets: ratio is relative to the threshold, not total context
         target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
@@ -889,6 +891,19 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = redact_sensitive_text(content.strip())
+            # Fleet-repair hardening (WTS 7e1d32e9): preservation of the
+            # obligation sections was best-effort LLM output with NO
+            # verification — nothing checked that '## Active Task' (the
+            # template's "single most important field") survived. Verify and
+            # log LOUDLY; a summary missing its obligations is how a
+            # compressed session silently forgets what it owes the user.
+            _required = ("## Active Task",)
+            _missing = [s for s in _required if s not in summary]
+            if _missing:
+                logging.error(
+                    "context compression summary DROPPED obligation section(s) "
+                    "%s — the compressed session may no longer know its active "
+                    "task. Summary len=%d.", _missing, len(summary))
             # Store for iterative updates on next compaction
             self._previous_summary = summary
             self._summary_failure_cooldown_until = 0.0
@@ -1274,7 +1289,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
+    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None, *, request_overhead_tokens: int = 0, prune_only_if_fits: bool = False) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -1292,9 +1307,14 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 provided, the summariser will prioritise preserving information
                 related to this topic and be more aggressive about compressing
                 everything else.  Inspired by Claude Code's ``/compact``.
+            prune_only_if_fits: Opt-in for automatic threshold compression;
+                explicit/manual and provider-recovery calls leave this False.
+            request_overhead_tokens: System prompt and tool-schema tokens to
+                include when deciding whether the pruned request fits.
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
+        self._last_compression_skipped = False
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_summary_error = None
@@ -1320,6 +1340,21 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         )
         if pruned_count and not self.quiet_mode:
             logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
+
+        # WTS 709ed4b0: automatic, explicitly opted-in compression can stop
+        # after the cheap prune. Include fixed request overhead so tool schemas
+        # and the system prompt cannot hide pressure above the threshold.
+        if prune_only_if_fits and not focus_topic:
+            post_prune_tokens = estimate_messages_tokens_rough(messages)
+            overhead = max(0, int(request_overhead_tokens))
+            if post_prune_tokens + overhead < self.threshold_tokens:
+                self._last_compression_skipped = True
+                logger.info(
+                    "Compression skipped: pruning left ~%d message tokens + %d "
+                    "overhead below %d; transcript retained (%d results pruned)",
+                    post_prune_tokens, overhead, self.threshold_tokens, pruned_count,
+                )
+                return messages
 
         # Phase 2: Determine boundaries
         compress_start = self.protect_first_n

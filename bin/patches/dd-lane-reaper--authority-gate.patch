@@ -1,0 +1,166 @@
+--- a/bin/dd-lane-reaper
++++ b/bin/dd-lane-reaper
+@@ -345,6 +345,35 @@
+ data = json.load(open(os.environ["RG_FILE"]))
+ print(json.dumps(data, indent=2))
+ PY
++}
++
++# ── WTS 17cbc96c — may THIS reaper re-inject THIS run into ITS OWN session? ──
++# reinject_caller_session() below resolves its destination with
++# gateway.mirror._find_session_id(platform, chat_id). Levi's Telegram chat id
++# 8737984752 is IDENTICAL across all five bots, so that lookup names a TRANSPORT,
++# not an owner: on 2026-08-10 it appended PTG's and Azul's lane closeouts to P1's
++# transcript, and P1 then wrote reconciliation notes onto CLIENT WTS records.
++#
++# The run's dispatch-authority sidecar records which instance dispatched it and
++# where its callback may return. That, and not the chat id, decides. The whole
++# decision lives in tools/dispatch_authority.reinject_authorisation() so it is
++# unit-tested in the repo rather than buried in a heredoc: it returns "ok" or
++# "skip:<reason>" and never raises. FAIL CLOSED — if the check cannot run at all,
++# the || arm answers skip, which is the safe answer.
++#
++# This fires on exactly the paths the wake does NOT own: wake=skipped(disabled),
++# skipped(no-routing), error(exc), CONTINUATION_BLOCKED, gateway-refused, or
++# DD_LANE_EXACTLY_ONCE=0. Those are the last remaining ways a foreign run's text
++# could still reach this gateway's transcript.
++reinject_authorised() { # $1=run_dir -> echoes "ok" or "skip:<reason>"
++  local rd="$1"
++  RA_RD="$rd" RA_AGENT_DIR="$AGENT_DIR" HERMES_HOME="$HERMES_HOME" \
++  "$VENV_PY" - <<'PY_REINJECT_AUTH' 2>>"$LOG_FILE" || echo "skip:authority-check-unavailable"
++import os, sys
++sys.path.insert(0, os.environ["RA_AGENT_DIR"])
++from tools.dispatch_authority import reinject_authorisation
++print(reinject_authorisation(os.environ.get("RA_RD") or ""))
++PY_REINJECT_AUTH
+ }
+ 
+ # ── Re-inject a closeout into the caller's gateway session (cross-process). ──
+@@ -352,8 +381,19 @@
+ # path (file JSONL + SQLite) that resolves the live session by platform+chat_id.
+ # This is what makes P1 reconcile its internal PENDING with real substance on its
+ # next turn WITHOUT the user poking it. Returns 0/1 booleans only (no secrets).
+-reinject_caller_session() { # $1=platform $2=chat_id $3=thread_id $4=closeout_text
+-  local platform="$1" chat_id="$2" thread_id="$3" text="$4"
++#
++# GATED (WTS 17cbc96c): the append happens only when this run's dispatch record
++# names THIS instance as the destination. A skip is not a failure and is not
++# logged as one — the result is already durable on the WTS task and the lane
++# thread; only the passive transcript append is withheld, which is the point.
++reinject_caller_session() { # $1=platform $2=chat_id $3=thread_id $4=closeout_text $5=run_dir
++  local platform="$1" chat_id="$2" thread_id="$3" text="$4" run_dir="${5:-}"
++  local _auth; _auth="$(reinject_authorised "$run_dir")"
++  if [[ "$_auth" != "ok" ]]; then
++    log "REINJECT-SKIPPED run_dir=${run_dir:-none} reason=${_auth#skip:} — this run's callback is not addressed to this instance's session; result stays durable on WTS + the lane thread, no transcript touched (WTS 17cbc96c)"
++    printf 'reinject_skipped=%s\n' "${_auth#skip:}"
++    return 0
++  fi
+   RJ_PLAT="$platform" RJ_CHAT="$chat_id" RJ_THREAD="$thread_id" RJ_TEXT="$text" \
+   RJ_AGENT_DIR="$AGENT_DIR" HERMES_HOME="$HERMES_HOME" \
+   "$VENV_PY" - <<'PY' 2>>"$LOG_FILE"
+@@ -1278,6 +1318,38 @@
+       and str(wt.get("chat_id") or "").strip())
+ raise SystemExit(0 if ok else 1)
+ PY_WT_ROUTING
++}
++
++# ── WTS 17cbc96c — three PURE classifiers for the drain's processed outcome. ──
++# Pure (argument in, string/status out, no I/O) so they can be extracted by name
++# and executed by a test harness, and so the three places that ask "did the wake
++# actually deliver?" cannot drift apart. The distinction they encode:
++#   injected / claimed / anything else  -> the gateway ACCEPTED and P1 continued
++#   refused-* (or the older quarantined*) -> the gateway REFUSED at admission;
++#                                            no model turn, no continuation
++classify_wake_proof() { # $1=processed-marker outcome $2=idempotency key -> wake token
++  local _inj="$1" _wkey="$2"
++  case "$_inj" in
++    refused-*|quarantined|quarantined:*)
++      printf 'wake=gateway-refused(%s,%s)\n' "$_inj" "$_wkey" ;;
++    *)
++      printf 'wake=gateway-accepted(%s,%s)\n' "$_inj" "$_wkey" ;;
++  esac
++}
++
++wake_was_refused() { # $1=wake_outcome -> exit 0 iff the gateway refused the callback
++  case "$1" in
++    wake=gateway-refused\(*) return 0 ;;
++  esac
++  return 1
++}
++
++wake_owns_delivery() { # $1=wake_outcome -> exit 0 iff the wake OWNS delivery
++  # gateway-refused is deliberately NOT here: a refused callback delivered nothing.
++  case "$1" in
++    wake=emitted\(*|wake=gateway-accepted\(*|wake=skipped\(dup:*|wake=skipped\(processed:*) return 0 ;;
++  esac
++  return 1
+ }
+ 
+ # ── P1 orchestration repair (Batch B / Q3): gateway INJECTION proof, not emit. ──
+@@ -1939,12 +2011,25 @@
+   #        event was ENQUEUED. Read back the gateway drain's at-most-once processed
+   #        marker to learn whether P1 was actually injected. When proven, upgrade the
+   #        token to wake=gateway-accepted(injected,<key>) — the canonical wake proof.
++  #
++  #        WTS 17cbc96c: the drain also writes a processed marker when it REFUSES a
++  #        callback (admission quarantine). Every non-empty outcome used to be
++  #        wrapped as gateway-accepted and logged as "the gateway drain injected the
++  #        P1 continuation (canonical proof)", so a refusal was reported as the
++  #        strongest success signal this rail has — and graded orch=DONE. Classify
++  #        first. `refused-*` is the current token; `quarantined*` is the token the
++  #        live gateway wrote before this change and may still be sitting in
++  #        .processed markers on disk, so both are recognised.
+   if [[ "$wake_outcome" == wake=emitted\(* ]]; then
+     local _wkey="${wake_outcome#wake=emitted(}"; _wkey="${_wkey%)}"
+     local _inj; _inj="$(wake_injection_proof "$_wkey")"
+     if [[ -n "$_inj" ]]; then
+-      wake_outcome="wake=gateway-accepted(${_inj},${_wkey})"
+-      log "WAKE-ACCEPTED run_dir=$rd key=$_wkey outcome=$_inj — gateway drain injected the P1 continuation (canonical proof)"
++      wake_outcome="$(classify_wake_proof "$_inj" "$_wkey")"
++      if wake_was_refused "$wake_outcome"; then
++        log "WAKE-REFUSED run_dir=$rd key=$_wkey outcome=$_inj — the gateway drain QUARANTINED this callback BEFORE the model ran; no continuation was injected. This is a governance failure, not a delivery."
++      else
++        log "WAKE-ACCEPTED run_dir=$rd key=$_wkey outcome=$_inj — gateway drain injected the P1 continuation (canonical proof)"
++      fi
+     fi
+   fi
+ 
+@@ -1956,17 +2041,20 @@
+   #         previously both fired for every run, and their independently
+   #         composed texts are the documented source of the dual/contradictory
+   #         callbacks. Set DD_LANE_EXACTLY_ONCE=0 to restore dual delivery.
++  #         WTS 17cbc96c: wake=gateway-refused(...) is deliberately ABSENT from the
++  #         ownership list below. A refused wake delivered nothing, so it cannot own
++  #         delivery; the run falls through to the passive reinject, which is itself
++  #         authority-gated and will skip when the run is not ours. Do not "simplify"
++  #         this back to a wake=gateway-* glob.
+   if [[ -n "$sk" && -n "$platform" && -n "$chat_id" ]]; then
+     local _wake_owns=false
+-    case "$wake_outcome" in
+-      wake=emitted\(*|wake=gateway-accepted\(*|wake=skipped\(dup:*|wake=skipped\(processed:*) _wake_owns=true ;;
+-    esac
++    if wake_owns_delivery "$wake_outcome"; then _wake_owns=true; fi
+     if [[ "${DD_LANE_EXACTLY_ONCE:-1}" != "0" && "$_wake_owns" == "true" ]]; then
+       reinject_outcome="skipped(delivered-via-wake)"
+       log "EXACTLY-ONCE run_dir=$rd delivery=wake (${wake_outcome}); passive reinject suppressed"
+     else
+-      local rj_out; rj_out="$(reinject_caller_session "$platform" "$chat_id" "$thread_id" "$closeout" || true)"
+-      reinject_outcome="$(printf '%s' "$rj_out" | grep -oE 'reinject_(ok|err)=[^ ]*' | head -1 || echo "reinject=unknown")"
++      local rj_out; rj_out="$(reinject_caller_session "$platform" "$chat_id" "$thread_id" "$closeout" "$rd" || true)"
++      reinject_outcome="$(printf '%s' "$rj_out" | grep -oE 'reinject_(ok|err|skipped)=[^ ]*' | head -1 || echo "reinject=unknown")"
+     fi
+   fi
+ 
+@@ -2016,6 +2104,12 @@
+     *)
+       if [[ "$wake_outcome" == wake=CONTINUATION_BLOCKED* ]]; then
+         orch="CONTINUATION-BLOCKED"; orch_reason="P1 owns this result but could not be woken (see CONTINUATION_BLOCKED)"
++      elif wake_was_refused "$wake_outcome"; then
++        # WTS 17cbc96c. The gateway REFUSED this callback at admission — wrong
++        # instance, wrong session, wrong run, no dispatch record, stale or replayed.
++        # Nothing was injected and no continuation happened, so this can never be
++        # DONE. Check the quarantine evidence in $HERMES_HOME/quarantine.
++        orch="BLOCKED"; orch_reason="gateway QUARANTINED the callback (${wake_outcome}) — no P1 continuation was injected; the work product may be fine but the governance loop did not close; see \$HERMES_HOME/quarantine"
+       elif [[ "$wts_outcome" == wts_attach=FAIL* ]]; then
+         orch="BLOCKED"; orch_reason="result not durable — WTS attach failed"
+       elif [[ "$_had_caller" == "true" && "$mirror_degraded" == "1" ]]; then

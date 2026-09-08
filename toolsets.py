@@ -52,8 +52,8 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Code execution + delegation
-    "execute_code", "delegate_task",
+    # Code execution + delegation + lane routing
+    "execute_code", "delegate_task", "route_to_lane", "wts_bind", "chain_status",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -204,6 +204,17 @@ TOOLSETS = {
         "includes": []
     },
 
+    # P1 specialist-lane dispatch + chain-status read. Split out of "delegation"
+    # (2026-06-16) so a surface can keep the generic delegate_task tool while
+    # disabling the P1-only dispatch/chain tools — e.g. the personal advisor
+    # gateway sets agent.disabled_toolsets: [p1-dispatch]. Default-on like
+    # delegation was, so P1 (which disables nothing) is unaffected.
+    "p1-dispatch": {
+        "description": "Route work to specialist lanes and read chain status from the request_chains spine",
+        "tools": ["route_to_lane", "wts_bind", "chain_status"],
+        "includes": []
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
@@ -315,7 +326,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             "todo", "memory",
             "session_search",
-            "execute_code", "delegate_task",
+            "execute_code", "delegate_task", "route_to_lane", "wts_bind", "chain_status",
         ],
         "includes": []
     },
@@ -342,8 +353,8 @@ TOOLSETS = {
             "todo", "memory",
             # Session history search
             "session_search",
-            # Code execution + delegation
-            "execute_code", "delegate_task",
+            # Code execution + delegation + lane routing
+            "execute_code", "delegate_task", "route_to_lane", "wts_bind", "chain_status",
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
