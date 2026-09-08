@@ -689,7 +689,22 @@ class SessionDB:
         return session_id
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
-        """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
+        """Remove old empty TUI rows only when no transcript artifacts exist.
+
+        Legacy sessions can have history exclusively in JSON/JSONL. Absence of
+        SQLite messages does not establish that those sessions are empty. Keep
+        any session with an artifact (including empty or unreadable files), and
+        never remove files from this automatic cleanup.
+        """
+        if sessions_dir is None:
+            return 0  # Cannot establish whether legacy history exists.
+        try:
+            artifact_names = {path.name for path in Path(sessions_dir).iterdir()}
+        except FileNotFoundError:
+            artifact_names = set()
+        except OSError:
+            logger.debug("Ghost session prune skipped: transcript directory unavailable")
+            return 0
         cutoff = time.time() - 86400  # Only sessions older than 24 hours
 
         def _do(conn):
@@ -704,6 +719,12 @@ class SessionDB:
                   )
             """, (cutoff,)).fetchall()
             ids = [r[0] if isinstance(r, (tuple, list)) else r["id"] for r in rows]
+            ids = [sid for sid in ids if not (
+                f"{sid}.json" in artifact_names
+                or f"{sid}.jsonl" in artifact_names
+                or any(name.startswith(f"request_dump_{sid}_") and name.endswith(".json")
+                       for name in artifact_names)
+            )]
             if ids:
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
@@ -712,10 +733,6 @@ class SessionDB:
             return ids
 
         removed_ids = self._execute_write(_do) or []
-        # Clean up any on-disk session files (belt-and-suspenders)
-        if sessions_dir and removed_ids:
-            for sid in removed_ids:
-                self._remove_session_files(sessions_dir, sid)
         return len(removed_ids)
 
     def finalize_orphaned_compression_sessions(self) -> int:
