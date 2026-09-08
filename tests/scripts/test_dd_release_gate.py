@@ -46,3 +46,14 @@ def test_missing_required_gate_fails_before_pytest(monkeypatch, tmp_path):
     monkeypatch.setattr(subprocess, "call", lambda *a, **kw: pytest.fail("must not run"))
     with pytest.raises(SystemExit, match="Required release tests missing"):
         module["main"]()
+
+
+@pytest.mark.parametrize("soft,hard,expected", [(256, 8192, 4096), (256, 1024, 1024), (8192, 8192, None)])
+def test_test_process_limit_respects_existing_hard_limit(monkeypatch, soft, hard, expected):
+    resource = pytest.importorskip("resource")
+    module = runpy.run_path(str(RUNNER))
+    calls = []
+    monkeypatch.setattr(resource, "getrlimit", lambda key: (soft, hard))
+    monkeypatch.setattr(resource, "setrlimit", lambda key, value: calls.append((key, value)))
+    module["prepare_file_limit"]()
+    assert calls == ([] if expected is None else [(resource.RLIMIT_NOFILE, (expected, hard))])

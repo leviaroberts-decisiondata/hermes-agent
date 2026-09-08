@@ -66,6 +66,19 @@ PATTERNS = (
 )
 
 
+def prepare_file_limit():
+    """Account for launchd's 256-file soft limit in this test process only."""
+    try:
+        import resource
+    except ImportError:
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+    if soft != resource.RLIM_INFINITY and soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    print(f"Test process file limit: {resource.getrlimit(resource.RLIMIT_NOFILE)[0]}", flush=True)
+
+
 def main():
     missing = [name for name in REQUIRED if not (ROOT / name).is_file()]
     if missing:
@@ -73,6 +86,7 @@ def main():
     paths = set(REQUIRED)
     for pattern in PATTERNS:
         paths.update(str(path.relative_to(ROOT)) for path in ROOT.glob(pattern))
+    prepare_file_limit()
     # Start from OS essentials instead of a credential-name denylist: collection
     # happens before conftest's per-test cleanup, and auth-store overrides and
     # application-specific key names must never reach that stage.
