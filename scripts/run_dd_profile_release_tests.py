@@ -19,7 +19,7 @@ REVIEWED_FIXTURES = ("tests/test_route_to_lane_shared_home.py", "tests/test_rout
 BOUNDARY = "tests/tools/test_p1_caller_boundary.py"
 
 
-def main():
+def main(*, extra_tests=()):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", required=True)
     args = parser.parse_args()
@@ -78,7 +78,7 @@ def _component_import_origins():
         env.pop("PYTHONPATH", None)
         env["DD_PROFILE_COMPONENT_ROOT"] = str(candidate)
         return subprocess.call(command + ["tests/scripts/test_dd_hermes_ordinary_release.py",
-                                          "tests/scripts/test_dd_hermes_profile_release.py"],
+                                          "tests/scripts/test_dd_hermes_profile_release.py", *extra_tests],
                                cwd=HELPER_ROOT, env=env)
 
 
