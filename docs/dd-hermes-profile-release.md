@@ -115,9 +115,10 @@ identity; a chained restart's first-label proof cannot represent fifteen process
 Use one canary row first. After its approved activation and attended acceptance,
 stage and submit the remaining profiles against then-current baselines and execute
 them sequentially. Do not assume `depends_on` is accepted without readback. Every
-approval belongs to Levi. If another approved ordinary release changes ordinary's
-PID/source/config before the profile activation, restage and rebind the manifest;
-do not waive the stale protection. Do not guess a future ordinary PID.
+approval belongs to Levi. A change to the target profile's staged identity still
+requires restaging and rebinding. Ordinary/Classic identities recorded at staging
+are informational: their unrelated approved changes while this row awaits approval
+do not invalidate the target's manifest.
 
 ## Transaction and limits
 
@@ -132,8 +133,11 @@ Only the target plist's cwd and `--replace` removal change; interpreter, environ
 home, profile arguments and all other properties stay intact. Only its existing
 config's STT provider scalar changes to DGX. The old shared source and shared venv
 are not edited. Protected ordinary/Classic snapshots bind PID, actual cwd,
-plist/environment, config, tracked source and interpreter; they are checked before
-each stop/start and at final validation.
+plist/environment, config, tracked source and interpreter. Activation captures this
+verified baseline once during preflight under both the fleet and profile locks,
+before service mutation. Missing or unverifiable siblings refuse activation. The
+same baseline is checked before each stop/start and at final validation, including
+recovery; it is never refreshed to accept a change during the operation.
 
 Portless verification binds status-file PID to launchd/lsof identity and requires
 idle baseline state. Enabled transports come from the guarded canonical resolver;
