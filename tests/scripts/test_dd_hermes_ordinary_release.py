@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import plistlib
+import subprocess
+import sys
 
 import pytest
 
@@ -25,6 +27,13 @@ class FakeHost(release.Host):
         self.mutations = []
         self.mode = "normal"
         self.row = {}
+        self.enabled = ["api_server", "feishu", "telegram"]
+
+    def enabled_platforms(self, root, python, plist, deadline):
+        self.remaining(deadline)
+        if self.mode == "enabled_drift" and str(root) == self.candidate:
+            return ["api_server", "telegram"]
+        return self.enabled
 
     def clock(self):
         return self.elapsed
@@ -64,7 +73,7 @@ class FakeHost(release.Host):
             platforms = {name: {"state": "connected", "updated_at": stamp}
                          for name in ("telegram", "api_server", "feishu")}
             platforms["slack"] = {"state": "retrying", "updated_at": stamp}
-            if self.mode == "feishu_failed" and self.current["cwd"] == self.candidate:
+            if self.mode == "feishu_always_failed" or (self.mode == "feishu_failed" and self.current["cwd"] == self.candidate):
                 platforms["feishu"]["state"] = "retrying"
             return {"status": "ok", "gateway_state": "running", "pid": self.current["pid"],
                     "active_agents": 1 if self.mode == "busy" else 0,
@@ -159,6 +168,218 @@ def test_stage_is_read_only_and_does_not_expose_private_values(bundle):
     assert bundle["config"].read_bytes() == bundle["baseline_config"]
     assert "fixture-private-value" not in json.dumps(bundle["manifest"])
     assert bundle["manifest"]["connected_platforms"] == ["api_server", "feishu", "telegram"]
+
+
+def restage(bundle):
+    host, old = bundle["host"], bundle["manifest"]
+    manifest = release.stage(old["candidate"], old["python"], TARGET, host)
+    bundle["manifest"] = manifest
+    bundle["path"].write_bytes(release.canonical(manifest))
+    bundle["hash"] = release.digest(bundle["path"])
+    host.row["restart_command"] = release.restart_command(bundle["path"], bundle["hash"])
+    return manifest
+
+
+def test_disabled_persisted_transport_does_not_block_candidate_or_rollback(bundle):
+    bundle["host"].enabled = ["api_server", "telegram"]
+    manifest = restage(bundle)
+    assert manifest["connected_platforms"] == ["api_server", "telegram"]
+    assert manifest["ignored_disabled_platforms"] == ["feishu"]
+    bundle["host"].mode = "feishu_failed"
+    assert activate(bundle)["status"] == "succeeded"
+
+
+def test_disabled_persisted_transport_does_not_block_restored_baseline(bundle):
+    bundle["host"].enabled = ["api_server", "telegram"]
+    restage(bundle)
+    bundle["host"].mode = "start_failure"
+    result = activate(bundle)
+    assert result["status"] == "rolled_back"
+    assert result["failure_reason"] == "candidate_start_failed_after_effect"
+
+
+def test_enabled_extra_transport_remains_required_with_diagnostic(bundle):
+    bundle["host"].mode = "feishu_failed"
+    result = activate(bundle)
+    assert result["status"] == "rolled_back"
+    assert result["failure_reason"] == "verification_timeout_transport_not_connected_feishu"
+
+
+def test_candidate_must_preserve_enabled_platforms(bundle):
+    bundle["host"].mode = "enabled_drift"
+    with pytest.raises(release.Refused, match="candidate_enabled_platforms_changed"):
+        restage(bundle)
+    assert activate(bundle)["status"] == "preflight_failed"
+    assert not bundle["host"].mutations
+
+
+def test_new_optional_resolver_input_refuses_before_mutation(bundle):
+    (release.ORDINARY_HOME / "gateway.json").write_text("{}")
+    assert activate(bundle)["status"] == "preflight_failed"
+    assert not bundle["host"].mutations
+
+
+def failed_state(bundle):
+    host = bundle["host"]
+    host.mode = "rollback_failure"
+    assert activate(bundle)["status"] == "failed_recovery"
+    host.mode = "normal"
+    host.enabled = ["api_server", "telegram"]
+    host.row["status"] = "failed"
+    assert host.current["cwd"] == host.baseline
+    return (release.STATE / "state.json").read_bytes()
+
+
+def acknowledge(bundle, raw):
+    return release.acknowledge_recovery(bundle["path"], bundle["hash"], QUEUE_ID,
+                                        release.sha(raw), bundle["host"])
+
+
+def test_acknowledgment_preserves_failure_archive_and_replay_fence(bundle):
+    raw = failed_state(bundle)
+    prior = json.loads(raw)
+    mutations = list(bundle["host"].mutations)
+    result = acknowledge(bundle, raw)
+    assert result["status"] == "operator_recovered"
+    state = json.loads((release.STATE / "state.json").read_bytes())
+    assert state["used"] == prior["used"]
+    assert state["events"][:-1] == prior["events"]
+    assert state["events"][-1]["ignored_disabled_platforms"] == ["feishu"]
+    assert state["recovery_failure_reason"] == prior["recovery_failure_reason"]
+    archive = release.STATE / (QUEUE_ID + "." + release.sha(raw) + ".failed-state.json")
+    assert archive.read_bytes() == raw
+    assert archive.stat().st_mode & 0o777 == 0o600
+    receipt = release.STATE / (QUEUE_ID + "." + release.sha(raw) + ".recovery.json")
+    assert json.loads(receipt.read_bytes()) == state["events"][-1]
+    assert bundle["host"].row["status"] == "failed"
+    assert bundle["host"].mutations == mutations
+    bundle["host"].row["status"] = "deploying"
+    with pytest.raises(release.Refused, match="already_consumed"):
+        activate(bundle)
+
+
+@pytest.mark.parametrize("drift", ["state", "operation", "queue", "candidate", "config", "plist", "python", "source"])
+def test_acknowledgment_refuses_unproven_baseline(bundle, drift):
+    raw = failed_state(bundle)
+    host = bundle["host"]
+    if drift == "state":
+        (release.STATE / "state.json").write_bytes(raw + b" ")
+    elif drift == "operation":
+        state = json.loads(raw)
+        state["operation"] = "22222222-2222-4333-8444-555555555555"
+        raw = release.canonical(state)
+        (release.STATE / "state.json").write_bytes(raw)
+    elif drift == "queue":
+        host.row["status"] = "deploying"
+    elif drift == "candidate":
+        host.current["cwd"] = host.candidate
+    elif drift == "config":
+        bundle["config"].write_bytes(b"foreign")
+    elif drift == "plist":
+        document = plistlib.loads(bundle["plist"].read_bytes())
+        document["RunAtLoad"] = False
+        bundle["plist"].write_bytes(plistlib.dumps(document))
+    elif drift == "python":
+        Path(bundle["manifest"]["python"]).write_bytes(b"foreign")
+    elif drift == "source":
+        host.baseline_source = lambda *args: "e" * 64
+    before = (release.STATE / "state.json").read_bytes()
+    with pytest.raises(release.Refused):
+        acknowledge(bundle, raw)
+    assert (release.STATE / "state.json").read_bytes() == before
+    assert not list(release.STATE.glob("*.failed-state.json"))
+
+
+def test_acknowledgment_accepts_old_manifest_without_rebuilding_old_command(bundle):
+    # Acknowledgment can run from the new author checkout while the failed row
+    # remains bound to the old immutable candidate helper and manifest.
+    manifest = bundle["manifest"]
+    manifest.pop("enabled_platforms")
+    manifest.pop("ignored_disabled_platforms")
+    manifest["config_sha256"] = {str(bundle["config"]): release.digest(bundle["config"])}
+    bundle["path"].write_bytes(release.canonical(manifest))
+    bundle["hash"] = release.digest(bundle["path"])
+    release.STATE.mkdir(mode=0o700)
+    state = {"operation": QUEUE_ID, "manifest_sha256": bundle["hash"], "phase": "failed_recovery",
+             "used": [QUEUE_ID], "rollback_count": 1, "events": [{"phase": "failed_recovery"}]}
+    raw = release.canonical(state)
+    (release.STATE / "state.json").write_bytes(raw)
+    bundle["host"].row.update(status="failed", restart_command="/old/python /old/helper activate --manifest-sha256 " + bundle["hash"])
+    assert acknowledge(bundle, raw)["status"] == "operator_recovered"
+
+
+def test_acknowledgment_still_requires_original_enabled_transport(bundle):
+    raw = failed_state(bundle)
+    bundle["host"].enabled = ["api_server", "feishu", "telegram"]
+    bundle["host"].mode = "feishu_always_failed"
+    with pytest.raises(release.Refused, match="transport_not_connected_feishu"):
+        acknowledge(bundle, raw)
+    assert (release.STATE / "state.json").read_bytes() == raw
+
+
+@pytest.mark.parametrize("attempt", ["none", "write", "auth", "network", "subprocess",
+                                     "old_baseline", "disabled_plugin", "enabled_plugin",
+                                     "existing_directory", "missing_directory", "same_mode", "changed_mode",
+                                     "socket_construction", "bind", "ipv6_probe"])
+def test_real_resolver_guard_is_read_only_and_redacts_output(tmp_path, monkeypatch, attempt):
+    root = tmp_path.resolve()
+    for package in ("gateway", "hermes_cli"):
+        (root / package).mkdir()
+        (root / package / "__init__.py").write_text("")
+    marker = root / "forbidden-write"
+    # This auth path is deliberately absent; neither fixture nor helper creates
+    # or reads a credential store. The audit hook must reject before OS access.
+    attempts = {"none": "pass", "write": "open('forbidden-write', 'w')",
+                "auth": "open('auth.json')", "network": "__import__('socket').socket().connect(('127.0.0.1', 1))",
+                "socket_construction": "__import__('socket').socket().close()",
+                "bind": "__import__('socket').socket().bind(('127.0.0.1', 0))",
+                "ipv6_probe": "__import__('socket').has_ipv6 and __import__('socket').socket().bind(('127.0.0.1', 0))",
+                "subprocess": "__import__('subprocess').run(['/usr/bin/true'])",
+                "existing_directory": "__import__('pathlib').Path('gateway').mkdir(exist_ok=True)",
+                "missing_directory": "__import__('pathlib').Path('forbidden-write').mkdir(exist_ok=True)",
+                "same_mode": "__import__('os').chmod('gateway', 0o700)",
+                "changed_mode": "__import__('os').chmod('gateway', 0o777)"}
+    (root / "gateway").chmod(0o700)
+    (root / "hermes_cli/env_loader.py").write_text(
+        "def load_hermes_dotenv(**kwargs):\n"
+        "    print('fixture-secret-must-not-escape')\n"
+        "    try:\n        " + attempts.get(attempt, "pass") + "\n"
+        "    except Exception:\n        pass\n")
+    (root / "gateway/config.py").write_text(
+        "from types import SimpleNamespace as S\nfrom enum import Enum\n"
+        "class Platform(Enum):\n    API='api_server'\n    TELEGRAM='telegram'\n"
+        "def load_gateway_config():\n"
+        "    return S(platforms={p:S(enabled=True) for p in Platform})\n")
+    if attempt != "old_baseline":
+        entries = ("[S(name='telegram')]" if attempt == "enabled_plugin" else
+                   "[S(name='disabled_fixture')]" if attempt == "disabled_plugin" else "[]")
+        (root / "gateway/platform_registry.py").write_text(
+            "from types import SimpleNamespace as S\nclass Registry:\n"
+            "    def plugin_entries(self): return " + entries + "\nplatform_registry=Registry()\n")
+    monkeypatch.setattr(release, "ORDINARY_HOME", root)
+    host = release.Host()
+    if attempt in {"none", "old_baseline", "disabled_plugin", "existing_directory", "same_mode", "socket_construction", "ipv6_probe"}:
+        assert host.enabled_platforms(root, sys.executable, {}, host.clock() + 5) == ["api_server", "telegram"]
+    else:
+        reason = "^resolver_plugins_failed$" if attempt == "enabled_plugin" else "^resolver_plugins_blocked_"
+        with pytest.raises(release.Refused, match=reason):
+            host.enabled_platforms(root, sys.executable, {}, host.clock() + 5)
+    assert not marker.exists()
+    assert (root / "gateway").stat().st_mode & 0o777 == 0o700
+    assert not list(root.rglob("__pycache__"))
+
+
+def test_real_resolver_excludes_agent_environment(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "agent-private-fixture")
+    def run(args, **kwargs):
+        assert "ANTHROPIC_API_KEY" not in kwargs["env"]
+        assert kwargs["env"]["SERVICE_FIXTURE"] == "service-private-fixture"
+        assert kwargs["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+        return subprocess.CompletedProcess(args, 0, b'["api_server", "telegram"]', b"")
+    monkeypatch.setattr(subprocess, "run", run)
+    host = release.Host()
+    assert host.enabled_platforms(tmp_path, sys.executable, {"EnvironmentVariables": {
+        "SERVICE_FIXTURE": "service-private-fixture"}}, host.clock() + 5) == ["api_server", "telegram"]
 
 
 def test_success_changes_only_ordinary_plist_and_stt_with_private_backups(bundle):

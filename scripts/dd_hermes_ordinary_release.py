@@ -65,6 +65,88 @@ def canonical(document):
     return json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
 
 
+# Runs before gateway imports. A blocked operation remains a failure even when
+# optional plugin discovery or dotenv sanitation catches the exception internally.
+RESOLVE_PLATFORMS = r'''
+import contextlib, importlib.util, io, json, os, pathlib, socket, stat, sys
+blocked = []
+def guard(event, args):
+    forbidden = event in {"os.remove", "os.rename", "os.mkdir", "os.rmdir", "os.chmod",
+                          "os.chown", "os.truncate", "os.link", "os.symlink", "os.utime",
+                          "os.system", "subprocess.Popen", "os.posix_spawn", "os.exec", "os.fork"}
+    # asyncio imports may construct sockets; construction alone communicates
+    # nothing. Resolution, connect, bind, send and every other socket event refuse.
+    forbidden = forbidden or (event.startswith("socket.") and event != "socket.__new__")
+    if event == "open":
+        path, mode, flags = args
+        if isinstance(path, (str, bytes)):
+            path = pathlib.Path(os.fsdecode(path))
+            forbidden = forbidden or "auth.json" in path.parts or "auth.json" in path.resolve().parts
+        forbidden = forbidden or bool(flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND))
+    if forbidden:
+        blocked.append(event)
+        raise PermissionError("release_resolver_read_only")
+sys.addaudithook(guard)
+# Canonical discovery uses mkdir(exist_ok=True) for existing directories.
+# Reproduce the existing-directory result without making a mutating syscall;
+# missing directories still reach the audit refusal and poison the result.
+original_mkdir = os.mkdir
+def read_only_mkdir(path, mode=0o777, *, dir_fd=None):
+    if dir_fd is None and pathlib.Path(path).is_dir():
+        raise FileExistsError("release_resolver_existing_directory")
+    return original_mkdir(path, mode, dir_fd=dir_fd)
+os.mkdir = read_only_mkdir
+original_chmod = os.chmod
+def read_only_chmod(path, mode, *, dir_fd=None, follow_symlinks=True):
+    if dir_fd is None and isinstance(path, (str, bytes, os.PathLike)):
+        try:
+            current = os.stat(path, follow_symlinks=follow_symlinks)
+            if stat.S_IMODE(current.st_mode) == mode:
+                return
+        except OSError:
+            pass
+    return original_chmod(path, mode, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+os.chmod = read_only_chmod
+# urllib3 otherwise binds ::1:0 during import to detect IPv6 support. This
+# inspection-only capability hint skips that probe; actual bind stays forbidden.
+# It does not change service environment, platform enablement or runtime sockets.
+socket.has_ipv6 = False
+phase = "imports"
+try:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        from hermes_cli.env_loader import load_hermes_dotenv
+        phase = "dotenv"
+        load_hermes_dotenv(hermes_home=os.environ["HERMES_HOME"], project_env=pathlib.Path.cwd() / ".env")
+        phase = "config"
+        from gateway.config import load_gateway_config
+        cfg = load_gateway_config()
+        names = sorted(p.value for p, c in cfg.platforms.items() if c.enabled)
+        phase = "plugins"
+        # Older baseline sources predate this optional registry. Disabled
+        # discovered entries do not participate in adapter startup.
+        if importlib.util.find_spec("gateway.platform_registry") is not None:
+            from gateway.platform_registry import platform_registry
+            if any(entry.name in names for entry in platform_registry.plugin_entries()):
+                raise RuntimeError("enabled_plugin_unsupported")
+    if blocked:
+        raise PermissionError("blocked_operation")
+except Exception:
+    print(json.dumps({"error": "resolver_" + phase + ("_blocked_" + blocked[0].replace(".", "_").lower() if blocked else "_failed")}))
+    sys.exit(1)
+print(json.dumps(names))
+'''
+
+
+def optional_digest(path):
+    path = safe_path(path)
+    return digest(path) if path.exists() else None
+
+
+def safe_reason(exc):
+    value = str(exc) if isinstance(exc, Refused) else "unexpected_exception"
+    return value if re.fullmatch(r"[a-z0-9_]{1,160}", value) else "redacted_exception"
+
+
 class Host:
     """Actual bounded OS/HTTP adapter. Tests replace this entire boundary."""
 
@@ -154,6 +236,33 @@ class Host:
                 or Path(origins["hermes_cli"]).resolve() != root / "hermes_cli/__init__.py"):
             raise Refused("candidate_import_origin_mismatch")
 
+    def enabled_platforms(self, root, python, plist, deadline):
+        env = {k: os.environ[k] for k in ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG")
+               if k in os.environ}
+        env.update(plist.get("EnvironmentVariables", {}))
+        env.update(HERMES_HOME=str(ORDINARY_HOME), PYTHONDONTWRITEBYTECODE="1")
+        # The resolver receives the service environment, never the agent's keys.
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        rc, output = self.command([str(python), "-B", "-c", RESOLVE_PLATFORMS], deadline,
+                                  True, cwd=root, env=env)
+        if rc:
+            try:
+                error = json.loads(output).get("error", "")
+            except (ValueError, AttributeError):
+                error = ""
+            if isinstance(error, str) and re.fullmatch(r"resolver_[a-z_]{1,100}", error):
+                raise Refused(error)
+            raise Refused("enabled_platform_resolver_failed")
+        try:
+            names = json.loads(output)
+            if (not isinstance(names, list) or len(names) != len(set(names))
+                    or not all(isinstance(n, str) and re.fullmatch(r"[a-z0-9_]+", n) for n in names)):
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise Refused("enabled_platform_resolver_invalid") from None
+        return sorted(names)
+
     def stop(self, pid, deadline):
         # Exactly one stop request. Never a repeated kill loop or --replace takeover.
         self.command(["/bin/launchctl", "bootout", LABEL], deadline)
@@ -229,14 +338,28 @@ def health(host, identity, deadline, *, idle=False, since=None, platforms=()):
         for platform in platforms:
             item = value["platforms"][platform]
             if item["state"] != "connected":
-                raise ValueError()
+                raise Refused("transport_not_connected_" + platform)
             if since:
                 connected = datetime.fromisoformat(item["updated_at"].replace("Z", "+00:00")).timestamp()
-                if connected < since - 1:
-                    raise ValueError()
+                if connected < since - 1 or connected > time.time() + 2:
+                    raise Refused("transport_not_fresh_" + platform)
     except (KeyError, ValueError, TypeError):
         raise Refused("health_or_transport_not_fresh") from None
     return value
+
+
+def connected_platforms(value, enabled):
+    connected = sorted(name for name, entry in value.get("platforms", {}).items()
+                       if entry.get("state") == "connected")
+    required = sorted(set(connected).intersection(enabled))
+    if not {"telegram", "api_server"}.issubset(required):
+        raise Refused("ordinary_required_transports_unavailable")
+    return required, sorted(set(connected).difference(enabled))
+
+
+def resolver_inputs(baseline, candidate):
+    return sorted({str(ORDINARY_HOME / name) for name in ("config.yaml", ".env", "gateway.json")}
+                  | {str(safe_path(root) / ".env") for root in (baseline, candidate)})
 
 
 def stage(candidate, python, target, host=None):
@@ -262,16 +385,20 @@ def stage(candidate, python, target, host=None):
     if baseline["cwd"] == str(candidate):
         raise Refused("candidate_already_live")
     baseline_health = health(host, baseline, deadline, idle=True)
-    platforms = sorted(name for name, entry in baseline_health.get("platforms", {}).items()
-                       if entry.get("state") == "connected")
-    if not {"telegram", "api_server"}.issubset(platforms):
-        raise Refused("ordinary_required_transports_unavailable")
     new_plist = candidate_plist(plist, candidate, python)
     # Pin the original config/environment; activation changes only stt.provider.
     home = Path(plist.get("EnvironmentVariables", {}).get("HERMES_HOME", str(ORDINARY_HOME)))
     if home.resolve() != ORDINARY_HOME.resolve():
         raise Refused("ordinary_home_mismatch")
-    config = {str(p): digest(p) for p in (home / "config.yaml", home / ".env") if p.exists()}
+    config = {p: optional_digest(p) for p in resolver_inputs(baseline["cwd"], candidate)}
+    enabled = host.enabled_platforms(baseline["cwd"], plist["ProgramArguments"][0], plist, deadline)
+    if host.enabled_platforms(candidate, python, plist, deadline) != enabled:
+        raise Refused("candidate_enabled_platforms_changed")
+    platforms, ignored = connected_platforms(baseline_health, enabled)
+    if host.identity(deadline) != baseline:
+        raise Refused("baseline_process_changed")
+    if any(optional_digest(p) != expected for p, expected in config.items()):
+        raise Refused("resolver_inputs_changed")
     new_config = dgx_config((home / "config.yaml").read_bytes())
     return {"schema": 1, "service": SERVICE, "label": LABEL, "target_commit": target,
             "candidate": str(candidate), "python": str(python), "source": source,
@@ -281,6 +408,7 @@ def stage(candidate, python, target, host=None):
             "baseline_plist_sha256": sha(raw), "candidate_plist_sha256": sha(new_plist),
             "config_sha256": config, "maintenance": MAINTENANCE,
             "connected_platforms": platforms,
+            "enabled_platforms": enabled, "ignored_disabled_platforms": ignored,
             "candidate_config_sha256": sha(new_config),
             "activation_seconds": 15, "rollback_seconds": 10,
             "crash_recovery": "operator-required; no external-supervisor guarantee"}
@@ -306,7 +434,7 @@ def validate(manifest, host, deadline, *, activated=False):
     for path, expected in manifest["config_sha256"].items():
         if activated and path == str(ORDINARY_HOME / "config.yaml"):
             expected = manifest["candidate_config_sha256"]
-        if digest(path) != expected:
+        if optional_digest(path) != expected:
             raise Refused("configuration_changed")
 
 
@@ -377,9 +505,10 @@ def locked_state():
 
 def verify_runtime(host, root, old_pid, deadline, since, platforms):
     stable_since = None
+    last_reason = "runtime_not_observed"
     while True:
-        host.remaining(deadline)
         try:
+            host.remaining(deadline)
             identity = host.identity(deadline)
             if identity["pid"] == old_pid or identity["cwd"] != root:
                 raise Refused("runtime_identity_wrong")
@@ -388,9 +517,12 @@ def verify_runtime(host, root, old_pid, deadline, since, platforms):
                 stable_since = host.clock()
             if host.clock() - stable_since >= 1:
                 return identity
-        except Refused:
+        except Refused as exc:
+            if host.clock() >= deadline:
+                raise Refused("verification_timeout_" + last_reason) from None
+            last_reason = safe_reason(exc)
             stable_since = None
-        host.sleep(min(.2, host.remaining(deadline)))
+        host.sleep(min(.2, max(0, deadline - host.clock())))
 
 
 def activate(manifest_path, manifest_digest, queue_id, host=None):
@@ -408,7 +540,7 @@ def activate(manifest_path, manifest_digest, queue_id, host=None):
         old = json.loads(state_path.read_text()) if state_path.exists() else {}
         if operation in old.get("used", []):
             raise Refused("operation_already_consumed")
-        if old and old.get("phase") not in {"succeeded", "rolled_back", "preflight_failed"}:
+        if old and old.get("phase") not in {"succeeded", "rolled_back", "preflight_failed", "operator_recovered"}:
             raise Refused("prior_operation_requires_operator_recovery")
         state = {"operation": operation, "manifest_sha256": manifest_digest,
                  "used": old.get("used", []) + [operation], "events": [], "rollback_count": 0}
@@ -433,6 +565,10 @@ def activate(manifest_path, manifest_digest, queue_id, host=None):
                 raise Refused("baseline_runtime_changed")
             if host.identity(deadline) != manifest["baseline"]:
                 raise Refused("baseline_process_changed")
+            enabled = host.enabled_platforms(manifest["baseline"]["cwd"], plist["ProgramArguments"][0], plist, deadline)
+            if (enabled != manifest.get("enabled_platforms")
+                    or host.enabled_platforms(manifest["candidate"], manifest["python"], plist, deadline) != enabled):
+                raise Refused("enabled_platforms_changed")
             new_plist = candidate_plist(plist, manifest["candidate"], manifest["python"])
             if sha(new_plist) != manifest["candidate_plist_sha256"]:
                 raise Refused("candidate_plist_changed")
@@ -467,7 +603,8 @@ def activate(manifest_path, manifest_digest, queue_id, host=None):
             validate(manifest, host, deadline, activated=True)
             state["running_identity"] = identity
             record("succeeded")
-        except Exception:
+        except Exception as exc:
+            state["failure_reason"] = safe_reason(exc)
             if not mutated:
                 record("preflight_failed")
             else:
@@ -482,7 +619,7 @@ def activate(manifest_path, manifest_digest, queue_id, host=None):
                     if digest(Path(plist["ProgramArguments"][0]).resolve()) != manifest["baseline_python_sha256"]:
                         raise Refused("rollback_interpreter_changed")
                     for path, expected in manifest["config_sha256"].items():
-                        if path != str(config_path) and digest(path) != expected:
+                        if path != str(config_path) and optional_digest(path) != expected:
                             raise Refused("rollback_environment_changed")
                     if (baseline_config is None or digest(config_path) not in
                             {sha(baseline_config), manifest["candidate_config_sha256"]}):
@@ -512,19 +649,111 @@ def activate(manifest_path, manifest_digest, queue_id, host=None):
                         host, manifest["baseline"]["cwd"], baseline_pid, recovery_deadline, issued,
                         manifest["connected_platforms"])
                     record("rolled_back")
-                except Exception:
+                except Exception as exc:
+                    state["recovery_failure_reason"] = safe_reason(exc)
                     record("failed_recovery")
-        return {"operation": operation, "status": state["phase"], "rollback_count": state["rollback_count"]}
+        return {"operation": operation, "status": state["phase"], "rollback_count": state["rollback_count"],
+                **{key: state[key] for key in ("failure_reason", "recovery_failure_reason") if key in state}}
+
+
+def acknowledge_recovery(manifest_path, manifest_digest, expected_operation, expected_state_digest, host=None):
+    """Verify a restored baseline and release its fence; never restart or alter MC."""
+    host = host or Host()
+    deadline = host.clock() + 15
+    raw_manifest = safe_path(manifest_path).read_bytes()
+    if sha(raw_manifest) != manifest_digest:
+        raise Refused("manifest_digest_mismatch")
+    manifest = json.loads(raw_manifest)
+    operation = str(UUID(expected_operation))
+    if not re.fullmatch(r"[a-f0-9]{64}", expected_state_digest or ""):
+        raise Refused("exact_prior_state_digest_required")
+    with locked_state():
+        state_path = safe_path(STATE / "state.json")
+        if state_path.is_symlink():
+            raise Refused("state_symlink")
+        prior_raw = state_path.read_bytes()
+        prior = json.loads(prior_raw)
+        if (sha(prior_raw) != expected_state_digest or prior.get("operation") != operation
+                or prior.get("manifest_sha256") != manifest_digest
+                or prior.get("phase") != "failed_recovery" or operation not in prior.get("used", [])):
+            raise Refused("matching_failed_state_required")
+        row = host.http(QUEUE + "/" + operation, deadline)
+        command = shlex.split(row.get("restart_command", ""))
+        binding = [i for i, item in enumerate(command) if item == "--manifest-sha256"]
+        if (row.get("id") != operation or row.get("service_name") != SERVICE
+                or row.get("target_commit") != manifest.get("target_commit")
+                or row.get("status") != "failed" or len(binding) != 1
+                or command[binding[0] + 1:binding[0] + 2] != [manifest_digest]):
+            raise Refused("matching_terminal_failed_queue_row_required")
+        # The old candidate must remain immutable until this acknowledgment.
+        validate(manifest, host, deadline)
+        raw, plist = read_plist()
+        baseline_root = manifest["baseline"]["cwd"]
+        if (sha(raw) != manifest["baseline_plist_sha256"]
+                or str(Path(plist["WorkingDirectory"]).resolve()) != baseline_root
+                or host.baseline_source(baseline_root, deadline) != manifest["baseline_source_sha256"]
+                or digest(Path(plist["ProgramArguments"][0]).resolve()) != manifest["baseline_python_sha256"]):
+            raise Refused("original_baseline_not_restored")
+        # Old manifests predate optional-input pinning. Capture those inputs for
+        # this check and receipt without pretending they were in the old proof.
+        inputs = {p: optional_digest(p) for p in resolver_inputs(baseline_root, manifest["candidate"])}
+        identity = host.identity(deadline)
+        if identity["cwd"] != baseline_root or identity["cwd"] == manifest["candidate"]:
+            raise Refused("baseline_process_not_restored")
+        enabled = host.enabled_platforms(baseline_root, plist["ProgramArguments"][0], plist, deadline)
+        platforms, ignored = connected_platforms(health(host, identity, deadline), enabled)
+        platforms = sorted(set(platforms) | set(manifest["connected_platforms"]).intersection(enabled))
+        health(host, identity, deadline, platforms=platforms)
+        host.sleep(min(1, host.remaining(deadline)))
+        health(host, identity, deadline, platforms=platforms)
+        if (host.identity(deadline) != identity or digest(PLIST) != manifest["baseline_plist_sha256"]
+                or host.baseline_source(baseline_root, deadline) != manifest["baseline_source_sha256"]
+                or digest(Path(plist["ProgramArguments"][0]).resolve()) != manifest["baseline_python_sha256"]
+                or any(optional_digest(p) != expected for p, expected in inputs.items())
+                or sha(state_path.read_bytes()) != expected_state_digest):
+            raise Refused("baseline_changed_during_acknowledgment")
+        archive = safe_path(STATE / (operation + "." + expected_state_digest + ".failed-state.json"))
+        if archive.is_symlink():
+            raise Refused("prior_state_archive_symlink")
+        if archive.exists() and archive.read_bytes() != prior_raw:
+            raise Refused("prior_state_archive_conflict")
+        if not archive.exists():
+            write_private(archive, prior_raw)
+        receipt = {"phase": "operator_recovered", "at": datetime.now(timezone.utc).isoformat(),
+                   "prior_state_sha256": expected_state_digest, "failed_queue_id": operation,
+                   "running_identity": identity, "enabled_platforms": enabled,
+                   "connected_platforms": platforms, "ignored_disabled_platforms": ignored,
+                   "resolver_inputs_sha256": inputs}
+        # Retain acknowledgment evidence after a future operation replaces the
+        # current journal. The state hash gives each acknowledgment one identity.
+        receipt_path = safe_path(STATE / (operation + "." + expected_state_digest + ".recovery.json"))
+        if receipt_path.is_symlink():
+            raise Refused("recovery_receipt_symlink")
+        if receipt_path.exists():
+            existing = json.loads(receipt_path.read_bytes())
+            if existing.get("prior_state_sha256") != expected_state_digest or existing.get("failed_queue_id") != operation:
+                raise Refused("recovery_receipt_conflict")
+            receipt = existing
+        else:
+            write_private(receipt_path, canonical(receipt))
+        recovered = copy.deepcopy(prior)
+        recovered["phase"] = "operator_recovered"
+        recovered["events"].append(receipt)
+        write_private(state_path, canonical(recovered))
+        return {"status": "operator_recovered", "operation": operation,
+                "prior_state_sha256": expected_state_digest, "running_identity": identity}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["stage", "inspect", "activate"])
+    parser.add_argument("action", choices=["stage", "inspect", "activate", "acknowledge-recovery"])
     parser.add_argument("--candidate")
     parser.add_argument("--python")
     parser.add_argument("--target")
     parser.add_argument("--manifest")
     parser.add_argument("--manifest-sha256")
+    parser.add_argument("--expected-operation")
+    parser.add_argument("--expected-state-sha256")
     parser.add_argument("--queue-id", default="auto")
     parser.add_argument("--label", choices=[LABEL], default=LABEL)
     args = parser.parse_args()
@@ -534,12 +763,15 @@ def main():
         elif args.action == "inspect":
             path = safe_path(STATE / "state.json")
             result = json.loads(path.read_text()) if path.exists() else {"status": "absent"}
+        elif args.action == "acknowledge-recovery":
+            result = acknowledge_recovery(args.manifest, args.manifest_sha256,
+                                          args.expected_operation, args.expected_state_sha256)
         else:
             result = activate(args.manifest, args.manifest_sha256, args.queue_id)
         print(json.dumps(result, sort_keys=True))
         return 0 if args.action != "activate" or result["status"] == "succeeded" else 1
     except Exception as exc:
-        print(json.dumps({"status": "refused", "reason": str(exc) if isinstance(exc, Refused) else type(exc).__name__}))
+        print(json.dumps({"status": "refused", "reason": safe_reason(exc)}))
         return 1
 
 
