@@ -215,6 +215,13 @@ def engine_for(profile):
             with base_lock():
                 yield
 
+    base_verify_runtime = engine.verify_runtime
+    def verify_runtime(host, root, old_pid, deadline, since, platforms):
+        identity = base_verify_runtime(host, root, old_pid, deadline, since, platforms)
+        # Recovery also verifies a runtime, but does not call final validate.
+        host.check_protected(deadline)
+        return identity
+
     engine.read_plist = read_plist
     engine.candidate_plist = candidate_plist
     engine.connected_platforms = connected
@@ -222,6 +229,7 @@ def engine_for(profile):
     engine.approved_row = approved
     engine.validate = validate
     engine.locked_state = locked_state
+    engine.verify_runtime = verify_runtime
     return engine
 
 
@@ -316,8 +324,31 @@ def activate(profile, manifest_path, checksum, queue_id="auto", *, engine=None, 
     manifest = json.loads(raw)
     if manifest.get("profile") != profile:
         raise common.Refused("profile_manifest_mismatch")
-    host.protected = manifest["protected"]
-    return engine.activate(manifest_path, checksum, queue_id, host)
+    # Staged siblings are informational: unrelated approved work may finish
+    # while this row awaits approval. The transaction's first validate runs
+    # under both locks, inside the journaled preflight, before any mutation.
+    host.protected = None
+    captured = False
+    base_validate = engine.validate
+
+    def validate(current_manifest, current_host, deadline, *, activated=False):
+        nonlocal captured
+        if not captured:
+            if activated:
+                raise common.Refused("protected_sibling_baseline_missing")
+            snapshot = current_host.protected_snapshot(deadline)
+            if not isinstance(snapshot, dict) or set(snapshot) != set(PROTECTED):
+                raise common.Refused("protected_sibling_baseline_missing")
+            current_host.protected = snapshot
+            captured = True
+        # Never refresh this baseline at post-validation or during recovery.
+        return base_validate(current_manifest, current_host, deadline, activated=activated)
+
+    engine.validate = validate
+    try:
+        return engine.activate(manifest_path, checksum, queue_id, host)
+    finally:
+        engine.validate = base_validate
 
 
 def main():

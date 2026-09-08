@@ -48,7 +48,8 @@ class FakeHost:
         if self.mode == "component_changed": raise release.common.Refused("component_changed")
         return {"reviewed_commit": reviewed, "base_commit": release.BASE, "artifact_commit": target}
     def protected_snapshot(self, deadline):
-        return {"ordinary": "changed" if self.mode == "protected_changed" else "untouched", "classic": "untouched"}
+        return {label: "changed" if self.mode == "protected_changed" else "untouched"
+                for label in release.PROTECTED}
     def check_protected(self, deadline):
         if self.protected != self.protected_snapshot(deadline):
             raise release.common.Refused("protected_sibling_changed")
@@ -155,12 +156,110 @@ def test_protected_or_unknown_profiles_are_never_targets(profile):
         release.engine_for(profile)
 
 
-@pytest.mark.parametrize("mode", ["busy", "wrong_pid", "component_changed", "protected_changed", "helper_unreviewed"])
+@pytest.mark.parametrize("mode", ["busy", "wrong_pid", "component_changed", "helper_unreviewed"])
 def test_preflight_failure_has_no_mutation(bundle, mode):
     b = bundle(); b.host.mode = mode
     assert activate(b)["status"] == "preflight_failed"
     assert not b.host.mutations
     assert b.config.read_bytes() == b.config_bytes
+
+
+def test_sibling_change_while_awaiting_approval_is_accepted_under_lock(bundle, monkeypatch):
+    b = bundle()
+    staged = dict(b.manifest["protected"])
+    b.host.mode = "protected_changed"
+    snapshot = b.host.protected_snapshot
+    observations = []
+
+    def observed_snapshot(deadline):
+        # Every activation observation, including the first capture, must be
+        # inside the real fleet lock; a second descriptor cannot acquire it.
+        with (release.STATE_ROOT / "fleet.lock").open() as other:
+            with pytest.raises(BlockingIOError):
+                release.fcntl.flock(other, release.fcntl.LOCK_EX | release.fcntl.LOCK_NB)
+        observations.append(b.host.protected)
+        return snapshot(deadline)
+
+    monkeypatch.setattr(b.host, "protected_snapshot", observed_snapshot)
+    assert activate(b)["status"] == "succeeded"
+    assert observations[0] is None
+    assert all(value is observations[1] for value in observations[1:])
+    assert observations[1] != staged
+    assert json.loads(b.path.read_bytes())["protected"] == staged
+    assert b.host.mutations == ["stop", "start"]
+
+
+@pytest.mark.parametrize("point", ["pre_stop", "post_stop", "post_start"])
+def test_sibling_change_during_operation_never_recaptures(bundle, monkeypatch, point):
+    b = bundle()
+    method = "start" if point == "post_start" else "stop"
+    original = getattr(b.host, method)
+
+    def change(*args):
+        if point == "pre_stop": b.host.mode = "protected_changed"
+        result = original(*args)
+        b.host.mode = "protected_changed"
+        return result
+
+    monkeypatch.setattr(b.host, method, change)
+    result = activate(b)
+    assert result["status"] == "failed_recovery"
+    assert result["rollback_count"] == 1
+    assert b.host.protected == b.manifest["protected"]
+    assert b.host.protected != b.host.protected_snapshot(25)
+    assert b.host.mutations == {"pre_stop": [], "post_stop": ["stop"],
+                                "post_start": ["stop", "start"]}[point]
+
+
+def test_sibling_change_during_restored_runtime_verification_refuses_recovery(bundle, monkeypatch):
+    b = bundle(); b.host.mode = "start_failed"
+    start = b.host.start
+    def change_after_rollback_start(deadline):
+        result = start(deadline)
+        if b.host.current["cwd"] == b.host.baseline:
+            b.host.mode = "protected_changed"
+        return result
+    monkeypatch.setattr(b.host, "start", change_after_rollback_start)
+    result = activate(b)
+    assert result["status"] == "failed_recovery"
+    assert result["recovery_failure_reason"] == "protected_sibling_changed"
+    assert result["rollback_count"] == 1
+    assert b.host.protected == b.manifest["protected"]
+    assert b.host.mutations == ["stop", "start", "stop", "start"]
+    assert b.config.read_bytes() == b.config_bytes
+    assert b.plist.read_bytes() == b.plist_bytes
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_activation_snapshot_failure_is_closed_before_mutation(bundle, monkeypatch, missing):
+    b = bundle()
+    def unavailable(deadline):
+        if missing: return {}
+        raise release.common.Refused("sibling_identity_unavailable")
+    monkeypatch.setattr(b.host, "protected_snapshot", unavailable)
+    assert activate(b)["status"] == "preflight_failed"
+    assert not b.host.mutations
+
+
+def test_post_validation_cannot_initialize_missing_snapshot(bundle, monkeypatch):
+    b = bundle()
+    monkeypatch.setattr(b.engine, "activate", lambda *args:
+                        b.engine.validate(b.manifest, b.host, 15, activated=True))
+    with pytest.raises(release.common.Refused, match="protected_sibling_baseline_missing"):
+        activate(b)
+    assert b.host.protected is None
+
+
+@pytest.mark.parametrize("drift", ["pid", "cwd", "config", "plist", "source"])
+def test_target_drift_still_refuses_with_fresh_sibling_baseline(bundle, monkeypatch, drift):
+    b = bundle(); b.host.mode = "protected_changed"
+    if drift == "pid": b.host.current["pid"] += 10
+    elif drift == "cwd": b.host.current["cwd"] += "-foreign"
+    elif drift == "config": b.config.write_bytes(b.config_bytes + b"# foreign\n")
+    elif drift == "plist": b.plist.write_bytes(b.plist_bytes + b"\n")
+    else: monkeypatch.setattr(b.host, "baseline_source", lambda *args: "e" * 64)
+    assert activate(b)["status"] == "preflight_failed"
+    assert not b.host.mutations
 
 
 @pytest.mark.parametrize("mode,expected", [("start_failed", "rolled_back"), ("rollback_failed", "failed_recovery"),
