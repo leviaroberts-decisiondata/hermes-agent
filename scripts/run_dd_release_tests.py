@@ -16,6 +16,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 REQUIRED = (
     "tests/scripts/test_dd_release_gate.py",
+    "tests/scripts/test_dd_hermes_ordinary_release.py",
     "tests/test_dd_obs_config.py",
     "tests/test_route_to_lane_shared_home.py",
     "tests/test_route_to_lane_mission_parity.py",
