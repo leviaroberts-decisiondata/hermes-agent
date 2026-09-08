@@ -105,7 +105,7 @@ bootstraps only ordinary. The candidate launcher omits `--replace`, so it cannot
 take over another surviving process.
 
 Success requires a changed PID at the candidate cwd, process-owned fresh health,
-all baseline-connected transports and a one-second stable observation window,
+all enabled baseline-connected transports and a one-second stable observation window,
 followed by source/interpreter/config revalidation. This is **not** model-quality,
 DGX transcription execution, or a Telegram round-trip proof. A human-visible audio
 canary remains an attended post-deploy acceptance step; the helper sends no messages.
@@ -132,6 +132,59 @@ blocks new operations; a repeated consumed queue ID always refuses. An operator
 must inspect the private snapshots, actual label/PID/cwd and current bytes before
 manual recovery. This deliberately does not import or invoke the retired Classic
 activator or expand Classic's approval contract.
+
+## Persisted transport state and recovery acknowledgment
+
+Detailed health can retain connected entries from an older process. Stage resolves
+the baseline's enabled transports through its own canonical dotenv/config loader,
+using the installed plist environment. It requires the candidate to resolve the
+same enabled set. Required transports are the connected baseline entries in that
+enabled set; disabled persisted entries are recorded as `ignored_disabled_platforms`.
+Telegram and API remain mandatory, and enabled extra transports remain required.
+This does not infer process start time from status-transition timestamps.
+
+The resolver runs with bytecode writes disabled and an audit guard installed before
+gateway imports. Writes, credential-store opens, networking and subprocess launches
+refuse, even if an optional loader catches the refusal. Existing-directory mkdir
+requests return FileExistsError without an OS write so canonical `exist_ok=True`
+calls can proceed; creation of a missing directory still refuses. Chmod requests
+also return without an OS write when the actual mode already matches; any permission
+change still refuses. Older baselines
+without the plugin registry are supported. Enabled plugin transports refuse because
+their external configuration is outside this manifest; disabled discovered plugins
+do not become requirements. Only enabled names or fixed failure codes leave the
+resolver. Home config, home `.env`, legacy `gateway.json`, and both project `.env`
+files are pinned, including their absence.
+
+Socket construction is allowed, but DNS/connect/bind/send operations remain blocked.
+The inspection subprocess sets its own `socket.has_ipv6=False` to skip urllib3's
+import-time localhost bind capability probe. This changes no runtime configuration,
+service environment or service networking.
+
+After independently restoring ordinary, an operator can acknowledge a
+`failed_recovery` journal using its exact prior operation and state digest:
+
+```sh
+python scripts/dd_hermes_ordinary_release.py acknowledge-recovery \
+  --manifest /absolute/path/to/old-manifest.json \
+  --manifest-sha256 OLD_MANIFEST_SHA256 \
+  --expected-operation FAILED_QUEUE_UUID \
+  --expected-state-sha256 CURRENT_FAILED_STATE_SHA256
+```
+
+Keep the old candidate unchanged until acknowledgment completes. The command checks
+the failed terminal queue row and original manifest binding; immutable candidate;
+original baseline source, interpreter, config and plist; and actual baseline PID,
+cwd, health and required enabled transports. It writes no runtime or queue data.
+Under the existing exclusive lock it archives the exact failed state privately and
+appends `operator_recovered` evidence, preserving old failure events and consumed IDs.
+An immutable private recovery receipt retains that evidence after a later operation.
+The old deploy remains failed. A new activation needs a new manifest and a different
+approved queue operation; acknowledgment never permits replay of the failed one.
+
+Activation now records safe `failure_reason` and `recovery_failure_reason` codes,
+including the last failed transport probe when verification expires. It never emits
+raw subprocess stderr, configuration values or credentials.
 
 ## Fixture validation
 
