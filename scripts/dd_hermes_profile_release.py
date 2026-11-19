@@ -23,8 +23,10 @@ from uuid import UUID
 
 if __package__:
     from scripts import dd_hermes_ordinary_release as common
+    from scripts import dd_hermes_pricing_component as pricing
 else:
     import dd_hermes_ordinary_release as common
+    import dd_hermes_pricing_component as pricing
 
 BASE = "d1a294da78c45a18c9f8cc89fa992e33b4cc0282"
 COMPONENT = "tools/transcription_tools.py"
@@ -43,6 +45,7 @@ PROTECTED = {"ai.hermes.gateway": Path("/Users/openclaw/.hermes"),
 def helper_identity():
     root = Path(__file__).resolve().parents[1]
     paths = ("scripts/dd_hermes_profile_release.py", "scripts/dd_hermes_ordinary_release.py",
+             "scripts/dd_hermes_pricing_component.py",
              "scripts/run_dd_profile_release_tests.py", "scripts/run_dd_release_tests.py",
              "tests/scripts/test_dd_hermes_profile_release.py", "tests/scripts/test_dd_hermes_ordinary_release.py",
              "tests/test_route_to_lane_shared_home.py", "tests/test_route_to_lane_mission_parity.py")
@@ -78,7 +81,7 @@ def backport_default(raw):
     return raw[:start] + token[:1] + b"dgx" + token[-1:] + raw[end:]
 
 
-def component_identity(host, candidate, target, reviewed, deadline):
+def component_identity(host, candidate, target, reviewed, deadline, pricing_commit=None):
     """Actual composite identity, never mislabelled as a full-main runtime."""
     if not re.fullmatch(r"[a-f0-9]{40}", reviewed or ""):
         raise common.Refused("exact_reviewed_commit_required")
@@ -87,6 +90,17 @@ def component_identity(host, candidate, target, reviewed, deadline):
         return host.command(git + list(args), deadline)[1].decode().strip()
     # The reviewed source must be merged; the artifact is a separate exact tree.
     host.command(git + ["merge-base", "--is-ancestor", reviewed, "origin/main"], deadline)
+    if pricing_commit is not None:
+        # Keep the prior transcription/default component intact, and verify the
+        # entire new tree against the generated pricing-only backport. Merely
+        # listing extra allowed paths would admit unrelated runtime changes.
+        baseline = output("rev-parse", target + "^")
+        retained = component_identity(host, candidate, baseline, reviewed, deadline)
+        generated = pricing.verify_tree(candidate, baseline, pricing_commit, target)
+        host.remaining(deadline)
+        return {**retained, "artifact_commit": target,
+                "artifact_tree": output("rev-parse", target + "^{tree}"),
+                "pricing": generated}
     changed = output("diff", "--name-only", BASE, target, "--").splitlines()
     if changed != sorted([COMPONENT, DEFAULT_COMPONENT]):
         raise common.Refused("component_candidate_has_unapproved_delta")
@@ -192,8 +206,10 @@ def engine_for(profile):
         if manifest.get("profile") != profile or manifest.get("helper_sha256") != helper_identity():
             raise common.Refused("profile_or_helper_changed")
         host.helpers_reviewed(manifest["component"]["reviewed_commit"], deadline)
+        pricing_identity = manifest["component"].get("pricing")
+        pricing_args = {"pricing_commit": pricing_identity["reviewed_commit"]} if pricing_identity else {}
         actual = host.component_identity(manifest["candidate"], manifest["target_commit"],
-                                         manifest["component"]["reviewed_commit"], deadline)
+                                         manifest["component"]["reviewed_commit"], deadline, **pricing_args)
         if actual != manifest["component"]:
             raise common.Refused("component_identity_changed")
         host.check_protected(deadline)
@@ -249,8 +265,8 @@ def host_for(engine):
             # launchd/lsof process identity. No invented HTTP proof or timestamp.
             return {**value, "status": "ok"}
 
-        def component_identity(self, candidate, target, reviewed, deadline):
-            return component_identity(self, candidate, target, reviewed, deadline)
+        def component_identity(self, candidate, target, reviewed, deadline, pricing_commit=None):
+            return component_identity(self, candidate, target, reviewed, deadline, pricing_commit)
 
         def baseline_compatible(self, root, deadline):
             self.command(["/usr/bin/git", "-C", str(root), "diff", "--quiet", BASE, "--"], deadline)
@@ -299,7 +315,7 @@ def host_for(engine):
     return ProfileHost()
 
 
-def stage(profile, candidate, python, target, reviewed, *, engine=None, host=None):
+def stage(profile, candidate, python, target, reviewed, *, engine=None, host=None, pricing_commit=None):
     engine = engine or engine_for(profile)
     host = host or host_for(engine)
     deadline = host.clock() + 15
@@ -307,7 +323,8 @@ def stage(profile, candidate, python, target, reviewed, *, engine=None, host=Non
     manifest = engine.stage(candidate, python, target, host)
     host.baseline_compatible(manifest["baseline"]["cwd"], deadline)
     host.helpers_reviewed(reviewed, deadline)
-    manifest.update(profile=profile, component=host.component_identity(candidate, target, reviewed, deadline),
+    pricing_args = {"pricing_commit": pricing_commit} if pricing_commit else {}
+    manifest.update(profile=profile, component=host.component_identity(candidate, target, reviewed, deadline, **pricing_args),
                     helper_sha256=helper_identity(), protected=protected,
                     health_contract="portless_launchd_pid_cwd_fresh_gateway_state_telegram")
     host.protected = protected
@@ -360,6 +377,7 @@ def main():
     parser.add_argument("--target")
     parser.add_argument("--reviewed-commit")
     parser.add_argument("--manifest")
+    parser.add_argument("--pricing-reviewed-commit")
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--queue-id", default="auto")
     parser.add_argument("--label")
@@ -369,7 +387,8 @@ def main():
         if args.label is not None and args.label != engine.LABEL:
             raise common.Refused("profile_label_mismatch")
         if args.action == "stage":
-            result = stage(args.profile, args.candidate, args.python, args.target, args.reviewed_commit, engine=engine)
+            result = stage(args.profile, args.candidate, args.python, args.target, args.reviewed_commit,
+                           engine=engine, pricing_commit=args.pricing_reviewed_commit)
         elif args.action == "inspect":
             path = engine.safe_path(engine.STATE / "state.json")
             result = json.loads(path.read_bytes()) if path.exists() else {"status": "absent"}

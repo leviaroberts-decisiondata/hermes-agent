@@ -54,7 +54,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 # It is imported there, not here, so that importing run_agent from a
 # daemon thread (e.g. curator's forked review agent) never fails with
 # ModuleNotFoundError on broken/partial installs where `fire` isn't present.
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -1138,7 +1138,8 @@ def _emit_dd_per_call_generation(
         _output = int(getattr(canonical_usage, "output_tokens", 0) or 0)
         _cache_read = int(getattr(canonical_usage, "cache_read_tokens", 0) or 0)
         _cache_write = int(getattr(canonical_usage, "cache_write_tokens", 0) or 0)
-        _cost = float(cost_amount_usd) if cost_amount_usd is not None else 0.0
+        _cost = float(cost_amount_usd) if cost_amount_usd is not None else (
+            None if (model or "").split("/")[-1].startswith("gpt-6.2-") else 0.0)
         _latency = int(latency_ms) if latency_ms is not None else None
         _request_messages_json = _dd_obs_json(request_messages)
         _content_blocks_json = _dd_obs_json(_dd_response_content_blocks(response_obj))
@@ -12846,6 +12847,7 @@ class AIAgent:
                             response.usage,
                             provider=self.provider,
                             api_mode=self.api_mode,
+                            model_name=self.model,
                         )
                         prompt_tokens = canonical_usage.prompt_tokens
                         completion_tokens = canonical_usage.output_tokens
@@ -12906,6 +12908,8 @@ class AIAgent:
                             provider=self.provider,
                             base_url=self.base_url,
                             api_key=getattr(self, "api_key", ""),
+                            requested_at=datetime.fromtimestamp(api_start_time, tz=timezone.utc),
+                            service_tier=getattr(response, "service_tier", None),
                         )
                         if cost_result.amount_usd is not None:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
