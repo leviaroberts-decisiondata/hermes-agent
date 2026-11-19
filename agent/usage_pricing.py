@@ -7,6 +7,12 @@ from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
+from agent.openai_gpt62_pricing import (
+    RATES as GPT62_RATES,
+    PRICING_VERSION as GPT62_VERSION,
+    model_key as gpt62_model_key,
+    request_cost as gpt62_request_cost,
+)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
@@ -34,6 +40,9 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    cache_write_30m_tokens: Optional[int] = None
+    cache_write_12h_tokens: Optional[int] = None
+    reported_input_tokens: Optional[int] = None
 
     @property
     def prompt_tokens(self) -> int:
@@ -427,6 +436,13 @@ def resolve_billing_route(
 
 
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
+    key = gpt62_model_key(route.model.lower()) if route.provider == "openai" else None
+    if key:
+        ordinary, read, write30, _write12, output = GPT62_RATES[key]
+        return PricingEntry(input_cost_per_million=ordinary, output_cost_per_million=output,
+                            cache_read_cost_per_million=read, cache_write_cost_per_million=write30,
+                            source="official_docs_snapshot", source_url="https://developers.openai.com/api/docs/pricing",
+                            pricing_version=GPT62_VERSION)
     return _OFFICIAL_DOCS_PRICING.get((route.provider, route.model.lower()))
 
 
@@ -518,6 +534,7 @@ def normalize_usage(
     *,
     provider: Optional[str] = None,
     api_mode: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> CanonicalUsage:
     """Normalize raw API response usage into canonical token buckets.
 
@@ -577,12 +594,38 @@ def normalize_usage(
     if output_details:
         reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
 
+    write30 = write12 = reported_input = None
+    if gpt62_model_key((model_name or "").split("/")[-1]) and provider_name in ("openai", "openai-codex"):
+        # Retain the provider total to detect invalid/clamped cache breakdowns.
+        responses = hasattr(response_usage, "input_tokens")
+        reported_input = _to_int(getattr(response_usage, "input_tokens" if responses else "prompt_tokens", 0))
+        output_tokens = _to_int(getattr(response_usage, "output_tokens" if responses else "completion_tokens", 0))
+        details = getattr(response_usage, "input_tokens_details" if responses else "prompt_tokens_details", None)
+        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0))
+        cache_write_tokens = _to_int(getattr(details, "cache_write_tokens", getattr(details, "cache_creation_tokens", 0)))
+        write30 = getattr(details, "cache_write_30m_tokens", None)
+        write12 = getattr(details, "cache_write_12h_tokens", None)
+        if write30 is None and write12 is None and cache_write_tokens:
+            ttl = getattr(details, "cache_write_ttl", None)
+            if ttl == "30m":
+                write30, write12 = cache_write_tokens, 0
+            elif ttl == "12h":
+                write30, write12 = 0, cache_write_tokens
+        input_tokens = max(0, reported_input - cache_read_tokens - cache_write_tokens)
+        reasoning_details = getattr(response_usage, "output_tokens_details" if responses else "completion_tokens_details", None)
+        reasoning_tokens = _to_int(getattr(reasoning_details, "reasoning_tokens", 0))
+
     return CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        **{
+            "cache_write_30m_tokens": write30,
+            "cache_write_12h_tokens": write12,
+            "reported_input_tokens": reported_input,
+        },
     )
 
 
@@ -593,6 +636,10 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    requested_at: Optional[datetime] = None,
+    service_tier: Optional[str] = None,
+    background_completion_window: Optional[str] = None,
+    regional_processing: bool = False,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -607,6 +654,20 @@ def estimate_usage_cost(
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
     if not entry:
         return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
+
+    if route.provider == "openai" and gpt62_model_key(route.model) and entry.source == "official_docs_snapshot":
+        amount = gpt62_request_cost(route.model, usage, requested_at=requested_at,
+                                   service_tier=service_tier or "standard",
+                                   background_completion_window=background_completion_window,
+                                   regional_processing=regional_processing)
+        notes = ("Official API estimate; output includes reasoning. Cache writes replace ordinary input.",)
+        if service_tier is None:
+            notes += ("Standard API-equivalent estimate: response did not report a service tier.",)
+        if amount is None:
+            notes += ("Request counts, cache lifetime, tier or effective date could not be verified.",)
+        return CostResult(amount_usd=amount, status="estimated" if amount is not None else "unknown",
+                          source=entry.source, label=f"~${amount:.2f}" if amount is not None else "n/a",
+                          pricing_version=GPT62_VERSION, notes=notes)
 
     notes: list[str] = []
     amount = _ZERO
