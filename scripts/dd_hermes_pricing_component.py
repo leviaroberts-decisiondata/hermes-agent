@@ -14,7 +14,8 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-PATHS = ("agent/openai_gpt62_pricing.py", "agent/usage_pricing.py", "dd_obs.py", "run_agent.py")
+CORE_BASE = "bb200c4a13e18869e24eaa78a926b227dc533bb3"
+PATHS = ("agent/usage_pricing.py", "dd_obs.py", "run_agent.py")
 SEAMS = ("datetime", "_cost", "canonical_usage", "cost_result")
 
 
@@ -62,10 +63,8 @@ def backport(base, parent, reviewed):
     """The pinned runtime may differ elsewhere; never import those differences."""
     if set(parent) != set(PATHS) or set(reviewed) != set(PATHS) or set(base) != set(PATHS):
         raise Refused("pricing_path_set_changed")
-    if base[PATHS[0]] is not None or parent[PATHS[0]] is not None:
-        raise Refused("pricing_new_module_already_exists")
-    result = {PATHS[0]: reviewed[PATHS[0]]}
-    for path in PATHS[1:3]:
+    result = {}
+    for path in PATHS[:-1]:
         if base[path] != parent[path]:
             raise Refused("pricing_baseline_module_changed:" + path)
         result[path] = reviewed[path]
@@ -90,7 +89,8 @@ def generate_tree(repo, baseline, reviewed):
         if len(ref) != 40 or any(c not in "0123456789abcdef" for c in ref):
             raise Refused("exact_commit_required")
     subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", reviewed, "origin/main"], check=True)
-    parent = git(repo, "rev-parse", reviewed + "^").decode().strip()
+    parent = CORE_BASE
+    subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", parent, reviewed], check=True)
     changed = git(repo, "diff", "--name-only", parent, reviewed).decode().splitlines()
     if set(p for p in changed if not p.startswith("tests/")) != set(PATHS):
         raise Refused("reviewed_pricing_scope_changed")
@@ -112,7 +112,7 @@ def generate_tree(repo, baseline, reviewed):
             identities[path] = {"blob": blob, "sha256": hashlib.sha256(raw.encode()).hexdigest()}
         tree = git(repo, "write-tree", env=env).decode().strip()
     return {"kind": "hermes_gpt62_pricing_v1", "baseline_commit": baseline,
-            "reviewed_commit": reviewed, "review_parent": parent,
+            "reviewed_commit": reviewed, "review_base": parent,
             "artifact_tree": tree, "paths": identities}
 
 

@@ -22,9 +22,9 @@ NEW = NEW.replace("estimate_usage_cost(model, canonical_usage)", "estimate_usage
 
 
 def sources():
-    parent = {component.PATHS[0]: None, "agent/usage_pricing.py": "price = 1\n",
+    parent = {"agent/usage_pricing.py": "price = 1\n",
               "dd_obs.py": "unknown = 0\n", "run_agent.py": OLD}
-    reviewed = {component.PATHS[0]: "rate = 8\n", "agent/usage_pricing.py": "price = 8\n",
+    reviewed = {"agent/usage_pricing.py": "price = 8\n",
                 "dd_obs.py": "unknown = None\n", "run_agent.py": NEW}
     baseline = deepcopy(parent)
     baseline["run_agent.py"] = OLD.replace('"original"', '"pinned runtime, preserved"')
@@ -39,13 +39,13 @@ def test_backport_keeps_pinned_runtime_bytes_outside_reviewed_nodes():
     assert baseline["dd_obs.py"] == "unknown = 0\n"
 
 
-@pytest.mark.parametrize("change", ["seam", "module", "extra_runtime", "existing_new_module", "path_set"])
+@pytest.mark.parametrize("change", ["seam", "module", "extra_runtime", "missing_source", "path_set"])
 def test_ambiguous_or_unreviewed_runtime_delta_is_refused(change):
     baseline, parent, reviewed = sources()
     if change == "seam": baseline["run_agent.py"] = baseline["run_agent.py"].replace("_cost = 0", "_cost = 1")
     if change == "module": baseline["dd_obs.py"] = "foreign = True\n"
     if change == "extra_runtime": reviewed["run_agent.py"] += "extra_change = True\n"
-    if change == "existing_new_module": baseline[component.PATHS[0]] = "foreign = True\n"
+    if change == "missing_source": reviewed[component.PATHS[0]] = None
     if change == "path_set": reviewed["foreign.py"] = "foreign = True\n"
     with pytest.raises(component.Refused): component.backport(baseline, parent, reviewed)
 
@@ -68,7 +68,7 @@ def test_real_owner_snapshots_have_compatible_pricing_seams():
     def show(ref, path):
         p = subprocess.run(["git", "-C", str(root), "show", ref + ":" + path],capture_output=True,text=True)
         return p.stdout if p.returncode == 0 else None
-    refs = ("ed06e69a39ebbc8c31d9f9243651a915416c1778", "bb200c4a13e1", "94cf9d01629dab501551026a8fd927b26f75bfca")
+    refs = ("ed06e69a39ebbc8c31d9f9243651a915416c1778", "bb200c4a13e1", "5d36f55471798f433baf526d4569c281c610c62e")
     # A shallow executor without the retained snapshots reports the fixture gap.
     if any(show(ref, "run_agent.py") is None for ref in refs):
         pytest.skip("retained owner snapshot objects unavailable")
@@ -81,7 +81,7 @@ def test_real_owner_snapshots_have_compatible_pricing_seams():
 
 
 @pytest.fixture
-def git_owner(tmp_path):
+def git_owner(tmp_path, monkeypatch):
     # A local synthetic repository; these refs are not production lineage/proof.
     root = tmp_path / "owner"
     root.mkdir()
@@ -101,6 +101,7 @@ def git_owner(tmp_path):
         git("commit", "-qm", "synthetic")
         return git("rev-parse", "HEAD")
     parent_ref = write(parent)
+    monkeypatch.setattr(component, "CORE_BASE", parent_ref)
     reviewed_ref = write(reviewed)
     git("update-ref", "refs/remotes/origin/main", reviewed_ref)
     return root, git, parent_ref, reviewed_ref, baseline
