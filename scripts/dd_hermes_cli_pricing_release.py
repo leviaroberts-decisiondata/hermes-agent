@@ -92,6 +92,13 @@ def engine_for(artifact, target, pricing_commit):
     engine.read_manifest = read_manifest
 
     class PricingHost(engine.Host):
+        def lineage(self, reviewed, deadline):
+            result = super().lineage(reviewed, deadline)
+            actual = self.source(engine.ARTIFACT, deadline)
+            if actual["commit"] != engine.TARGET or actual["tree"] != result["artifact_tree"]:
+                raise common.Refused("pricing_artifact_checkout_mismatch")
+            return result
+
         def consumers(self, deadline):
             environment = engine.environment_identity()
             if engine.PATH_CONSOLE.resolve() != engine.CONSOLE.resolve():

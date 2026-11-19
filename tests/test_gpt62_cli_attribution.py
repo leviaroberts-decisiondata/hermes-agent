@@ -159,3 +159,24 @@ def test_native_inspector_runs_actual_price_module_without_writes_or_network(bun
     hashes = {str(root / name): release.common.digest(root / name) for name in release.pricing.PATHS}
     assert result["pricing"] == release.expected_prices(root, hashes)
     assert {str(p): p.read_bytes() for p in home.rglob("*") if p.is_file()} == before
+
+
+def test_pricing_lineage_checks_the_actual_clean_checkout(bundle, monkeypatch):
+    engine = bundle.engine
+    def git(*args):
+        return subprocess.check_output(["git", "-C", str(engine.ARTIFACT), *args],text=True).strip()
+    git("init", "-q", "-b", "main")
+    git("config", "user.name", "Synthetic fixture")
+    git("config", "user.email", "fixture@example.invalid")
+    git("add", ".")
+    git("commit", "-qm", "synthetic")
+    engine.TARGET = git("rev-parse", "HEAD")
+    identity = {"artifact_tree": git("rev-parse", "HEAD^{tree}")}
+    parent = engine.Host.__mro__[1]
+    monkeypatch.setattr(parent, "lineage", lambda *args: identity)
+    host = engine.Host()
+    assert host.lineage(REVIEWED, host.clock()+5) == identity
+    path = engine.ARTIFACT / "dd_obs.py"
+    path.write_bytes(b"foreign unreviewed pricing")
+    with pytest.raises(release.common.Refused, match="tracked_source_dirty"):
+        host.lineage(REVIEWED, host.clock()+5)
