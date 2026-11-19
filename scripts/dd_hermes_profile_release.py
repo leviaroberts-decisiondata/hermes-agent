@@ -3,7 +3,8 @@
 
 The candidate keeps the d1 runtime/history writer, replaces the reviewed
 transcription module and backports its one-token DGX default. Ordinary and Classic
-are protected siblings, never targets.
+are protected siblings, never targets. Optional pricing components preserve the
+existing transcription/config component and add only reviewed request-pricing seams.
 """
 from __future__ import annotations
 
@@ -46,6 +47,8 @@ def helper_identity():
     root = Path(__file__).resolve().parents[1]
     paths = ("scripts/dd_hermes_profile_release.py", "scripts/dd_hermes_ordinary_release.py",
              "scripts/dd_hermes_pricing_component.py",
+             "scripts/run_dd_profile_pricing_release_tests.py", "tests/test_gpt62_pricing_attribution.py",
+             "tests/test_gpt62_component_attribution.py",
              "scripts/run_dd_profile_release_tests.py", "scripts/run_dd_release_tests.py",
              "tests/scripts/test_dd_hermes_profile_release.py", "tests/scripts/test_dd_hermes_ordinary_release.py",
              "tests/test_route_to_lane_shared_home.py", "tests/test_route_to_lane_mission_parity.py")
@@ -126,6 +129,14 @@ def component_identity(host, candidate, target, reviewed, deadline, pricing_comm
                 "change": "DEFAULT_CONFIG.stt.provider local to dgx; all other bytes unchanged"}}
 
 
+def pricing_config_unchanged(engine, manifest):
+    path = str(engine.ORDINARY_HOME / "config.yaml")
+    baseline = manifest.get("config_sha256", {}).get(path)
+    if not baseline or manifest.get("candidate_config_sha256") != baseline:
+        raise common.Refused("pricing_config_migration_refused")
+    return baseline
+
+
 def engine_for(profile):
     """An isolated instance of the tested transaction engine, scoped once.
 
@@ -145,6 +156,15 @@ def engine_for(profile):
     engine.ORDINARY_HOME = PROFILE_HOMES[profile]
     engine.STATE = STATE_ROOT / profile
     cli_profile = profile if profile in NAMED else "default"
+    pricing_config = {"sha": None}
+    base_write_private = engine.write_private
+    def write_private(path, data):
+        if Path(path) == engine.ORDINARY_HOME / "config.yaml" and pricing_config["sha"] is not None:
+            if engine.sha(data) != pricing_config["sha"] or engine.digest(path) != pricing_config["sha"]:
+                raise common.Refused("pricing_config_changed")
+            return  # preserve the existing config byte-for-byte, metadata too
+        return base_write_private(path, data)
+    engine.write_private = write_private
 
     def read_plist():
         if engine.PLIST.is_symlink():
@@ -207,6 +227,8 @@ def engine_for(profile):
             raise common.Refused("profile_or_helper_changed")
         host.helpers_reviewed(manifest["component"]["reviewed_commit"], deadline)
         pricing_identity = manifest["component"].get("pricing")
+        if pricing_identity:
+            pricing_config["sha"] = pricing_config_unchanged(engine, manifest)
         pricing_args = {"pricing_commit": pricing_identity["reviewed_commit"]} if pricing_identity else {}
         actual = host.component_identity(manifest["candidate"], manifest["target_commit"],
                                          manifest["component"]["reviewed_commit"], deadline, **pricing_args)
@@ -321,6 +343,8 @@ def stage(profile, candidate, python, target, reviewed, *, engine=None, host=Non
     deadline = host.clock() + 15
     protected = host.protected_snapshot(deadline)
     manifest = engine.stage(candidate, python, target, host)
+    if pricing_commit:
+        pricing_config_unchanged(engine, manifest)
     host.baseline_compatible(manifest["baseline"]["cwd"], deadline)
     host.helpers_reviewed(reviewed, deadline)
     pricing_args = {"pricing_commit": pricing_commit} if pricing_commit else {}

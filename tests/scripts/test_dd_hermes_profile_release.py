@@ -396,6 +396,35 @@ def test_real_component_identity_refuses_unapproved_delta(component_repo, drift)
         release.component_identity(host, root, target, reviewed, host.clock() + 5)
 
 
+def test_pricing_stage_refuses_configuration_migration(bundle):
+    b = bundle("dd-engineer-1")
+    with pytest.raises(release.common.Refused, match="pricing_config_migration"):
+        release.stage(b.profile, Path(b.manifest["candidate"]), Path(b.manifest["python"]), TARGET, REVIEWED,
+                      engine=b.engine, host=b.host, pricing_commit="c" * 40)
+    assert b.host.mutations == []
+
+
+def test_pricing_activation_preserves_config_bytes_and_metadata(bundle):
+    b = bundle("dd-engineer-1")
+    config = b.engine.ORDINARY_HOME / "config.yaml"
+    config.write_bytes(release.common.dgx_config(config.read_bytes()))
+    before, stamp = config.read_bytes(), config.stat().st_mtime_ns
+    original_identity = b.host.component_identity
+    def pricing_identity(candidate, target, reviewed, deadline, **kwargs):
+        value = original_identity(candidate, target, reviewed, deadline)
+        value["pricing"] = {"reviewed_commit": "c" * 40}
+        return value
+    b.host.component_identity = pricing_identity
+    manifest = release.stage(b.profile, Path(b.manifest["candidate"]), Path(b.manifest["python"]), TARGET, REVIEWED,
+                             engine=b.engine, host=b.host, pricing_commit="c" * 40)
+    b.path.write_bytes(b.engine.canonical(manifest))
+    checksum = b.engine.digest(b.path)
+    b.host.row["restart_command"] = b.engine.restart_command(b.path, checksum)
+    result = release.activate(b.profile, b.path, checksum, OP, engine=b.engine, host=b.host)
+    assert result["status"] == "succeeded"
+    assert config.read_bytes() == before and config.stat().st_mtime_ns == stamp
+
+
 def test_actual_candidate_transcription_module_routes_dgx_without_fallback(tmp_path):
     # The component proof runner sets this to the actual immutable d1 artifact.
     # Ordinary author tests use the identical reviewed module in this checkout.

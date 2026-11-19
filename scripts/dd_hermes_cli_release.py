@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Five-file CLI DGX release. Stage/verify are read-only; apply requires MC approval."""
+"""CLI component transaction. Stage/verify are read-only; apply requires MC approval."""
 from __future__ import annotations
 
 import argparse
@@ -31,13 +31,18 @@ CONSOLE = ROOT / "venv/bin/hermes"
 PATH_CONSOLE = Path("/Users/openclaw/.local/bin/hermes")
 STATE = Path("/Users/openclaw/.openclaw/hermes-cli-release")
 PROFILES = ("document-review", "video-review", "security-review")
+CONFIG_PROFILES = PROFILES
 HOMES = {p: Path("/Users/openclaw/.hermes/profiles") / p for p in PROFILES}
 SOURCES = (component.COMPONENT, component.DEFAULT_COMPONENT)
 KIND = "hermes_cli_component_v1"
+BASELINE_COMPONENT = component.BASE
+LINEAGE_PRICING_COMMIT = None
+EXTRA_HELPER_NAMES = ()
+PRESERVE_UNCHANGED = False
 
 
 def paths():
-    return [ROOT / name for name in SOURCES] + [HOMES[p] / "config.yaml" for p in PROFILES]
+    return [ROOT / name for name in SOURCES] + [HOMES[p] / "config.yaml" for p in CONFIG_PROFILES]
 
 
 def environment_identity():
@@ -60,7 +65,7 @@ def helper_identity():
     names = ("scripts/dd_hermes_cli_release.py", "scripts/dd_hermes_profile_release.py",
              "scripts/dd_hermes_ordinary_release.py", "scripts/run_dd_cli_release_tests.py",
              "scripts/run_dd_profile_release_tests.py", "scripts/run_dd_release_tests.py",
-             "tests/scripts/test_dd_hermes_cli_release.py")
+             "tests/scripts/test_dd_hermes_cli_release.py", "scripts/dd_hermes_pricing_component.py") + EXTRA_HELPER_NAMES
     return {str(root / name): common.digest(root / name) for name in names}
 
 
@@ -106,7 +111,8 @@ except Exception:
 
 class Host(common.Host):
     def lineage(self, reviewed, deadline):
-        value = component.component_identity(self, ARTIFACT, TARGET, reviewed, deadline)
+        pricing_args = {"pricing_commit": LINEAGE_PRICING_COMMIT} if LINEAGE_PRICING_COMMIT else {}
+        value = component.component_identity(self, ARTIFACT, TARGET, reviewed, deadline, **pricing_args)
         root = Path(__file__).resolve().parents[1]
         for path, checksum in helper_identity().items():
             relative = str(Path(path).relative_to(root))
@@ -214,7 +220,7 @@ def replacements():
         file_identity(path)
     result = {str(ROOT / name): common.safe_path(ARTIFACT / name).read_bytes() for name in SOURCES}
     result.update({str(HOMES[p] / "config.yaml"): common.dgx_config((HOMES[p] / "config.yaml").read_bytes())
-                   for p in PROFILES})
+                   for p in CONFIG_PROFILES})
     return result
 
 
@@ -226,7 +232,7 @@ def stage(reviewed, host=None):
     baseline = {str(p): file_identity(p) for p in paths()}
     # Both source inputs must be the exact historical base, not another patch.
     for name in SOURCES:
-        _, raw = host.command(["/usr/bin/git", "-C", str(ARTIFACT), "show", component.BASE + ":" + name], deadline)
+        _, raw = host.command(["/usr/bin/git", "-C", str(ARTIFACT), "show", BASELINE_COMPONENT + ":" + name], deadline)
         if common.sha(raw) != baseline[str(ROOT / name)]["sha256"]:
             raise common.Refused("cli_component_baseline_changed")
     host.gateways(deadline)
@@ -234,6 +240,7 @@ def stage(reviewed, host=None):
     if any(file_identity(p) != baseline[str(p)] for p in paths()):
         raise common.Refused("staging_file_drift")
     return {"kind": KIND, "service": SERVICE, "target_commit": TARGET, "component": lineage,
+            "helper_bundle_version": 2,
             "reviewed_commit": reviewed, "helper_sha256": helper_identity(), "baseline": baseline,
             "candidate": candidate, "unchanged_source": unchanged,
             "python_sha256": common.digest(PYTHON.resolve()), "console_sha256": common.digest(CONSOLE),
@@ -281,7 +288,7 @@ def verify(path, checksum, operation, host=None, *, challenge="", attempt_id="",
     return {"kind": KIND, "status": "verified", "service": SERVICE, "challenge": challenge,
             "attempt_id": attempt_id, "queue_id": operation, "target_commit": TARGET,
             "manifest_sha256": checksum, "source_files": {str(ROOT / p): m["candidate"][str(ROOT / p)] for p in SOURCES},
-            "config_files": {str(HOMES[p] / "config.yaml"): m["candidate"][str(HOMES[p] / "config.yaml")] for p in PROFILES},
+            "config_files": {str(HOMES[p] / "config.yaml"): m["candidate"][str(HOMES[p] / "config.yaml")] for p in CONFIG_PROFILES},
             "python_sha256": m["python_sha256"], "console_sha256": m["console_sha256"], "consumer": consumers}
 
 
@@ -363,6 +370,8 @@ def apply(path, checksum, operation="auto", host=None):
             for target in paths():
                 host.remaining(deadline)
                 key = str(target)
+                if PRESERVE_UNCHANGED and candidate[key] == originals[key]:
+                    continue
                 # Journal intent before rename: death/exception after replace
                 # must never be reported as an untouched preflight failure.
                 installed[key] = None

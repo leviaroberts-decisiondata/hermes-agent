@@ -19,18 +19,22 @@ REVIEWED_FIXTURES = ("tests/test_route_to_lane_shared_home.py", "tests/test_rout
 BOUNDARY = "tests/tools/test_p1_caller_boundary.py"
 
 
-def main(*, extra_tests=()):
+def main(*, extra_tests=(), pricing_coverage=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate", required=True)
     args = parser.parse_args()
     candidate = Path(args.candidate).resolve()
     if not candidate.is_dir(): raise SystemExit("Candidate missing")
     paths = set(MANDATORY) | {BOUNDARY}
+    reviewed_fixtures = set(REVIEWED_FIXTURES)
+    if pricing_coverage:
+        reviewed_fixtures.add("tests/test_gpt62_pricing_attribution.py")
+        paths.add("tests/test_gpt62_pricing_attribution.py")
     for pattern in ("tests/test_*attribution*.py", "tests/gateway/test_*attribution*.py"):
         paths.update(str(path.relative_to(candidate)) for path in candidate.glob(pattern))
     if any(not (candidate / name).is_file() for name in (*MANDATORY, BOUNDARY, "tests/conftest.py")):
         raise SystemExit("Mandatory candidate attribution tests missing")
-    if any(not (HELPER_ROOT / name).is_file() for name in REVIEWED_FIXTURES):
+    if any(not (HELPER_ROOT / name).is_file() for name in reviewed_fixtures):
         raise SystemExit("Reviewed authorization fixtures missing")
     prepare_file_limit()
     env = {name: os.environ[name] for name in (
@@ -51,7 +55,7 @@ def main(*, extra_tests=()):
         # tests or weaken their assertions. Negative boundary tests stay d1's.
         harness = Path(home) / "harness"
         for name in sorted(paths):
-            source = HELPER_ROOT if name in REVIEWED_FIXTURES else candidate
+            source = HELPER_ROOT if name in reviewed_fixtures else candidate
             destination = harness / name
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes((source / name).read_bytes())
@@ -66,6 +70,15 @@ def _component_import_origins():
     for name in ("dd_obs", "tools.route_to_lane_tool", "tools.p1_caller_boundary"):
         module = importlib.import_module(name)
         assert Path(module.__file__).resolve().is_relative_to(root), "runtime import escaped candidate"
+'''
+        if pricing_coverage:
+            conftest += '''
+\n@pytest.fixture(autouse=True)
+def _pricing_import_origin():
+    import agent.usage_pricing as pricing
+    import os
+    from pathlib import Path
+    assert Path(pricing.__file__).resolve().is_relative_to(Path(os.environ["DD_PROFILE_COMPONENT_ROOT"]).resolve())
 '''
         (harness / "tests/conftest.py").write_text(conftest)
         env["PYTHONPATH"] = str(candidate)
