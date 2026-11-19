@@ -7,6 +7,7 @@ from typing import Any, Dict, Literal, Optional
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
 from utils import base_url_host_matches
+import re
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 
@@ -34,6 +35,9 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    cache_write_30m_tokens: Optional[int] = None
+    cache_write_12h_tokens: Optional[int] = None
+    reported_input_tokens: Optional[int] = None
 
     @property
     def prompt_tokens(self) -> int:
@@ -77,6 +81,80 @@ class CostResult:
 
 
 _UTC_NOW = lambda: datetime.now(timezone.utc)
+
+
+# GPT-6.2 request pricing, verified 2026-11-18; effective 2026-11-17.
+# https://developers.openai.com/api/docs/pricing
+# https://developers.openai.com/api/docs/guides/prompt-caching
+GPT62_VERSION = "openai-standard:gpt-6.2:2026-11-17"
+GPT62_RATES = {
+    "gpt-6.2-astra": tuple(map(Decimal, ("8", ".4", "10", "20", "40"))),
+    "gpt-6.2-sol": tuple(map(Decimal, ("2", ".1", "2.5", "5", "10"))),
+}
+
+
+def gpt62_model_key(model):
+    match = re.fullmatch(r"(gpt-6\.2-(?:astra|sol))(?:-\d{4}-\d{2}-\d{2})?", model or "")
+    return match.group(1) if match else None
+
+
+def gpt62_request_cost(model, usage, *, requested_at=None, service_tier="standard",
+                 background_completion_window=None, regional_processing=False):
+    """Canonical buckets are disjoint; output already includes reasoning.
+
+    Unknown TTL, tier, date or inconsistent counts return None. Ultrafast
+    promotion ends at midnight March 1, 2027 Pacific (08:00 UTC).
+    """
+    key = gpt62_model_key(model)
+    if not key:
+        return None
+    counts = (usage.input_tokens, usage.output_tokens, usage.cache_read_tokens,
+              usage.cache_write_tokens, usage.reasoning_tokens)
+    if any(type(n) is not int or n < 0 for n in counts) or usage.reasoning_tokens > usage.output_tokens:
+        return None
+    total = usage.prompt_tokens
+    if usage.reported_input_tokens is not None and total != usage.reported_input_tokens:
+        return None
+    write30, write12 = usage.cache_write_30m_tokens, usage.cache_write_12h_tokens
+    if write30 is None and write12 is None:
+        if usage.cache_write_tokens:
+            return None
+        write30 = write12 = 0
+    else:
+        write30, write12 = write30 or 0, write12 or 0
+        if any(type(n) is not int or n < 0 for n in (write30, write12)) or write30 + write12 != usage.cache_write_tokens:
+            return None
+    at = None
+    if requested_at is not None:
+        try:
+            at = requested_at if isinstance(requested_at, datetime) else datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+            if at.tzinfo is None or at < datetime(2026, 11, 17, tzinfo=timezone.utc):
+                return None
+        except (ValueError, TypeError, AttributeError):
+            return None
+    multipliers = {"standard": Decimal(1), "default": Decimal(1), "batch": Decimal(".5"),
+                   "fast": Decimal(2), "priority": Decimal(2)}
+    if service_tier == "ultrafast":
+        if at is None:
+            return None
+        multiplier = Decimal(3 if at < datetime(2027, 3, 1, 8, tzinfo=timezone.utc) else 6)
+    else:
+        multiplier = multipliers.get(service_tier)
+        if multiplier is None:
+            return None
+    if background_completion_window:
+        if service_tier not in ("standard", "default") or background_completion_window not in ("2h", "8h"):
+            return None
+        multiplier = {"2h": Decimal(".7"), "8h": Decimal(".6")}[background_completion_window]
+    if regional_processing:
+        multiplier *= Decimal("1.1")
+    ordinary, read, write_short, write_long, output = GPT62_RATES[key]
+    input_multiplier = Decimal(2 if total > 272000 else 1)
+    output_multiplier = Decimal("1.5") if total > 272000 else Decimal(1)
+    return multiplier * (input_multiplier * (
+        usage.input_tokens * ordinary + usage.cache_read_tokens * read
+        + write30 * write_short + write12 * write_long)
+        + usage.output_tokens * output * output_multiplier) / Decimal(1000000)
 
 
 # Official docs snapshot entries. Models whose published pricing and cache
@@ -427,6 +505,13 @@ def resolve_billing_route(
 
 
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
+    key = gpt62_model_key(route.model.lower()) if route.provider == "openai" else None
+    if key:
+        ordinary, read, write30, _write12, output = GPT62_RATES[key]
+        return PricingEntry(input_cost_per_million=ordinary, output_cost_per_million=output,
+                            cache_read_cost_per_million=read, cache_write_cost_per_million=write30,
+                            source="official_docs_snapshot", source_url="https://developers.openai.com/api/docs/pricing",
+                            pricing_version=GPT62_VERSION)
     return _OFFICIAL_DOCS_PRICING.get((route.provider, route.model.lower()))
 
 
@@ -518,6 +603,7 @@ def normalize_usage(
     *,
     provider: Optional[str] = None,
     api_mode: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> CanonicalUsage:
     """Normalize raw API response usage into canonical token buckets.
 
@@ -577,12 +663,38 @@ def normalize_usage(
     if output_details:
         reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
 
+    write30 = write12 = reported_input = None
+    if gpt62_model_key((model_name or "").split("/")[-1]) and provider_name in ("openai", "openai-codex"):
+        # Retain the provider total to detect invalid/clamped cache breakdowns.
+        responses = hasattr(response_usage, "input_tokens")
+        reported_input = _to_int(getattr(response_usage, "input_tokens" if responses else "prompt_tokens", 0))
+        output_tokens = _to_int(getattr(response_usage, "output_tokens" if responses else "completion_tokens", 0))
+        details = getattr(response_usage, "input_tokens_details" if responses else "prompt_tokens_details", None)
+        cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0))
+        cache_write_tokens = _to_int(getattr(details, "cache_write_tokens", getattr(details, "cache_creation_tokens", 0)))
+        write30 = getattr(details, "cache_write_30m_tokens", None)
+        write12 = getattr(details, "cache_write_12h_tokens", None)
+        if write30 is None and write12 is None and cache_write_tokens:
+            ttl = getattr(details, "cache_write_ttl", None)
+            if ttl == "30m":
+                write30, write12 = cache_write_tokens, 0
+            elif ttl == "12h":
+                write30, write12 = 0, cache_write_tokens
+        input_tokens = max(0, reported_input - cache_read_tokens - cache_write_tokens)
+        reasoning_details = getattr(response_usage, "output_tokens_details" if responses else "completion_tokens_details", None)
+        reasoning_tokens = _to_int(getattr(reasoning_details, "reasoning_tokens", 0))
+
     return CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        **{
+            "cache_write_30m_tokens": write30,
+            "cache_write_12h_tokens": write12,
+            "reported_input_tokens": reported_input,
+        },
     )
 
 
@@ -593,6 +705,10 @@ def estimate_usage_cost(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    requested_at: Optional[datetime] = None,
+    service_tier: Optional[str] = None,
+    background_completion_window: Optional[str] = None,
+    regional_processing: bool = False,
 ) -> CostResult:
     route = resolve_billing_route(model_name, provider=provider, base_url=base_url)
     if route.billing_mode == "subscription_included":
@@ -607,6 +723,20 @@ def estimate_usage_cost(
     entry = get_pricing_entry(model_name, provider=provider, base_url=base_url, api_key=api_key)
     if not entry:
         return CostResult(amount_usd=None, status="unknown", source="none", label="n/a")
+
+    if route.provider == "openai" and gpt62_model_key(route.model) and entry.source == "official_docs_snapshot":
+        amount = gpt62_request_cost(route.model, usage, requested_at=requested_at,
+                                   service_tier=service_tier or "standard",
+                                   background_completion_window=background_completion_window,
+                                   regional_processing=regional_processing)
+        notes = ("Official API estimate; output includes reasoning. Cache writes replace ordinary input.",)
+        if service_tier is None:
+            notes += ("Standard API-equivalent estimate: response did not report a service tier.",)
+        if amount is None:
+            notes += ("Request counts, cache lifetime, tier or effective date could not be verified.",)
+        return CostResult(amount_usd=amount, status="estimated" if amount is not None else "unknown",
+                          source=entry.source, label=f"~${amount:.2f}" if amount is not None else "n/a",
+                          pricing_version=GPT62_VERSION, notes=notes)
 
     notes: list[str] = []
     amount = _ZERO
