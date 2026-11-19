@@ -16,6 +16,7 @@ import tempfile
 
 CORE_BASE = "bb200c4a13e18869e24eaa78a926b227dc533bb3"
 PATHS = ("agent/usage_pricing.py", "dd_obs.py", "run_agent.py")
+APPS = Path("/Users/openclaw/apps")
 SEAMS = ("datetime", "_cost", "canonical_usage", "cost_result")
 
 
@@ -136,14 +137,37 @@ def produce(repo, baseline, reviewed):
     return {**identity, "artifact_commit": target}
 
 
+def materialize(repo, baseline, reviewed, destination):
+    """Create a fresh artifact checkout; never copy into an existing runtime."""
+    destination = Path(destination)
+    if (not destination.is_absolute() or destination.exists() or destination.is_symlink()
+            or destination.parent.resolve() != destination.parent or not destination.parent.is_dir()
+            or not destination.is_relative_to(APPS)):
+        raise Refused("fresh_owned_artifact_path_required")
+    result = produce(repo, baseline, reviewed)
+    git(repo, "worktree", "add", "--detach", str(destination), result["artifact_commit"])
+    if git(destination, "rev-parse", "HEAD").decode().strip() != result["artifact_commit"]:
+        raise Refused("materialized_artifact_commit_mismatch")
+    if git(destination, "status", "--porcelain", "--untracked-files=no"):
+        raise Refused("materialized_artifact_dirty")
+    verify_tree(destination, baseline, reviewed, result["artifact_commit"])
+    return {**result, "candidate": str(destination)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--baseline", required=True)
     parser.add_argument("--pricing-reviewed-commit", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--candidate")
     args = parser.parse_args()
-    result = produce(Path(args.repo).resolve(), args.baseline, args.pricing_reviewed_commit)
+    if Path(args.out).exists() or Path(args.out).is_symlink():
+        raise Refused("new_output_path_required")
+    if args.candidate:
+        result = materialize(Path(args.repo).resolve(), args.baseline, args.pricing_reviewed_commit, args.candidate)
+    else:
+        result = produce(Path(args.repo).resolve(), args.baseline, args.pricing_reviewed_commit)
     # New metadata only; the producer never overwrites a staged manifest.
     with open(args.out, "x") as stream:
         json.dump(result, stream, sort_keys=True, indent=2)

@@ -121,3 +121,17 @@ def test_unmerged_pricing_cannot_generate_an_artifact(git_owner):
     root, git, baseline, reviewed, _ = git_owner
     git("update-ref", "refs/remotes/origin/main", baseline)
     with pytest.raises(subprocess.CalledProcessError): component.produce(root, baseline, reviewed)
+
+
+def test_materializer_creates_a_fresh_generated_checkout_only(git_owner, monkeypatch, tmp_path):
+    root, git, baseline, reviewed, _ = git_owner
+    apps = tmp_path / "apps"
+    apps.mkdir()
+    monkeypatch.setattr(component, "APPS", apps)
+    candidate = apps / "pricing-artifact"
+    result = component.materialize(root, baseline, reviewed, candidate)
+    assert result["candidate"] == str(candidate)
+    assert (candidate / "dd_obs.py").read_text() == "unknown = None\n"
+    assert git("rev-parse", "HEAD") == reviewed
+    with pytest.raises(component.Refused): component.materialize(root, baseline, reviewed, candidate)
+    with pytest.raises(component.Refused): component.materialize(root, baseline, reviewed, tmp_path / "outside")
